@@ -1,0 +1,20 @@
+# フロントエンド関連
+next-kyudo-app/node_modules/
+next-kyudo-app/.next/
+next-kyudo-app/out/
+next-kyudo-app/.env.local
+next-kyudo-app/.env*.local
+
+# バックエンド関連 (Python / FastAPI)
+next-kyudo-api/venv/
+next-kyudo-api/__pycache__/
+next-kyudo-api/*.pyc
+
+# Cloud Functions 関連
+functions/node_modules/
+functions/lib/
+
+# ログファイル・OS一時ファイル
+*.log
+.DS_Store
+Thumbs.db

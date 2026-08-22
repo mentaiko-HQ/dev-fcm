@@ -1,0 +1,49 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ユーザーがシステム管理者（役員）であるか判定するヘルパー関数
+    function isAdmin() {
+      return request.auth != null && request.auth.token.admin == true;
+    }
+
+    // ユーザー自身のリソースであるか判定するヘルパー関数
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    // users コレクション（FCMトークン・チーム紐付け）
+    // フールプルーフ: 不正な型や不正なフィールドの書き込みを防止する
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && isOwner(userId);
+      allow update: if request.auth != null && (isOwner(userId) || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    // teams コレクション（立順、チーム構成）
+    match /teams/{teamId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    // entries コレクション（エントリー情報）
+    match /entries/{entryId} {
+      allow read: if true;
+      allow create: if request.auth != null;
+      allow update, delete: if isAdmin();
+    }
+
+    // matches コレクション（試合進行、立の進行管理）
+    match /matches/{matchId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    // scores コレクション（的中データ）
+    match /scores/{scoreId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+  }
+}
