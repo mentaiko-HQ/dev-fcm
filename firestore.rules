@@ -2,7 +2,7 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ユーザーがシステム管理者（役員）であるか判定するヘルパー関数
+    // ユーザーがシステム管理者（役員）であるか判定するヘルパー関数（フールプルーフ）
     function isAdmin() {
       return request.auth != null && request.auth.token.admin == true;
     }
@@ -13,7 +13,7 @@ service cloud.firestore {
     }
 
     // users コレクション（FCMトークン・チーム紐付け）
-    // フールプルーフ: 不正な型や不正なフィールドの書き込みを防止する
+    // フールプルーフ: 他人のドキュメントに対する不正な書き込み・上書きを防止
     match /users/{userId} {
       allow read: if request.auth != null;
       allow create: if request.auth != null && isOwner(userId);
@@ -22,6 +22,7 @@ service cloud.firestore {
     }
 
     // teams コレクション（立順、チーム構成）
+    // フェイルセーフ: 参加者による誤操作での立順改変を防ぐため読み取りのみ全開放
     match /teams/{teamId} {
       allow read: if true;
       allow create, update, delete: if isAdmin();

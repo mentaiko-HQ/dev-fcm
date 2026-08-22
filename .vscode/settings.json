@@ -1,0 +1,10 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/next-kyudo-api/venv/Scripts/python.exe",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/next-kyudo-api",
+    "${workspaceFolder}/next-kyudo-api/app",
+    "${workspaceFolder}/next-kyudo-api/venv/Lib/site-packages"
+  ],
+  "python.analysis.autoSearchPaths": true,
+  "python.analysis.typeCheckingMode": "basic"
+}
