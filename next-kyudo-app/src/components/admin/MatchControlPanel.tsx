@@ -4,7 +4,7 @@ import React, { useState, useEffect } from "react";
 import { doc, setDoc, onSnapshot, serverTimestamp } from "firebase/firestore";
 import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
 import { Button } from "@/components/ui/button";
-import { ArrowRight, AlertTriangle, CheckCircle2, Database, RefreshCw } from "lucide-react";
+import { ArrowRight, AlertTriangle, CheckCircle2, Database } from "lucide-react";
 
 interface MatchControlPanelProps {
   matchId: string;
@@ -25,7 +25,7 @@ const DEFAULT_MATCH_STATE: MatchState = {
   status: "進行中",
 };
 
-// 初期シード用チームデータ定義
+// 初期シード用チームデータ定義（フールプルーフ: 型定義に基づき厳密なnumber型として定義）
 const INITIAL_TEAMS_DATA = [
   { id: "team_01", name: "第一立（福岡弓道倶楽部A）", standNumber: 1, division: "一般男子" },
   { id: "team_02", name: "第二立（博多紅葉会）", standNumber: 2, division: "一般女子" },
@@ -55,7 +55,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
           const data = snapshot.data() as MatchState;
           setMatchState(data);
         } else {
-          // 初期ドキュメントが存在しない場合は初期データを作成（フェイルセーフ）
+          // 初期ドキュメントが存在しない場合は自動作成（フェイルセーフ）
           setDoc(
             matchDocRef,
             {
@@ -75,7 +75,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
     return () => unsubscribe();
   }, [matchId]);
 
-  // Firestore初期コレクション（teams, matches）の一括投入処理
+  // Firestore初期コレクション（teams, matches）の一括投入処理（フールプルーフ: 手動入力を排除し型事故を防止）
   const handleSeedFirestore = async () => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
       setStatusMessage("Firebase環境変数が設定されていません。");
@@ -87,14 +87,14 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
     setStatusMessage("Firestore初期データ（teams, matches）を書き込み中...");
 
     try {
-      // 1. teams コレクションの初期化
+      // 1. teams コレクションの初期化（TypeScriptの数値型として確実に書き込み）
       for (const team of INITIAL_TEAMS_DATA) {
         const teamDocRef = doc(firestoreInstance, "teams", team.id);
         await setDoc(
           teamDocRef,
           {
             name: team.name,
-            standNumber: team.standNumber,
+            standNumber: Number(team.standNumber), // 数値型として明示的にキャスト
             division: team.division,
             updatedAt: Date.now(),
           },
@@ -141,7 +141,8 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
 
     try {
       if (isFirebaseConfigured && isFirestoreAvailable(db)) {
-        const matchDocRef = doc(db, "matches", matchId);
+        const firestoreInstance = db;
+        const matchDocRef = doc(firestoreInstance, "matches", matchId);
         await setDoc(
           matchDocRef,
           {
@@ -180,7 +181,8 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
 
     try {
       if (isFirebaseConfigured && isFirestoreAvailable(db)) {
-        const matchDocRef = doc(db, "matches", matchId);
+        const firestoreInstance = db;
+        const matchDocRef = doc(firestoreInstance, "matches", matchId);
         await setDoc(
           matchDocRef,
           {
