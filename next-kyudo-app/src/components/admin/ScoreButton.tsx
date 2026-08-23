@@ -1,106 +1,184 @@
-'use client';
+"use client";
 
-import React, { useState } from 'react';
-import { Button } from '@/components/ui/button';
-import { HitResult } from '@/types';
+import React, { useState, useCallback } from "react";
+import { doc, updateDoc, serverTimestamp } from "firebase/firestore";
+import { db } from "@/lib/firebase";
+import { HitResult, PlayerScore } from "@/types";
+import { Button } from "@/components/ui/button";
 
-interface ScoreButtonProps {
-  playerName: string;
-  totalArrows: number; // 規定矢数（例: 一手なら2、四矢なら4）
-  onScoreChange?: (scores: HitResult[]) => void;
+interface ScoreBoardProps {
+  matchId: string;
+  standNumber: number;
+  player: PlayerScore;
+  maxArrows: number; // 競技形式に基づく規定射数（一手なら2、四矢なら4）
+  isEditable?: boolean;
 }
 
 export function ScoreButton({
-  playerName,
-  totalArrows = 4,
-  onScoreChange,
-}: ScoreButtonProps) {
-  const [scores, setScores] = useState<HitResult[]>([]);
+  matchId,
+  standNumber,
+  player,
+  maxArrows = 4,
+  isEditable = true,
+}: ScoreBoardProps) {
+  // ローカルステートで即時フィードバックを提供（楽観的UI）
+  const [currentArrows, setCurrentArrows] = useState<HitResult[]>(player.arrows || []);
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [errorMessage, setErrorMessage] = useState<string>("");
 
-  // 的中（〇）または不中（✕）の入力を追加（フールプルーフ: 規定矢数超過を防止）
-  const handleAddScore = (result: HitResult) => {
-    if (scores.length >= totalArrows) {
-      console.warn(
-        '【入力制約】規定矢数に達しているため、これ以上追加できません。',
+  // Firestoreへの非同期保存関数（フェイルセーフ: 通信障害時のロールバックと構造化エラーログ）
+  const syncScoreToFirestore = useCallback(
+    async (updatedArrows: HitResult[], previousArrows: HitResult[]) => {
+      setIsSyncing(true);
+      setErrorMessage("");
+
+      // フールプルーフ: 型安全な合計的中数の計算（reduceに<number>を明示）
+      const calculatedHits: number = updatedArrows.reduce<number>(
+        (acc: number, cur: HitResult) => acc + cur,
+        0
       );
+      const isCompleted: boolean = updatedArrows.length >= maxArrows;
+
+      try {
+        const matchDocRef = doc(db, "scores", `${matchId}_stand_${standNumber}`);
+
+        // Firestoreへの更新（マージ更新パス）
+        await updateDoc(matchDocRef, {
+          [`playerScores.${player.playerId}.arrows`]: updatedArrows,
+          [`playerScores.${player.playerId}.totalHits`]: calculatedHits,
+          [`playerScores.${player.playerId}.isCompleted`]: isCompleted,
+          [`playerScores.${player.playerId}.updatedAt`]: Date.now(),
+          lastUpdated: serverTimestamp(),
+        });
+      } catch (error) {
+        // フェイルセーフ: Firestore書き込み失敗時に直前のローカル状態へロールバック
+        console.error("【エラーログ】Firestoreへのスコア同期に失敗しました:", {
+          matchId,
+          playerId: player.playerId,
+          attemptedArrows: updatedArrows,
+          error,
+        });
+        setCurrentArrows(previousArrows);
+        setErrorMessage("サーバーへのスコア保存に失敗しました。再試行してください。");
+      } finally {
+        setIsSyncing(false);
+      }
+    },
+    [matchId, standNumber, player.playerId, maxArrows]
+  );
+
+  // 的中（〇）または不中（✕）の入力処理
+  const handleAddArrow = (result: HitResult) => {
+    // フールプルーフ: 規定射数に達している場合や編集不可時は入力を早期ブロック
+    if (!isEditable || currentArrows.length >= maxArrows || isSyncing) {
+      console.warn("【入力制約】規定射数超過または処理中のため入力を無視しました。");
       return;
     }
-    const updated = [...scores, result];
-    setScores(updated);
-    if (onScoreChange) {
-      onScoreChange(updated);
-    }
+
+    const previous = [...currentArrows];
+    const updated = [...currentArrows, result];
+
+    // 楽観的更新
+    setCurrentArrows(updated);
+    syncScoreToFirestore(updated, previous);
   };
 
-  // 直前の入力を取り消す（Undo機能）
+  // 直前の入力を取り消すUndo処理
   const handleUndo = () => {
-    if (scores.length === 0) return;
-    const updated = scores.slice(0, -1);
-    setScores(updated);
-    if (onScoreChange) {
-      onScoreChange(updated);
+    // フールプルーフ: 未入力状態でのUndoをブロック
+    if (!isEditable || currentArrows.length === 0 || isSyncing) {
+      return;
     }
+
+    const previous = [...currentArrows];
+    const updated = currentArrows.slice(0, -1);
+
+    // 楽観的更新
+    setCurrentArrows(updated);
+    syncScoreToFirestore(updated, previous);
   };
+
+  // フールプルーフ: 表示用の的中数集計
+  const totalHits: number = currentArrows.reduce<number>(
+    (sum: number, val: HitResult) => sum + val,
+    0
+  );
 
   return (
     <div className="p-4 border border-slate-200 rounded-lg bg-white shadow-sm flex flex-col gap-3">
+      {/* 選手ヘッダー情報 */}
       <div className="flex justify-between items-center">
-        <span className="font-semibold text-slate-800">{playerName}</span>
-        <span className="text-xs text-slate-500">
-          {scores.length} / {totalArrows} 射終了
-        </span>
+        <div>
+          <span className="text-xs font-semibold px-2 py-0.5 rounded bg-slate-100 text-slate-700 mr-2">
+            {player.position}
+          </span>
+          <span className="font-bold text-slate-900">{player.playerName}</span>
+        </div>
+        <div className="text-right">
+          <span className="text-sm font-bold text-red-600">{totalHits}</span>
+          <span className="text-xs text-slate-500"> / {maxArrows} 的中</span>
+        </div>
       </div>
 
-      {/* スコア表示エリア */}
-      <div className="flex gap-2 justify-center py-2 bg-slate-50 border border-slate-100 rounded">
-        {Array.from({ length: totalArrows }).map((_, index) => {
-          const score = scores[index];
+      {/* 的中表示インジケーター（UI/UX: 一目で的中状況がわかるグリッド配置） */}
+      <div className="grid grid-cols-4 gap-2 py-2 bg-slate-50 border border-slate-100 rounded px-2">
+        {Array.from({ length: maxArrows }).map((_, index) => {
+          const arrowState = currentArrows[index];
           return (
             <div
               key={index}
-              className="w-10 h-10 flex items-center justify-center border border-slate-300 rounded font-bold text-lg bg-white"
+              className="h-12 flex flex-col items-center justify-center border border-slate-300 rounded font-bold bg-white"
             >
-              {score === 1 ? (
-                <span className="text-red-600">〇</span>
-              ) : score === 0 ? (
-                <span className="text-slate-400">✕</span>
+              <span className="text-[10px] text-slate-400 leading-none mb-1">{index + 1}射目</span>
+              {arrowState === 1 ? (
+                <span className="text-red-600 text-xl leading-none">〇</span>
+              ) : arrowState === 0 ? (
+                <span className="text-slate-400 text-xl leading-none">✕</span>
               ) : (
-                <span className="text-slate-200">-</span>
+                <span className="text-slate-200 text-lg leading-none">-</span>
               )}
             </div>
           );
         })}
       </div>
 
-      {/* 入力ボタングループ（操作性・タップ領域重視） */}
+      {/* 入力ボタングループ（操作性・フールプルーフ: 矢数上限到達時は自動で無効化） */}
       <div className="grid grid-cols-3 gap-2">
         <Button
           type="button"
-          onClick={() => handleAddScore(1)}
-          disabled={scores.length >= totalArrows}
-          className="bg-red-600 hover:bg-red-700 text-white font-bold h-12 text-lg"
+          onClick={() => handleAddArrow(1)}
+          disabled={!isEditable || currentArrows.length >= maxArrows || isSyncing}
+          className="bg-red-600 hover:bg-red-700 text-white font-bold h-12 text-lg shadow-sm active:scale-95 transition-transform"
         >
           〇 (的中)
         </Button>
         <Button
           type="button"
-          onClick={() => handleAddScore(0)}
-          disabled={scores.length >= totalArrows}
+          onClick={() => handleAddArrow(0)}
+          disabled={!isEditable || currentArrows.length >= maxArrows || isSyncing}
           variant="secondary"
-          className="font-bold h-12 text-lg text-slate-700"
+          className="font-bold h-12 text-lg text-slate-800 bg-slate-200 hover:bg-slate-300 active:scale-95 transition-transform"
         >
           ✕ (不中)
         </Button>
         <Button
           type="button"
           onClick={handleUndo}
-          disabled={scores.length === 0}
+          disabled={!isEditable || currentArrows.length === 0 || isSyncing}
           variant="outline"
-          className="h-12 text-sm"
+          className="h-12 text-xs font-semibold text-slate-600 active:scale-95 transition-transform"
         >
           取消 (Undo)
         </Button>
       </div>
+
+      {/* エラーメッセージおよび同期中状態のフィードバック */}
+      {isSyncing && (
+        <p className="text-[11px] text-center text-slate-400 animate-pulse">Firestoreと同期中...</p>
+      )}
+      {errorMessage && (
+        <p className="text-[11px] text-center text-red-600 font-medium">{errorMessage}</p>
+      )}
     </div>
   );
 }
