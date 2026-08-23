@@ -1,11 +1,11 @@
 from fastapi import FastAPI, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, validator
 import logging
 import typing
 
-# 構造化ログ設定（フェイルセーフ: 障害発生時の原因究明を迅速化）
+# 構造化ログ設定（フェイルセーフ: 異常発生時の即時追跡・エラーログ収集）
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(filename)s:%(lineno)d - %(message)s"
@@ -13,7 +13,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="弓道大会運営システム API",
+    title="弓道大会運営システム 高度処理 API",
     description="大会進行状態の検証およびスコア・通知制御を行うバックエンドAPI",
     version="1.0.0"
 )
@@ -27,7 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# フェイルセーフ: 未捕捉例外のグローバルハンドラ（サーバーダウンを防ぎ安全側で500応答）
+# フェイルセーフ: グローバル例外ハンドラ（未捕捉の例外時もプロセスを落とさず安全側で500応答）
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.error(f"【システム障害ログ】未捕捉の例外が発生しました: URL={request.url.path}, Error={str(exc)}", exc_info=True)
@@ -51,15 +51,13 @@ class MatchRuleVerificationRequest(BaseModel):
     arrow_format: str = Field(..., description="試合形式（一手 または 四矢）")
     scores: typing.List[int] = Field(..., description="的中データ（0: ✕, 1: 〇）の配列")
 
-    @field_validator("arrow_format")
-    @classmethod
+    @validator("arrow_format")
     def validate_arrow_format(cls, value: str) -> str:
         if value not in ["一手", "四矢"]:
             raise ValueError("arrow_format は '一手' または '四矢' である必要があります。")
         return value
 
-    @field_validator("scores")
-    @classmethod
+    @validator("scores")
     def validate_scores_values(cls, scores: typing.List[int]) -> typing.List[int]:
         for idx, score in enumerate(scores):
             if score not in [0, 1]:
@@ -145,4 +143,4 @@ async def verify_match_rules(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

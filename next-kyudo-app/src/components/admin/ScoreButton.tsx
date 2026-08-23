@@ -1,8 +1,8 @@
 "use client";
 
 import React, { useState, useCallback } from "react";
-import { doc, updateDoc, serverTimestamp } from "firebase/firestore";
-import { db } from "@/lib/firebase";
+import { doc, setDoc, serverTimestamp } from "firebase/firestore";
+import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
 import { HitResult, PlayerScore } from "@/types";
 import { Button } from "@/components/ui/button";
 
@@ -21,7 +21,6 @@ export function ScoreButton({
   maxArrows = 4,
   isEditable = true,
 }: ScoreBoardProps) {
-  // ローカルステートで即時フィードバックを提供（楽観的UI）
   const [currentArrows, setCurrentArrows] = useState<HitResult[]>(player.arrows || []);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string>("");
@@ -29,34 +28,58 @@ export function ScoreButton({
   // Firestoreへの非同期保存関数（フェイルセーフ: 通信障害時のロールバックと構造化エラーログ）
   const syncScoreToFirestore = useCallback(
     async (updatedArrows: HitResult[], previousArrows: HitResult[]) => {
-      setIsSyncing(true);
-      setErrorMessage("");
-
-      // フールプルーフ: 型安全な合計的中数の計算（reduceに<number>を明示）
+      // フールプルーフ: 型安全な的中数集計
       const calculatedHits: number = updatedArrows.reduce<number>(
         (acc: number, cur: HitResult) => acc + cur,
         0
       );
       const isCompleted: boolean = updatedArrows.length >= maxArrows;
 
+      // フールプルーフ: 型ガードでFirestoreの存在を確認
+      if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
+        // Firebase未設定時はローカル更新のみで安全に動作（フェイルセーフ）
+        return;
+      }
+
+      setIsSyncing(true);
+      setErrorMessage("");
+
       try {
         const matchDocRef = doc(db, "scores", `${matchId}_stand_${standNumber}`);
 
-        // Firestoreへの更新（マージ更新パス）
-        await updateDoc(matchDocRef, {
-          [`playerScores.${player.playerId}.arrows`]: updatedArrows,
-          [`playerScores.${player.playerId}.totalHits`]: calculatedHits,
-          [`playerScores.${player.playerId}.isCompleted`]: isCompleted,
-          [`playerScores.${player.playerId}.updatedAt`]: Date.now(),
-          lastUpdated: serverTimestamp(),
-        });
-      } catch (error) {
+        // フェイルセーフ: updateDocではなくsetDoc(merge: true)を使用し、ドキュメント初回未作成時でも自動生成
+        await setDoc(
+          matchDocRef,
+          {
+            matchId: matchId,
+            standNumber: standNumber,
+            playerScores: {
+              [player.playerId]: {
+                playerId: player.playerId,
+                playerName: player.playerName,
+                position: player.position,
+                arrows: updatedArrows,
+                totalHits: calculatedHits,
+                isCompleted: isCompleted,
+                updatedAt: Date.now(),
+              },
+            },
+            lastUpdated: serverTimestamp(),
+          },
+          { merge: true } // 既存の他選手のスコアを破壊しないマージ書き込み
+        );
+      } catch (error: unknown) {
         // フェイルセーフ: Firestore書き込み失敗時に直前のローカル状態へロールバック
+        const errorDetail =
+          error instanceof Error
+            ? { message: error.message, stack: error.stack }
+            : String(error);
+
         console.error("【エラーログ】Firestoreへのスコア同期に失敗しました:", {
           matchId,
           playerId: player.playerId,
           attemptedArrows: updatedArrows,
-          error,
+          error: errorDetail,
         });
         setCurrentArrows(previousArrows);
         setErrorMessage("サーバーへのスコア保存に失敗しました。再試行してください。");
@@ -64,7 +87,7 @@ export function ScoreButton({
         setIsSyncing(false);
       }
     },
-    [matchId, standNumber, player.playerId, maxArrows]
+    [matchId, standNumber, player.playerId, player.playerName, player.position, maxArrows]
   );
 
   // 的中（〇）または不中（✕）の入力処理
@@ -78,7 +101,6 @@ export function ScoreButton({
     const previous = [...currentArrows];
     const updated = [...currentArrows, result];
 
-    // 楽観的更新
     setCurrentArrows(updated);
     syncScoreToFirestore(updated, previous);
   };
@@ -93,7 +115,6 @@ export function ScoreButton({
     const previous = [...currentArrows];
     const updated = currentArrows.slice(0, -1);
 
-    // 楽観的更新
     setCurrentArrows(updated);
     syncScoreToFirestore(updated, previous);
   };
@@ -120,7 +141,7 @@ export function ScoreButton({
         </div>
       </div>
 
-      {/* 的中表示インジケーター（UI/UX: 一目で的中状況がわかるグリッド配置） */}
+      {/* 的中表示インジケーター */}
       <div className="grid grid-cols-4 gap-2 py-2 bg-slate-50 border border-slate-100 rounded px-2">
         {Array.from({ length: maxArrows }).map((_, index) => {
           const arrowState = currentArrows[index];
@@ -142,7 +163,7 @@ export function ScoreButton({
         })}
       </div>
 
-      {/* 入力ボタングループ（操作性・フールプルーフ: 矢数上限到達時は自動で無効化） */}
+      {/* 入力ボタングループ（操作性重視 / 上限到達時無効化） */}
       <div className="grid grid-cols-3 gap-2">
         <Button
           type="button"

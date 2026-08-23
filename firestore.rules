@@ -2,7 +2,8 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ユーザーがシステム管理者（役員）であるか判定するヘルパー関数（フールプルーフ）
+    // ユーザーがシステム管理者（役員）であるか判定するヘルパー関数
+    // フールプルーフ: トークンおよび管理者クレームの存在を厳密に検証
     function isAdmin() {
       return request.auth != null && request.auth.token.admin == true;
     }
@@ -22,7 +23,7 @@ service cloud.firestore {
     }
 
     // teams コレクション（立順、チーム構成）
-    // フェイルセーフ: 参加者による誤操作での立順改変を防ぐため読み取りのみ全開放
+    // フェイルセーフ: 参加者の誤操作による立順破壊を防ぐため、書き込み権限を管理者のみに制限
     match /teams/{teamId} {
       allow read: if true;
       allow create, update, delete: if isAdmin();
