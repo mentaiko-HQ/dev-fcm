@@ -2,7 +2,7 @@ import { onDocumentWritten, FirestoreEvent, Change } from "firebase-functions/v2
 import { DocumentSnapshot } from "firebase-admin/firestore";
 import * as admin from "firebase-admin";
 
-// フェイルセーフ: Firebase Admin SDKの多重初期化を防止し、初期化エラー時はログを出力
+// フェイルセーフ: Firebase Admin SDKの多重初期化を防止し、初期化エラー時は構造化ログを出力
 if (admin.apps.length === 0) {
   try {
     admin.initializeApp();
@@ -39,7 +39,7 @@ export const onMatchProgressUpdated = onDocumentWritten(
     document: "matches/{matchId}",
     region: "asia-northeast1",
     maxInstances: 10,
-    retry: false, // 二重通知事故を防ぐため自動リトライは無効化（フールプルーフ）
+    retry: false, // フールプルーフ: 二重通知事故防止のため自動リトライは無効化
   },
   async (event: FirestoreEvent<Change<DocumentSnapshot> | undefined, { matchId: string }>) => {
     if (!event.data?.after || !event.data.after.exists) {
@@ -80,7 +80,7 @@ export const onMatchProgressUpdated = onDocumentWritten(
         const teamId: string = teamDoc.id;
         const teamName: string = typeof teamData.name === "string" ? teamData.name : `第${targetStandNumber}立`;
 
-        // 該当チームを選択しているユーザー（選手・付添者）を検索
+        // 該当チームを選択しているユーザー（選手・付添者の登録端末）を検索
         const usersSnapshot = await db
           .collection("users")
           .where("selectedTeamId", "==", teamId)
@@ -98,11 +98,13 @@ export const onMatchProgressUpdated = onDocumentWritten(
         });
 
         if (tokens.length === 0) {
-          console.log(`【招集通知】チーム「${teamName}」(ID: ${teamId}) に紐付く有効なFCMトークンがありません。`);
+          console.log(`【招集通知】チーム「${teamName}」(ID: ${teamId}) に紐付く有効なFCMトークンがありません。端末登録状況を確認してください。`);
           continue;
         }
 
-        // マルチキャスト通知ペイロードの構築（重要通知設定）
+        console.log(`【通知送信開始】チーム「${teamName}」の ${tokens.length} 件のデバイスへFCM送信を実行します。`);
+
+        // マルチキャスト通知ペイロードの構築
         const payload: admin.messaging.MulticastMessage = {
           tokens: tokens,
           notification: {
@@ -113,11 +115,17 @@ export const onMatchProgressUpdated = onDocumentWritten(
             standNumber: String(targetStandNumber),
             teamId: teamId,
             matchId: event.params.matchId,
+            click_action: "http://localhost:3000",
           },
           webpush: {
+            headers: {
+              Urgency: "high",
+            },
             notification: {
               tag: `stand-${targetStandNumber}`,
               requireInteraction: true,
+              icon: "/favicon.ico",
+              badge: "/favicon.ico",
             },
           },
         };

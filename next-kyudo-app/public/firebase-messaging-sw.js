@@ -11,18 +11,17 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(clients.claim());
 });
 
-// フェイルセーフ: サービスワーカー内での初期化エラーを安全に捕捉
-try {
-  // 環境変数ではなくクライアント公開設定（Firebase Console上のWebアプリ構成値）
-  const firebaseConfig = {
-    apiKey: "AIzaSyYourActualApiKeyHere",
-    authDomain: "kyudoapp-dev-fcm.firebaseapp.com",
-    projectId: "kyudoapp-dev-fcm",
-    storageBucket: "kyudoapp-dev-fcm.appspot.com",
-    messagingSenderId: "123456789012",
-    appId: "1:123456789012:web:abcdef123456"
-  };
+// クライアント公開用設定値
+const firebaseConfig = {
+  apiKey: "AIzaSyDummyKeyReplaceWithActualIfConfigured",
+  authDomain: "kyudoapp-dev-fcm.firebaseapp.com",
+  projectId: "kyudoapp-dev-fcm",
+  storageBucket: "kyudoapp-dev-fcm.appspot.com",
+  messagingSenderId: "123456789012",
+  appId: "1:123456789012:web:abcdef123456"
+};
 
+try {
   firebase.initializeApp(firebaseConfig);
   const messaging = firebase.messaging();
 
@@ -44,7 +43,7 @@ try {
     self.registration.showNotification(notificationTitle, notificationOptions);
   });
 } catch (error) {
-  console.error("【エラーログ】サービスワーカーの初期化または通知処理に失敗しました:", error);
+  console.error("【エラーログ】サービスワーカー初期化失敗:", error);
 }
 
 // 通知クリック時のフォーカス制御

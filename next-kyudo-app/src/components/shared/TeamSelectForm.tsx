@@ -24,6 +24,7 @@ export function TeamSelectForm() {
   const [teams, setTeams] = useState<TeamOption[]>(FALLBACK_TEAMS);
   const [selectedTeamId, setSelectedTeamId] = useState<string>("");
   const [currentRegisteredTeam, setCurrentRegisteredTeam] = useState<string | null>(null);
+  const [currentRegisteredToken, setCurrentRegisteredToken] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>("");
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [localUserId, setLocalUserId] = useState<string>("");
@@ -43,12 +44,10 @@ export function TeamSelectForm() {
     }
   }, []);
 
-  // Firestoreからteamsコレクションを動的取得（フェイルセーフ: 失敗時はFALLBACK_TEAMSを維持）
+  // Firestoreからteamsコレクションを動的取得
   useEffect(() => {
-    // フールプルーフ: 型ガードでFirestoreの利用可否を判定
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
-    // フールプルーフ: 非同期クロージャ内での型推論を固定しTS2769エラーを解消
     const firestoreInstance = db;
     let isMounted = true;
 
@@ -68,7 +67,6 @@ export function TeamSelectForm() {
             });
           });
 
-          // 立順番号順にソート（フールプルーフ: 誤表示防止）
           loadedTeams.sort((a, b) => (a.standNumber || 0) - (b.standNumber || 0));
           setTeams(loadedTeams);
         }
@@ -102,6 +100,9 @@ export function TeamSelectForm() {
             setCurrentRegisteredTeam(data.selectedTeamId);
             setSelectedTeamId(data.selectedTeamId);
           }
+          if (data && typeof data.fcmToken === "string" && data.fcmToken.length > 0) {
+            setCurrentRegisteredToken(data.fcmToken);
+          }
         }
       } catch (error) {
         console.error("【エラーログ】既存チーム情報の復元に失敗しました:", error);
@@ -131,7 +132,7 @@ export function TeamSelectForm() {
 
     const firestoreInstance = db;
     setIsProcessing(true);
-    setStatusMessage("通知設定および登録を処理中...");
+    setStatusMessage("端末通知の許可確認および登録を処理中...");
 
     try {
       const token = await requestFcmToken();
@@ -149,7 +150,12 @@ export function TeamSelectForm() {
       );
 
       setCurrentRegisteredTeam(selectedTeamId);
-      setStatusMessage("登録が完了しました。出番の2立前に招集通知が届きます。");
+      setCurrentRegisteredToken(token);
+      setStatusMessage(
+        token
+          ? "【端末登録完了】FCMトークンが正常に登録されました。2立前に呼出通知が届きます。"
+          : "チームを登録しました（※FCMトークンが未取得のため通知は無効です。ブラウザの通知許可をご確認ください）。"
+      );
     } catch (error: unknown) {
       console.error("【エラーログ】チーム登録・通知設定中にエラーが発生しました:", error);
       setStatusMessage("登録処理に失敗しました。通信環境をご確認ください。");
@@ -162,6 +168,7 @@ export function TeamSelectForm() {
     // フェイルセーフ: Firebase未接続時のローカル解除対応
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
       setCurrentRegisteredTeam(null);
+      setCurrentRegisteredToken(null);
       setSelectedTeamId("");
       setStatusMessage("【ローカルモード】チームの紐付けを解除しました。");
       return;
@@ -182,6 +189,7 @@ export function TeamSelectForm() {
         { merge: true }
       );
       setCurrentRegisteredTeam(null);
+      setCurrentRegisteredToken(null);
       setSelectedTeamId("");
       setStatusMessage("チームの紐付けを解除しました。");
     } catch (error: unknown) {
@@ -193,22 +201,34 @@ export function TeamSelectForm() {
   };
 
   return (
-    <div className="w-full max-w-md p-6 bg-white border border-slate-200 rounded-lg shadow-sm">
-      <h2 className="text-lg font-bold text-slate-800 mb-2">参加チーム選択 / 招集通知設定</h2>
-      <p className="text-sm text-slate-600 mb-4">
-        所属する立（チーム）を選択すると、出番の2立前に自動で呼出プッシュ通知が届きます。
-      </p>
+    <div className="w-full max-w-md p-6 bg-white border border-slate-200 rounded-lg shadow-sm space-y-4">
+      <div>
+        <h2 className="text-lg font-bold text-slate-800 mb-1">参加チーム選択 / 招集通知設定</h2>
+        <p className="text-sm text-slate-600">
+          所属する立（チーム）を選択して登録すると、この端末に出番の2立前の呼出プッシュ通知が届きます。
+        </p>
+      </div>
 
       {currentRegisteredTeam && (
-        <div className="mb-4 p-3 bg-slate-50 border border-slate-200 rounded text-sm text-slate-700">
-          現在登録中:{" "}
-          <span className="font-semibold text-slate-900">
-            {teams.find((t) => t.id === currentRegisteredTeam)?.name || currentRegisteredTeam}
-          </span>
+        <div className="p-3 bg-slate-50 border border-slate-200 rounded text-sm text-slate-700 space-y-1">
+          <div>
+            現在登録中:{" "}
+            <span className="font-semibold text-slate-900">
+              {teams.find((t) => t.id === currentRegisteredTeam)?.name || currentRegisteredTeam}
+            </span>
+          </div>
+          <div className="text-[11px] text-slate-500">
+            FCMトークン（端末状態）:{" "}
+            {currentRegisteredToken ? (
+              <span className="text-green-600 font-bold">有効（プッシュ通知受信可能）</span>
+            ) : (
+              <span className="text-amber-600 font-bold">未取得（通知不可 / ブラウザ許可が必要）</span>
+            )}
+          </div>
         </div>
       )}
 
-      <div className="mb-4">
+      <div>
         <label htmlFor="team-select" className="block text-sm font-medium text-slate-700 mb-1">
           立・チーム選択
         </label>
@@ -234,7 +254,7 @@ export function TeamSelectForm() {
           disabled={isProcessing || !selectedTeamId}
           className="flex-1"
         >
-          {isProcessing ? "処理中..." : "チームを登録 / 更新"}
+          {isProcessing ? "処理中..." : "この端末をチームに登録 / 更新"}
         </Button>
         {currentRegisteredTeam && (
           <Button
@@ -248,7 +268,7 @@ export function TeamSelectForm() {
       </div>
 
       {statusMessage && (
-        <p className="mt-3 text-xs text-center text-slate-600 font-medium">
+        <p className="text-xs text-center text-slate-600 font-medium bg-slate-50 p-2 rounded border border-slate-200">
           {statusMessage}
         </p>
       )}

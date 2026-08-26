@@ -35,10 +35,10 @@ export async function requestFcmToken(): Promise<string | null> {
     // サービスワーカーの登録
     await navigator.serviceWorker.register("/firebase-messaging-sw.js");
 
-    // フェイルセーフ & フールプルーフ: Service Workerがアクティブになるまで待機（No active Service Workerエラーを完全に排除）
+    // フェイルセーフ & フールプルーフ: Service Workerがアクティブになるまで待機
     const activeRegistration = await navigator.serviceWorker.ready;
 
-    // フールプルーフ: VAPIDキーが未設定の場合は警告を出力
+    // フールプルーフ: VAPIDキーの検証
     if (!VAPID_KEY) {
       console.warn("【通知警告】NEXT_PUBLIC_FIREBASE_VAPID_KEY が設定されていません。Firebase ConsoleのCloud MessagingタブよりWeb Push 証明書キーを設定してください。");
     }
@@ -56,7 +56,6 @@ export async function requestFcmToken(): Promise<string | null> {
       return null;
     }
   } catch (error: unknown) {
-    // フェイルセーフ: 例外発生時もアプリ全体をクラッシュさせずに構造化エラーログを出力しnullを返却
     const errorDetail =
       error instanceof Error
         ? { message: error.message, stack: error.stack }

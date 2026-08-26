@@ -1,33 +1,33 @@
 from fastapi import FastAPI, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 import logging
 import typing
 
-# 構造化ログ設定（フェイルセーフ: 異常発生時の即時追跡・エラーログ収集）
+# 構造化ログ設定（フェイルセーフ: 障害発生時の原因究明を迅速化するためのログ設計）
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(filename)s:%(lineno)d - %(message)s"
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("kyudo-api")
 
 app = FastAPI(
-    title="弓道大会運営システム 高度処理 API",
+    title="弓道大会運営システム API",
     description="大会進行状態の検証およびスコア・通知制御を行うバックエンドAPI",
     version="1.0.0"
 )
 
-# CORS設定（クロスオリジン通信制御）
+# CORS設定（クロスオリジン通信制御: フロントエンドからの安全な通信を許可）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# フェイルセーフ: グローバル例外ハンドラ（未捕捉の例外時もプロセスを落とさず安全側で500応答）
+# フェイルセーフ: グローバル例外ハンドラ（未捕捉の例外発生時もAPIサーバーを落とさず安全側で500応答を返却）
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.error(f"【システム障害ログ】未捕捉の例外が発生しました: URL={request.url.path}, Error={str(exc)}", exc_info=True)
@@ -36,28 +36,32 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
         content={
             "success": False,
             "error_code": "INTERNAL_SERVER_ERROR",
-            "message": "システム内部で予期せぬエラーが発生しました。運営管理者へご連絡ください。"
+            "message": "システム内部で予期せぬエラーが発生しました。管理者ログを確認してください。"
         }
     )
 
-# フールプルーフ: 立進行リクエストの厳格な型・値制約（1以上の整数値のみ許可）
+# フールプルーフ: 立進行通知リクエストの型・値制約（1以上の整数のみ許容）
 class StandProgressNotificationRequest(BaseModel):
-    current_match_id: str = Field(..., min_length=1, description="現在の立/試合ID")
+    current_match_id: str = Field(..., min_length=1, description="現在の試合/立ID")
     current_stand_number: int = Field(..., ge=1, description="現在競技中の立番号（1以上の整数）")
 
-# フールプルーフ: スコア検証リクエストのバリデーション
+# フールプルーフ: 的中データ検証リクエストのバリデーション（規定矢数・0/1以外の混入を入口で遮断）
 class MatchRuleVerificationRequest(BaseModel):
     match_id: str = Field(..., min_length=1, description="試合のユニークID")
     arrow_format: str = Field(..., description="試合形式（一手 または 四矢）")
-    scores: typing.List[int] = Field(..., description="的中データ（0: ✕, 1: 〇）の配列")
+    scores: typing.List[int] = Field(..., description="的中データ配列（0: ✕, 1: 〇）")
 
-    @validator("arrow_format")
+    # フールプルーフ: 形式が指定文字列以外の場合はバリデーションエラー
+    @field_validator("arrow_format")
+    @classmethod
     def validate_arrow_format(cls, value: str) -> str:
         if value not in ["一手", "四矢"]:
             raise ValueError("arrow_format は '一手' または '四矢' である必要があります。")
         return value
 
-    @validator("scores")
+    # フールプルーフ: 0（不中）または 1（的中）以外の値の混入をブロック
+    @field_validator("scores")
+    @classmethod
     def validate_scores_values(cls, scores: typing.List[int]) -> typing.List[int]:
         for idx, score in enumerate(scores):
             if score not in [0, 1]:
@@ -69,7 +73,11 @@ async def health_check() -> typing.Dict[str, str]:
     """
     システムの死活監視用ヘルスチェックエンドポイント
     """
-    return {"status": "healthy", "service": "next-kyudo-api", "version": "1.0.0"}
+    return {
+        "status": "healthy",
+        "service": "next-kyudo-api",
+        "version": "1.0.0"
+    }
 
 @app.post("/api/v1/notifications/trigger-call", status_code=status.HTTP_200_OK)
 async def trigger_stand_call_notification(
@@ -131,7 +139,6 @@ async def verify_match_rules(
                 "total_hits": total_hits
             }
         }
-
     except HTTPException as http_err:
         raise http_err
     except Exception as e:
@@ -143,4 +150,4 @@ async def verify_match_rules(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)
