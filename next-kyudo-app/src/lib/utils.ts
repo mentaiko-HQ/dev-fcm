@@ -1,10 +1,10 @@
-import { type ClassValue, clsx } from 'clsx';
-import { twMerge } from 'tailwind-merge';
+import { type ClassValue, clsx } from "clsx";
+import { twMerge } from "tailwind-merge";
 
 /**
- * クラス名を安全に結合し、Tailwind CSSのクラス競合を自動解決するユーティリティ関数
- * フールプルーフ: 不正な型や重複クラスの混入を防止する
+ * shadcn/ui クラス名マージユーティリティ
+ * フールプルーフ: 不正な型や重複したTailwindクラスを安全に統合
  */
-export function cn(...inputs: ClassValue[]): string {
+export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }

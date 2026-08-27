@@ -94,7 +94,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
           teamDocRef,
           {
             name: team.name,
-            standNumber: Number(team.standNumber), // 数値型として明示的にキャスト
+            standNumber: Number(team.standNumber),
             division: team.division,
             updatedAt: Date.now(),
           },
