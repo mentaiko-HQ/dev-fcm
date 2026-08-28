@@ -3,8 +3,11 @@
 // 射数形式（一手: 2本, 四矢: 4本）
 export type ArrowCountFormat = "一手" | "四矢";
 
-// 順位決定戦・競射ルール（射詰: サドンデス、遠近: 的中心からの距離比較）
+// 順位決定戦・競射ルール（射詰: サドンデス、遠近: 審判判定による順位直接入力）
 export type TieBreakerFormat = "射詰" | "遠近";
+
+// 競技モード（本戦 / 射詰競射 / 遠近競射）
+export type MatchMode = "本戦" | "射詰競射" | "遠近競射";
 
 // 的中結果の厳密な型定義（1: 〇的中, 0: ✕不中）
 export type HitResult = 1 | 0;
@@ -28,6 +31,10 @@ export interface PlayerScore {
   arrows: HitResult[];                   // 入力された矢の結果配列
   totalHits: number;                     // 的中合計数 (0以上の整数)
   isCompleted: boolean;                  // 規定射数終了フラグ
+  isPerfect: boolean;                    // 皆中フラグ
+  tieBreakerArrows?: HitResult[];        // 射詰競射時の矢の結果配列
+  enkinRank?: number | null;             // 遠近競射時の決定順位（1: 1位, 2: 2位, ... / null: 未設定）
+  finalRank?: number | null;             // 確定順位（1位〜）
   updatedAt: number;                     // 最終更新エポックミリ秒
 }
 
@@ -38,6 +45,7 @@ export interface StandMatchScore {
   teamId: string;
   teamName: string;
   format: MatchFormat;
+  mode: MatchMode;                       // 現在の入力モード（本戦 / 射詰 / 遠近）
   playerScores: Record<string, PlayerScore>; // 選手IDをキーとするスコアマップ
   totalTeamHits: number;                 // チーム総的中数
   updatedAt: number;

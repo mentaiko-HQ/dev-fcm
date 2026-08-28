@@ -14,7 +14,6 @@ service cloud.firestore {
     }
 
     // users コレクション（FCMトークン・チーム紐付け）
-    // フールプルーフ: 他人のドキュメントに対する不正な書き込み・上書きを防止
     match /users/{userId} {
       allow read: if true;
       allow create, update: if true;
@@ -22,26 +21,24 @@ service cloud.firestore {
     }
 
     // teams コレクション（立順、チーム構成）
-    // フェイルセーフ: 参加者の誤操作による立順破壊を防ぐため、書き込み権限を管理者のみに制限
     match /teams/{teamId} {
       allow read: if true;
       allow create, update, delete: if true;
     }
 
-    // entries コレクション（エントリー情報）
+    // entries コレクション（参加者・立順データ・最終順位）
     match /entries/{entryId} {
       allow read: if true;
-      allow create: if true;
-      allow update, delete: if isAdmin();
+      allow create, update, delete: if true;
     }
 
-    // matches コレクション（試合進行、立の進行管理）
+    // matches コレクション（試合進行、立の進行管理、競技形式設定）
     match /matches/{matchId} {
       allow read: if true;
       allow create, update, delete: if true;
     }
 
-    // scores コレクション（的中データ）
+    // scores コレクション（リアルタイム的中データ）
     match /scores/{scoreId} {
       allow read: if true;
       allow create, update, delete: if true;

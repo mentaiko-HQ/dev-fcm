@@ -75,7 +75,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
     return () => unsubscribe();
   }, [matchId]);
 
-  // Firestore初期コレクション（teams, matches）の一括投入処理（フールプルーフ: 手動入力を排除し型事故を防止）
+  // Firestore初期コレクション（teams, matches, entries）の一括投入処理
   const handleSeedFirestore = async () => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
       setStatusMessage("Firebase環境変数が設定されていません。");
@@ -84,10 +84,10 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
 
     const firestoreInstance = db;
     setIsSeeding(true);
-    setStatusMessage("Firestore初期データ（teams, matches）を書き込み中...");
+    setStatusMessage("Firestore初期データ（teams, matches, entries）を書き込み中...");
 
     try {
-      // 1. teams コレクションの初期化（TypeScriptの数値型として確実に書き込み）
+      // 1. teams コレクションの初期化
       for (const team of INITIAL_TEAMS_DATA) {
         const teamDocRef = doc(firestoreInstance, "teams", team.id);
         await setDoc(
@@ -116,7 +116,23 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
         { merge: true }
       );
 
-      setStatusMessage("【成功】Firestoreに teams および matches コレクションが正常に作成されました。");
+      // 3. entries コレクションのサンプル初期化
+      const sampleEntries = [
+        { id: "p1", standNumber: 1, position: "大前", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "佐藤 健一", division: "一般男子", status: "行射中", totalHits: 4, totalShots: 4, isPerfect: true, enkinRank: null },
+        { id: "p2", standNumber: 1, position: "中", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "鈴木 隆", division: "一般男子", status: "行射中", totalHits: 3, totalShots: 4, isPerfect: false, enkinRank: null },
+        { id: "p3", standNumber: 1, position: "落", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "高橋 誠", division: "一般男子", status: "行射中", totalHits: 2, totalShots: 4, isPerfect: false, enkinRank: null },
+        { id: "p4", standNumber: 2, position: "大前", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "田中 美咲", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+        { id: "p5", standNumber: 2, position: "中", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "渡辺 彩花", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+        { id: "p6", standNumber: 2, position: "落", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "小林 葵", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+        { id: "p7", standNumber: 3, position: "大前", teamId: "team_03", teamName: "第三立（春日白鷺会）", playerName: "伊藤 剛", division: "シニア男子", status: "待機中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+        { id: "p8", standNumber: 3, position: "落", teamId: "team_03", teamName: "第三立（春日白鷺会）", playerName: "山本 翔太", division: "シニア男子", status: "待機中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+      ];
+
+      for (const entry of sampleEntries) {
+        await setDoc(doc(firestoreInstance, "entries", entry.id), entry, { merge: true });
+      }
+
+      setStatusMessage("【成功】Firestoreに teams, matches, entries コレクションが正常に作成されました。");
     } catch (error: unknown) {
       console.error("【エラーログ】Firestore初期データ作成中にエラーが発生しました:", error);
       setStatusMessage("初期データの書き込みに失敗しました。Firestoreルールを確認してください。");

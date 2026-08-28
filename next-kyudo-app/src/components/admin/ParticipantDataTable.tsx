@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect } from "react";
 import {
   ColumnDef,
   flexRender,
@@ -12,6 +12,8 @@ import {
   SortingState,
   ColumnFiltersState,
 } from "@tanstack/react-table";
+import { collection, onSnapshot, query, orderBy } from "firebase/firestore";
+import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
 import { Participant, ParticipantStatus, DivisionType } from "@/types/participant";
 import {
   Table,
@@ -22,27 +24,68 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
-import { ArrowUpDown, Search, RefreshCcw } from "lucide-react";
+import { ArrowUpDown, Search, RefreshCcw, Trophy, Download } from "lucide-react";
 
-const INITIAL_PARTICIPANTS: Participant[] = [
-  { id: "p1", standNumber: 1, position: "大前", teamId: "t1", teamName: "福岡弓道倶楽部A", playerName: "佐藤 健一", division: "一般男子", status: "行射中", totalHits: 3, totalShots: 4 },
-  { id: "p2", standNumber: 1, position: "中", teamId: "t1", teamName: "福岡弓道倶楽部A", playerName: "鈴木 隆", division: "一般男子", status: "行射中", totalHits: 4, totalShots: 4 },
-  { id: "p3", standNumber: 1, position: "落", teamId: "t1", teamName: "福岡弓道倶楽部A", playerName: "高橋 誠", division: "一般男子", status: "行射中", totalHits: 2, totalShots: 4 },
-  { id: "p4", standNumber: 2, position: "大前", teamId: "t2", teamName: "博多紅葉会", playerName: "田中 美咲", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0 },
-  { id: "p5", standNumber: 2, position: "中", teamId: "t2", teamName: "博多紅葉会", playerName: "渡辺 彩花", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0 },
-  { id: "p6", standNumber: 2, position: "落", teamId: "t2", teamName: "博多紅葉会", playerName: "小林 葵", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0 },
-  { id: "p7", standNumber: 3, position: "大前", teamId: "t3", teamName: "春日白鷺会", playerName: "伊藤 剛", division: "シニア男子", status: "待機中", totalHits: 0, totalShots: 0 },
-  { id: "p8", standNumber: 3, position: "落", teamId: "t3", teamName: "春日白鷺会", playerName: "山本 翔太", division: "シニア男子", status: "待機中", totalHits: 0, totalShots: 0 },
-  { id: "p9", standNumber: 4, position: "大前", teamId: "t4", teamName: "筑紫野葵会", playerName: "中村 陽子", division: "シニア女子", status: "待機中", totalHits: 0, totalShots: 0 },
+// 静的初期フォールバックデータ
+const FALLBACK_PARTICIPANTS: Participant[] = [
+  { id: "p1", standNumber: 1, position: "大前", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "佐藤 健一", division: "一般男子", status: "行射中", totalHits: 4, totalShots: 4, isPerfect: true, enkinRank: null },
+  { id: "p2", standNumber: 1, position: "中", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "鈴木 隆", division: "一般男子", status: "行射中", totalHits: 3, totalShots: 4, isPerfect: false, enkinRank: null },
+  { id: "p3", standNumber: 1, position: "落", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "高橋 誠", division: "一般男子", status: "行射中", totalHits: 2, totalShots: 4, isPerfect: false, enkinRank: null },
+  { id: "p4", standNumber: 2, position: "大前", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "田中 美咲", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+  { id: "p5", standNumber: 2, position: "中", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "渡辺 彩花", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+  { id: "p6", standNumber: 2, position: "落", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "小林 葵", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+  { id: "p7", standNumber: 3, position: "大前", teamId: "team_03", teamName: "第三立（春日白鷺会）", playerName: "伊藤 剛", division: "シニア男子", status: "待機中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: 1 },
+  { id: "p8", standNumber: 3, position: "落", teamId: "team_03", teamName: "第三立（春日白鷺会）", playerName: "山本 翔太", division: "シニア男子", status: "待機中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: 2 },
 ];
 
 export function ParticipantDataTable() {
-  const [data] = useState<Participant[]>(INITIAL_PARTICIPANTS);
+  const [data, setData] = useState<Participant[]>(FALLBACK_PARTICIPANTS);
   const [sorting, setSorting] = useState<SortingState>([{ id: "standNumber", desc: false }]);
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
   const [globalFilter, setGlobalFilter] = useState<string>("");
   const [selectedDivision, setSelectedDivision] = useState<string>("ALL");
   const [selectedStatus, setSelectedStatus] = useState<string>("ALL");
+
+  // Firestore `entries` コレクションのリアルタイム購読（フェイルセーフ）
+  useEffect(() => {
+    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
+
+    const firestoreInstance = db;
+    const entriesQuery = query(collection(firestoreInstance, "entries"), orderBy("standNumber", "asc"));
+
+    const unsubscribe = onSnapshot(
+      entriesQuery,
+      (snapshot) => {
+        if (!snapshot.empty) {
+          const loaded: Participant[] = [];
+          snapshot.forEach((docSnap) => {
+            const raw = docSnap.data();
+            loaded.push({
+              id: docSnap.id,
+              standNumber: Number(raw.standNumber) || 1,
+              position: raw.position || "大前",
+              teamId: raw.teamId || "",
+              teamName: raw.teamName || "所属未設定",
+              playerName: raw.playerName || "選手名未設定",
+              division: raw.division || "一般男子",
+              status: raw.status || "待機中",
+              totalHits: Number(raw.totalHits) || 0,
+              totalShots: Number(raw.totalShots) || 0,
+              isPerfect: Boolean(raw.isPerfect),
+              enkinRank: typeof raw.enkinRank === "number" ? raw.enkinRank : null,
+              finalRank: typeof raw.finalRank === "number" ? raw.finalRank : null,
+            });
+          });
+          setData(loaded);
+        }
+      },
+      (error) => {
+        console.warn("【警告】entriesコレクション購読失敗。フォールバックデータを使用します:", error);
+      }
+    );
+
+    return () => unsubscribe();
+  }, []);
 
   const getStatusBadge = (status: ParticipantStatus) => {
     switch (status) {
@@ -59,6 +102,34 @@ export function ParticipantDataTable() {
       default:
         return <span className="text-xs text-slate-500">-</span>;
     }
+  };
+
+  // CSVエクスポート処理
+  const handleExportCSV = () => {
+    const headers = ["立順", "立ち位置", "所属チーム", "選手氏名", "部門", "ステータス", "的中数", "射数", "皆中", "遠近順位", "総合確定順位"];
+    const rows = filteredData.map((p) => [
+      `第${p.standNumber}立`,
+      p.position,
+      `"${p.teamName}"`,
+      `"${p.playerName}"`,
+      p.division,
+      p.status,
+      p.totalHits,
+      p.totalShots,
+      p.isPerfect ? "皆中" : "",
+      p.enkinRank ? `${p.enkinRank}位` : "",
+      p.finalRank ? `${p.finalRank}位` : ""
+    ]);
+
+    const csvContent = "\uFEFF" + [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `kyudo_match_results_${new Date().toISOString().slice(0, 10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
   };
 
   const columns = useMemo<ColumnDef<Participant>[]>(
@@ -114,8 +185,13 @@ export function ParticipantDataTable() {
         accessorKey: "playerName",
         header: "選手氏名",
         cell: ({ row }) => (
-          <div className="font-medium text-slate-900">
+          <div className="font-medium text-slate-900 flex items-center gap-1.5">
             {row.getValue<string>("playerName")}
+            {row.original.isPerfect && (
+              <span title="皆中" className="inline-flex items-center">
+                <Trophy className="w-3.5 h-3.5 text-red-600 shrink-0" />
+              </span>
+            )}
           </div>
         ),
       },
@@ -157,6 +233,29 @@ export function ParticipantDataTable() {
           );
         },
       },
+      {
+        accessorKey: "finalRank",
+        header: "確定順位",
+        cell: ({ row }) => {
+          const rank = row.original.finalRank;
+          return (
+            <div className="text-center font-bold">
+              {rank ? (
+                <span className={`text-xs px-2 py-0.5 rounded ${
+                  rank === 1 ? "bg-amber-100 text-amber-900 font-black border border-amber-300" :
+                  rank === 2 ? "bg-slate-200 text-slate-900 border border-slate-300" :
+                  rank === 3 ? "bg-amber-50 text-amber-800 border border-amber-200" :
+                  "bg-slate-100 text-slate-700"
+                }`}>
+                  第 {rank} 位
+                </span>
+              ) : (
+                <span className="text-slate-300 text-xs">-</span>
+              )}
+            </div>
+          );
+        },
+      },
     ],
     []
   );
@@ -170,9 +269,9 @@ export function ParticipantDataTable() {
         return false;
       }
       if (globalFilter.trim().length > 0) {
-        const query = globalFilter.toLowerCase();
-        const matchesPlayer = (item.playerName || "").toLowerCase().includes(query);
-        const matchesTeam = (item.teamName || "").toLowerCase().includes(query);
+        const queryStr = globalFilter.toLowerCase();
+        const matchesPlayer = (item.playerName || "").toLowerCase().includes(queryStr);
+        const matchesTeam = (item.teamName || "").toLowerCase().includes(queryStr);
         if (!matchesPlayer && !matchesTeam) {
           return false;
         }
@@ -252,6 +351,11 @@ export function ParticipantDataTable() {
           <Button variant="outline" size="sm" onClick={handleResetFilters} className="h-9 px-3">
             <RefreshCcw className="h-3.5 w-3.5 mr-1" />
             リセット
+          </Button>
+
+          <Button variant="outline" size="sm" onClick={handleExportCSV} className="h-9 px-3 font-bold">
+            <Download className="h-3.5 w-3.5 mr-1" />
+            CSV出力
           </Button>
         </div>
       </div>

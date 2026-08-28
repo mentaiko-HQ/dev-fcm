@@ -18,14 +18,18 @@ export type ShootingPosition = "大前" | "二番" | "中" | "落前" | "落";
 
 // 参加選手エンティティのインターフェース
 export interface Participant {
-  id: string;              // 選手固有ID
-  standNumber: number;     // 立順番号（1以上の整数）
+  id: string;                 // 選手固有ID
+  standNumber: number;        // 立順番号（1以上の整数）
   position: ShootingPosition; // 立ち位置
-  teamId: string;          // 所属チームID
-  teamName: string;        // チーム・所属団体名
-  playerName: string;      // 選手氏名
-  division: DivisionType;  // 部門
-  status: ParticipantStatus; // 招集・競技ステータス
-  totalHits: number;       // 現在の的中数（0以上の整数）
-  totalShots: number;      // 射数（例: 4本、8本など）
+  teamId: string;             // 所属チームID
+  teamName: string;           // チーム・所属団体名
+  playerName: string;         // 選手氏名
+  division: DivisionType;     // 部門
+  status: ParticipantStatus;  // 招集・競技ステータス
+  totalHits: number;          // 現在の的中数（0以上の整数）
+  totalShots: number;         // 射数（例: 2本、4本など）
+  isPerfect?: boolean;        // 皆中フラグ
+  enkinRank?: number | null;  // 遠近順位（決定順位）
+  finalRank?: number | null;  // 総合確定順位
+  updatedAt?: number;         // 最終更新エポックミリ秒
 }

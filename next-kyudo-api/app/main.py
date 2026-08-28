@@ -14,7 +14,7 @@ logger = logging.getLogger("kyudo-api")
 
 app = FastAPI(
     title="弓道大会運営システム API",
-    description="大会進行状態の検証およびスコア・通知制御を行うバックエンドAPI",
+    description="大会進行状態の検証およびスコア・通知・遠近順位制御を行うバックエンドAPI",
     version="1.0.0"
 )
 
@@ -27,7 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# フェイルセーフ: グローバル例外ハンドラ（未捕捉の例外発生時もAPIサーバーを落とさず安全側で500応答を返却）
+# フェイルセーフ: グローバル例外ハンドラ（未捕捉の例外発生時もAPIサーバーを落さず安全側で500応答を返却）
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.error(f"【システム障害ログ】未捕捉の例外が発生しました: URL={request.url.path}, Error={str(exc)}", exc_info=True)
@@ -45,28 +45,26 @@ class StandProgressNotificationRequest(BaseModel):
     current_match_id: str = Field(..., min_length=1, description="現在の試合/立ID")
     current_stand_number: int = Field(..., ge=1, description="現在競技中の立番号（1以上の整数）")
 
-# フールプルーフ: 的中データ検証リクエストのバリデーション（規定矢数・0/1以外の混入を入口で遮断）
-class MatchRuleVerificationRequest(BaseModel):
-    match_id: str = Field(..., min_length=1, description="試合のユニークID")
-    arrow_format: str = Field(..., description="試合形式（一手 または 四矢）")
-    scores: typing.List[int] = Field(..., description="的中データ配列（0: ✕, 1: 〇）")
+# 順位判定・同中者抽出リクエスト（フールプルーフ: 不正な射数形式やスコアの混入を防止）
+class RankCalculationRequest(BaseModel):
+    match_id: str = Field(..., min_length=1, description="試合ID")
+    match_format: str = Field(..., description="一手 / 四矢")
+    tie_breaker_format: str = Field(..., description="射詰 / 遠近")
+    participants_scores: typing.List[typing.Dict[str, typing.Any]] = Field(..., description="各選手のスコアリスト")
 
-    # フールプルーフ: 形式が指定文字列以外の場合はバリデーションエラー
-    @field_validator("arrow_format")
+    @field_validator("match_format")
     @classmethod
-    def validate_arrow_format(cls, value: str) -> str:
+    def validate_match_format(cls, value: str) -> str:
         if value not in ["一手", "四矢"]:
-            raise ValueError("arrow_format は '一手' または '四矢' である必要があります。")
+            raise ValueError("match_format は '一手' または '四矢' である必要があります。")
         return value
 
-    # フールプルーフ: 0（不中）または 1（的中）以外の値の混入をブロック
-    @field_validator("scores")
+    @field_validator("tie_breaker_format")
     @classmethod
-    def validate_scores_values(cls, scores: typing.List[int]) -> typing.List[int]:
-        for idx, score in enumerate(scores):
-            if score not in [0, 1]:
-                raise ValueError(f"インデックス {idx} のスコア値が無効です。0（✕）または 1（〇）のみ指定可能です。")
-        return scores
+    def validate_tie_breaker(cls, value: str) -> str:
+        if value not in ["射詰", "遠近"]:
+            raise ValueError("tie_breaker_format は '射詰' または '遠近' である必要があります。")
+        return value
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 async def health_check() -> typing.Dict[str, str]:
@@ -106,46 +104,53 @@ async def trigger_stand_call_notification(
             detail="呼出処理の計算中に内部エラーが発生しました。"
         )
 
-@app.post("/api/v1/rules/verify", status_code=status.HTTP_200_OK)
-async def verify_match_rules(
-    payload: MatchRuleVerificationRequest
+@app.post("/api/v1/ranking/calculate", status_code=status.HTTP_200_OK)
+async def calculate_rankings(
+    payload: RankCalculationRequest
 ) -> typing.Dict[str, typing.Any]:
     """
-    入力されたスコアが弓道の試合形式ルール（規定矢数等）に適合しているか検証するエンドポイント
+    競技結果の集計と順位判定・競射進出者の自動抽出ロジック（弓道競技規則準拠）
     """
     try:
-        logger.info(f"スコア検証リクエスト受信: match_id={payload.match_id}, format={payload.arrow_format}")
+        scores_list = payload.participants_scores
 
-        expected_max_arrows: int = 2 if payload.arrow_format == "一手" else 4
-        actual_arrows: int = len(payload.scores)
+        # 遠近競射が実施されている場合は、直接入力された遠近順位（enkinRank）を最優先で評価
+        if payload.tie_breaker_format == "遠近":
+            def sort_key_enkin(p: typing.Dict[str, typing.Any]) -> typing.Tuple[int, int]:
+                enkin_rank = p.get("enkinRank")
+                rank_val = enkin_rank if (isinstance(enkin_rank, int) and enkin_rank > 0) else 999
+                hits_val = -1 * p.get("totalHits", 0)
+                return (rank_val, hits_val)
 
-        # フールプルーフ: 規定矢数超過の入力ミスを入口でブロック
-        if actual_arrows > expected_max_arrows:
-            logger.warning(f"【バリデーション警告】規定矢数超過: 形式={payload.arrow_format}, 期待値={expected_max_arrows}, 入力値={actual_arrows}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"{payload.arrow_format}の規定矢数は {expected_max_arrows} 本ですが、{actual_arrows} 本のデータが送信されました。"
+            sorted_participants = sorted(scores_list, key=sort_key_enkin)
+            requires_tie_breaker = False
+            top_contenders = []
+        else:
+            # 射詰および本戦の場合: 的中数降順ソート
+            sorted_participants = sorted(
+                scores_list,
+                key=lambda x: x.get("totalHits", 0),
+                reverse=True
             )
-
-        total_hits: int = sum(payload.scores)
+            max_hits = sorted_participants[0].get("totalHits", 0) if sorted_participants else 0
+            top_contenders = [p for p in sorted_participants if p.get("totalHits", 0) == max_hits]
+            requires_tie_breaker = len(top_contenders) > 1 and max_hits > 0
 
         return {
             "success": True,
-            "message": "ルール整合性検証を通過しました。",
-            "details": {
-                "match_id": payload.match_id,
-                "format": payload.arrow_format,
-                "verified_arrows": actual_arrows,
-                "total_hits": total_hits
-            }
+            "match_id": payload.match_id,
+            "format": payload.match_format,
+            "tie_breaker_format": payload.tie_breaker_format,
+            "ranked_participants": sorted_participants,
+            "requires_tie_breaker": requires_tie_breaker,
+            "tie_breaker_contenders": top_contenders if requires_tie_breaker else [],
+            "message": "順位集計が正常に完了しました。"
         }
-    except HTTPException as http_err:
-        raise http_err
     except Exception as e:
-        logger.error(f"【エラーログ】ルール検証中に予期せぬエラーが発生しました: {str(e)}", exc_info=True)
+        logger.error(f"【エラーログ】順位集計処理中にエラーが発生しました: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="スコア検証中にシステム内部エラーが発生しました。"
+            detail="順位集計中にシステム内部エラーが発生しました。"
         )
 
 if __name__ == "__main__":
