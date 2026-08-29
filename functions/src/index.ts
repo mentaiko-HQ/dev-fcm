@@ -18,21 +18,28 @@ interface MatchDocumentData {
   [key: string]: unknown;
 }
 
-interface TeamDocumentData {
-  name?: string;
+interface EntryDocumentData {
+  entryType?: "TEAM" | "INDIVIDUAL";
+  progressStatus?: "WAITING" | "CALLED" | "SHOOTING" | "COMPLETED";
+  qualificationStatus?: "ACTIVE" | "ABSENT" | "WITHDRAWN" | "DISQUALIFIED";
   standNumber?: number;
+  teamId?: string | null;
+  teamName?: string;
+  playerName?: string;
+  userId?: string;
   [key: string]: unknown;
 }
 
 interface UserDocumentData {
   fcmToken?: string;
-  selectedTeamId?: string;
+  selectedTeamId?: string | null;
+  selectedEntryId?: string | null;
   [key: string]: unknown;
 }
 
 /**
  * 試合進行ドキュメント（matches/{matchId}）の更新を監視し、
- * 2つ前の立が開始された時点で対象チームへFCM招集プッシュ通知を自動送信するCloud Function (v2)
+ * 2つ前の立が開始された時点で対象の団体・個人選手へFCM招集通知を自動送信するCloud Function (v2)
  */
 export const onMatchProgressUpdated = onDocumentWritten(
   {
@@ -64,100 +71,157 @@ export const onMatchProgressUpdated = onDocumentWritten(
     console.log(`【進行更新検知】第${currentStand}立開始を検知。呼出対象: 第${targetStandNumber}立`);
 
     try {
-      // 呼出対象立に該当するチームを検索
-      const teamsSnapshot = await db
-        .collection("teams")
+      // 1. 呼出対象立に所属する選手エントリー（団体・個人混在）を抽出
+      const entriesSnapshot = await db
+        .collection("entries")
         .where("standNumber", "==", targetStandNumber)
         .get();
 
-      if (teamsSnapshot.empty) {
-        console.log(`【招集通知】第${targetStandNumber}立に該当するチームは登録されていません。`);
+      if (entriesSnapshot.empty) {
+        console.log(`【招集通知】第${targetStandNumber}立に該当する選手エントリーは登録されていません。`);
         return;
       }
 
-      for (const teamDoc of teamsSnapshot.docs) {
-        const teamData = teamDoc.data() as TeamDocumentData;
-        const teamId: string = teamDoc.id;
-        const teamName: string = typeof teamData.name === "string" ? teamData.name : `第${targetStandNumber}立`;
+      // 2. 招集対象立の選手ステータスを CALLED（招集中）にバッチ更新（フェイルセーフ）
+      const batch = db.batch();
+      const targetTeamIds = new Set<string>();
+      const targetUserIds = new Set<string>();
 
-        // 該当チームを選択しているユーザー（選手・付添者の登録端末）を検索
-        const usersSnapshot = await db
+      entriesSnapshot.forEach((entryDoc) => {
+        const entryData = entryDoc.data() as EntryDocumentData;
+        // 欠席・失格以外の選手のみ招集更新対象
+        if (entryData.qualificationStatus === "ACTIVE" || entryData.qualificationStatus === "WITHDRAWN") {
+          batch.update(entryDoc.ref, {
+            progressStatus: "CALLED",
+            updatedAt: Date.now(),
+          });
+
+          if (entryData.entryType === "TEAM" && entryData.teamId) {
+            targetTeamIds.add(entryData.teamId);
+          } else if (entryData.userId) {
+            targetUserIds.add(entryData.userId);
+          }
+        }
+      });
+
+      // 現在行射中の立（currentStand）の選手ステータスを SHOOTING（行射中）に更新
+      const shootingEntriesSnapshot = await db
+        .collection("entries")
+        .where("standNumber", "==", currentStand)
+        .get();
+
+      shootingEntriesSnapshot.forEach((sDoc) => {
+        batch.update(sDoc.ref, {
+          progressStatus: "SHOOTING",
+          updatedAt: Date.now(),
+        });
+      });
+
+      await batch.commit();
+
+      // 3. 宛先トークンの収集（団体所属端末 ＋ 個人選手端末のマルチキャスト宛先解決）
+      const tokens: string[] = [];
+      const userDocIds: string[] = [];
+
+      // A. 団体チーム登録端末のFCMトークン取得
+      for (const teamId of targetTeamIds) {
+        const teamUsersSnapshot = await db
           .collection("users")
           .where("selectedTeamId", "==", teamId)
           .get();
 
-        const tokens: string[] = [];
-        const userDocIds: string[] = [];
+        teamUsersSnapshot.forEach((uDoc) => {
+          const uData = uDoc.data() as UserDocumentData;
+          if (uData.fcmToken && uData.fcmToken.trim().length > 0) {
+            tokens.push(uData.fcmToken.trim());
+            userDocIds.push(uDoc.id);
+          }
+        });
+      }
 
-        usersSnapshot.forEach((userDoc: admin.firestore.QueryDocumentSnapshot) => {
-          const userData = userDoc.data() as UserDocumentData;
-          if (userData.fcmToken && typeof userData.fcmToken === "string" && userData.fcmToken.trim().length > 0) {
-            tokens.push(userData.fcmToken.trim());
+      // B. 個人参加選手登録端末のFCMトークン取得
+      for (const userId of targetUserIds) {
+        const userDoc = await db.collection("users").doc(userId).get();
+        if (userDoc.exists) {
+          const uData = userDoc.data() as UserDocumentData;
+          if (uData.fcmToken && uData.fcmToken.trim().length > 0) {
+            tokens.push(uData.fcmToken.trim());
             userDocIds.push(userDoc.id);
           }
-        });
-
-        if (tokens.length === 0) {
-          console.log(`【招集通知】チーム「${teamName}」(ID: ${teamId}) に紐付く有効なFCMトークンがありません。端末登録状況を確認してください。`);
-          continue;
         }
+      }
 
-        console.log(`【通知送信開始】チーム「${teamName}」の ${tokens.length} 件のデバイスへFCM送信を実行します。`);
+      // 重複トークンの排除（フールプルーフ）
+      const uniqueTokenMap = new Map<string, string>();
+      tokens.forEach((t, idx) => {
+        uniqueTokenMap.set(t, userDocIds[idx]);
+      });
 
-        // マルチキャスト通知ペイロードの構築
-        const payload: admin.messaging.MulticastMessage = {
-          tokens: tokens,
+      const finalTokens = Array.from(uniqueTokenMap.keys());
+      const finalUserDocIds = Array.from(uniqueTokenMap.values());
+
+      if (finalTokens.length === 0) {
+        console.log(`【招集通知】第${targetStandNumber}立に紐付く有効なFCMトークンがありません。端末登録状況を確認してください。`);
+        return;
+      }
+
+      console.log(`【通知送信開始】第${targetStandNumber}立（団体/個人混成）の ${finalTokens.length} 件のデバイスへFCM送信を実行します。`);
+
+      // マルチキャスト通知ペイロードの構築
+      const payload: admin.messaging.MulticastMessage = {
+        tokens: finalTokens,
+        notification: {
+          title: "【招集通知】まもなく出番です",
+          body: `現在 第${currentStand}立 が進行中です。第${targetStandNumber}立（団体・個人選手）は弓道場控席へ入場してください。`,
+        },
+        data: {
+          standNumber: String(targetStandNumber),
+          matchId: event.params.matchId,
+          click_action: "http://localhost:3000",
+          soundEffect: "chime",
+        },
+        webpush: {
+          headers: {
+            Urgency: "high",
+          },
           notification: {
-            title: "【招集通知】まもなく出番です",
-            body: `現在 第${currentStand}立 が進行中です。${teamName} は弓道場控席へ入場してください。`,
+            tag: `stand-${targetStandNumber}`,
+            requireInteraction: true,
+            icon: "/favicon.ico",
+            badge: "/favicon.ico",
+            vibrate: [300, 100, 300, 100, 300],
+            silent: false,
           },
-          data: {
-            standNumber: String(targetStandNumber),
-            teamId: teamId,
-            matchId: event.params.matchId,
-            click_action: "http://localhost:3000",
-          },
-          webpush: {
-            headers: {
-              Urgency: "high",
-            },
-            notification: {
-              tag: `stand-${targetStandNumber}`,
-              requireInteraction: true,
-              icon: "/favicon.ico",
-              badge: "/favicon.ico",
-            },
-          },
-        };
+        },
+      };
 
-        const response: admin.messaging.BatchResponse = await admin.messaging().sendEachForMulticast(payload);
-        console.log(`【招集通知完了】チーム: ${teamName}, 成功: ${response.successCount}件, 失敗: ${response.failureCount}件`);
+      const response: admin.messaging.BatchResponse = await admin.messaging().sendEachForMulticast(payload);
+      console.log(`【招集通知完了】第${targetStandNumber}立, 成功: ${response.successCount}件, 失敗: ${response.failureCount}件`);
 
-        // フェイルセーフ: 無効となった古いトークンのクリーンアップ処理（デッドレター対策）
-        const staleTokenUpdates: Promise<admin.firestore.WriteResult>[] = [];
-        response.responses.forEach((res: admin.messaging.SendResponse, idx: number) => {
-          if (!res.success) {
-            const errorCode = res.error?.code;
-            console.error(`【エラーログ】FCMトークン送信失敗 (User: ${userDocIds[idx]}, Error: ${errorCode}):`, res.error);
+      // フェイルセーフ: 無効となった古いトークンのクリーンアップ処理（デッドレター対策）
+      const staleTokenUpdates: Promise<admin.firestore.WriteResult>[] = [];
+      response.responses.forEach((res: admin.messaging.SendResponse, idx: number) => {
+        if (!res.success) {
+          const errorCode = res.error?.code;
+          console.error(`【エラーログ】FCMトークン送信失敗 (User: ${finalUserDocIds[idx]}, Error: ${errorCode}):`, res.error);
 
-            if (
-              errorCode === "messaging/invalid-registration-token" ||
-              errorCode === "messaging/registration-token-not-registered"
-            ) {
-              console.log(`【トークン削除】無効なトークンをユーザー ${userDocIds[idx]} から削除します。`);
-              staleTokenUpdates.push(
-                db.collection("users").doc(userDocIds[idx]).update({
-                  fcmToken: admin.firestore.FieldValue.delete(),
-                  updatedAt: Date.now(),
-                })
-              );
-            }
+          if (
+            errorCode === "messaging/invalid-registration-token" ||
+            errorCode === "messaging/registration-token-not-registered"
+          ) {
+            console.log(`【トークン削除】無効なトークンをユーザー ${finalUserDocIds[idx]} から削除します。`);
+            staleTokenUpdates.push(
+              db.collection("users").doc(finalUserDocIds[idx]).update({
+                fcmToken: admin.firestore.FieldValue.delete(),
+                updatedAt: Date.now(),
+              })
+            );
           }
-        });
-
-        if (staleTokenUpdates.length > 0) {
-          await Promise.all(staleTokenUpdates);
         }
+      });
+
+      if (staleTokenUpdates.length > 0) {
+        await Promise.all(staleTokenUpdates);
       }
     } catch (error: unknown) {
       console.error("【エラーログ】招集通知の実行中に致命的なエラーが発生しました:", error);

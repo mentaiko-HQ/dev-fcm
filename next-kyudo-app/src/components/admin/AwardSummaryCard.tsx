@@ -2,29 +2,51 @@
 
 import React, { useMemo } from "react";
 import { Participant } from "@/types/participant";
-import { Trophy, Medal, Award, Flame } from "lucide-react";
+import { Trophy, Medal, Award, Flame, Shield, User } from "lucide-react";
 
 interface AwardSummaryCardProps {
   participants: Participant[];
 }
 
 export function AwardSummaryCard({ participants }: AwardSummaryCardProps) {
-  // 順位順にソート（finalRankが存在する場合は最優先）
-  const rankedList = useMemo(() => {
-    return [...participants].sort((a, b) => {
-      if (a.finalRank && b.finalRank) return a.finalRank - b.finalRank;
-      if (a.enkinRank && b.enkinRank) return a.enkinRank - b.enkinRank;
-      return b.totalHits - a.totalHits;
-    });
+  // 個人戦ランキング（欠席者を除外し、finalRankまたは的中数でソート）
+  const rankedIndividuals = useMemo(() => {
+    return [...participants]
+      .filter((p) => p.qualificationStatus !== "ABSENT")
+      .sort((a, b) => {
+        if (a.finalRank && b.finalRank) return a.finalRank - b.finalRank;
+        if (a.enkinRank && b.enkinRank) return a.enkinRank - b.enkinRank;
+        return b.totalHits - a.totalHits;
+      });
   }, [participants]);
 
-  const firstPlace = rankedList[0];
-  const secondPlace = rankedList[1];
-  const thirdPlace = rankedList[2];
+  // 団体戦ランキング（entryType === 'TEAM' かつ 欠席者を除いた有効チーム的中数の合算集計）
+  const rankedTeams = useMemo(() => {
+    const teamMap: Record<string, { teamId: string; teamName: string; totalHits: number }> = {};
 
-  // 皆中者リスト
+    participants.forEach((p) => {
+      if (p.entryType === "TEAM" && p.teamId && p.qualificationStatus !== "ABSENT") {
+        if (!teamMap[p.teamId]) {
+          teamMap[p.teamId] = {
+            teamId: p.teamId,
+            teamName: p.teamName,
+            totalHits: 0,
+          };
+        }
+        teamMap[p.teamId].totalHits += p.totalHits;
+      }
+    });
+
+    return Object.values(teamMap).sort((a, b) => b.totalHits - a.totalHits);
+  }, [participants]);
+
+  const topIndividual = rankedIndividuals[0];
+  const topTeam = rankedTeams[0];
+
   const perfectShooters = useMemo(() => {
-    return participants.filter((p) => p.isPerfect || (p.totalHits === 4 && p.totalShots === 4));
+    return participants.filter(
+      (p) => p.qualificationStatus === "ACTIVE" && (p.isPerfect || (p.totalHits === 4 && p.totalShots === 4))
+    );
   }, [participants]);
 
   return (
@@ -32,67 +54,48 @@ export function AwardSummaryCard({ participants }: AwardSummaryCardProps) {
       <div className="flex justify-between items-center border-b border-slate-700 pb-3">
         <h3 className="font-bold text-base flex items-center gap-2">
           <Trophy className="w-5 h-5 text-amber-400" />
-          大会表彰・成績サマリー
+          大会表彰・成績サマリー（団体・個人 2冠管理）
         </h3>
         <span className="text-xs bg-amber-500/20 text-amber-300 px-2.5 py-0.5 rounded-full border border-amber-500/30 font-semibold">
           公式記録
         </span>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-        {/* 優勝 */}
-        <div className="bg-slate-800/80 border border-amber-500/40 rounded-lg p-3.5 flex flex-col justify-between">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {/* 団体戦 優勝 */}
+        <div className="bg-slate-800/80 border border-blue-500/40 rounded-lg p-4 flex flex-col justify-between">
+          <div className="flex justify-between items-center mb-1">
+            <span className="text-xs font-bold text-blue-400 flex items-center gap-1">
+              <Shield className="w-4 h-4 text-blue-400" /> 団体戦 優勝 (第1位)
+            </span>
+          </div>
+          {topTeam ? (
+            <div>
+              <p className="text-xl font-black text-white">{topTeam.teamName}</p>
+              <p className="text-sm font-bold text-blue-400 mt-2">チーム総的中: {topTeam.totalHits} 中</p>
+            </div>
+          ) : (
+            <p className="text-xs text-slate-500 italic">未確定</p>
+          )}
+        </div>
+
+        {/* 個人戦 優勝 */}
+        <div className="bg-slate-800/80 border border-amber-500/40 rounded-lg p-4 flex flex-col justify-between">
           <div className="flex justify-between items-center mb-1">
             <span className="text-xs font-bold text-amber-400 flex items-center gap-1">
-              <Trophy className="w-4 h-4 text-amber-400" /> 優勝 (第1位)
+              <Trophy className="w-4 h-4 text-amber-400" /> 個人総合 優勝 (第1位)
             </span>
-            {firstPlace?.enkinRank && (
+            {topIndividual?.enkinRank && (
               <span className="text-[10px] bg-blue-500/30 text-blue-300 px-1.5 py-0.5 rounded">
-                遠近判定
+                遠近判定 {topIndividual.enkinRank}位
               </span>
             )}
           </div>
-          {firstPlace ? (
+          {topIndividual ? (
             <div>
-              <p className="text-lg font-black text-white">{firstPlace.playerName}</p>
-              <p className="text-xs text-slate-400">{firstPlace.teamName}</p>
-              <p className="text-sm font-bold text-amber-400 mt-2">{firstPlace.totalHits} 中</p>
-            </div>
-          ) : (
-            <p className="text-xs text-slate-500 italic">未確定</p>
-          )}
-        </div>
-
-        {/* 準優勝 */}
-        <div className="bg-slate-800/80 border border-slate-600 rounded-lg p-3.5 flex flex-col justify-between">
-          <div className="flex justify-between items-center mb-1">
-            <span className="text-xs font-bold text-slate-300 flex items-center gap-1">
-              <Medal className="w-4 h-4 text-slate-300" /> 準優勝 (第2位)
-            </span>
-          </div>
-          {secondPlace ? (
-            <div>
-              <p className="text-lg font-black text-white">{secondPlace.playerName}</p>
-              <p className="text-xs text-slate-400">{secondPlace.teamName}</p>
-              <p className="text-sm font-bold text-slate-300 mt-2">{secondPlace.totalHits} 中</p>
-            </div>
-          ) : (
-            <p className="text-xs text-slate-500 italic">未確定</p>
-          )}
-        </div>
-
-        {/* 第3位 */}
-        <div className="bg-slate-800/80 border border-amber-700/40 rounded-lg p-3.5 flex flex-col justify-between">
-          <div className="flex justify-between items-center mb-1">
-            <span className="text-xs font-bold text-amber-600 flex items-center gap-1">
-              <Award className="w-4 h-4 text-amber-600" /> 第3位
-            </span>
-          </div>
-          {thirdPlace ? (
-            <div>
-              <p className="text-lg font-black text-white">{thirdPlace.playerName}</p>
-              <p className="text-xs text-slate-400">{thirdPlace.teamName}</p>
-              <p className="text-sm font-bold text-amber-500 mt-2">{thirdPlace.totalHits} 中</p>
+              <p className="text-xl font-black text-white">{topIndividual.playerName}</p>
+              <p className="text-xs text-slate-400">{topIndividual.teamName} ({topIndividual.division})</p>
+              <p className="text-sm font-bold text-amber-400 mt-2">{topIndividual.totalHits} 中</p>
             </div>
           ) : (
             <p className="text-xs text-slate-500 italic">未確定</p>

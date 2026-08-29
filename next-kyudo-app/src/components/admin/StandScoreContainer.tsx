@@ -1,17 +1,17 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { doc, onSnapshot, setDoc, getDoc, collection, getDocs, serverTimestamp } from "firebase/firestore";
+import { doc, onSnapshot, setDoc, getDocs, collection, serverTimestamp } from "firebase/firestore";
 import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
 import { StandMatchScore, PlayerScore, HitResult, MatchFormat, MatchMode } from "@/types";
 import { ScoreButton } from "./ScoreButton";
 import { Button } from "@/components/ui/button";
-import { Trophy, Target, ShieldCheck, ArrowRight, ArrowLeft, AlertCircle, CheckCircle2 } from "lucide-react";
+import { Trophy, Target, ShieldCheck, ArrowRight, ArrowLeft, AlertCircle, CheckCircle2, Users } from "lucide-react";
 
 // フェイルセーフ: 試合形式のデフォルトフォールバック設定
 const DEFAULT_MATCH_FORMAT: MatchFormat = {
   id: "fmt_4arrows",
-  name: "四矢団体戦",
+  name: "四矢競技",
   arrowCount: "四矢",
   totalArrowsPerPerson: 4,
   isTeamMatch: true,
@@ -27,9 +27,9 @@ const DEFAULT_MATCH_SCORE: StandMatchScore = {
   format: DEFAULT_MATCH_FORMAT,
   mode: "本戦",
   playerScores: {
-    p1: { playerId: "p1", playerName: "佐藤 健一", position: "大前", arrows: [], totalHits: 0, isCompleted: false, isPerfect: false, enkinRank: null, updatedAt: 0 },
-    p2: { playerId: "p2", playerName: "鈴木 隆", position: "中", arrows: [], totalHits: 0, isCompleted: false, isPerfect: false, enkinRank: null, updatedAt: 0 },
-    p3: { playerId: "p3", playerName: "高橋 誠", position: "落", arrows: [], totalHits: 0, isCompleted: false, isPerfect: false, enkinRank: null, updatedAt: 0 },
+    p1: { playerId: "p1", playerName: "佐藤 健一", position: "大前", entryType: "TEAM", progressStatus: "SHOOTING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", arrows: [], totalHits: 0, isCompleted: false, isPerfect: false, enkinRank: null, updatedAt: 0 },
+    p2: { playerId: "p2", playerName: "鈴木 隆", position: "中", entryType: "TEAM", progressStatus: "SHOOTING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", arrows: [], totalHits: 0, isCompleted: false, isPerfect: false, enkinRank: null, updatedAt: 0 },
+    p3: { playerId: "p3", playerName: "高橋 誠", position: "落", entryType: "TEAM", progressStatus: "SHOOTING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", arrows: [], totalHits: 0, isCompleted: false, isPerfect: false, enkinRank: null, updatedAt: 0 },
   },
   totalTeamHits: 0,
   updatedAt: Date.now(),
@@ -67,7 +67,7 @@ export function StandScoreContainer() {
     return () => unsubscribe();
   }, [matchId]);
 
-  // 2. 指定された立番号 (currentStandNumber) のスコア・チーム情報を購読
+  // 2. 指定立順（currentStandNumber）のスコア・個人/団体混成データをFirestoreから購読
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
       setIsConnected(false);
@@ -98,32 +98,41 @@ export function StandScoreContainer() {
             setCurrentMode(rawData.mode);
           }
         } else {
-          // ドキュメントが存在しない場合は、teamsコレクションおよびentriesから安全に初期化（フェイルセーフ）
+          // ドキュメント未作成時はentriesコレクションから該当立の選手を検索して初期化（フェイルセーフ）
           try {
-            const teamsSnapshot = await getDocs(collection(firestoreInstance, "teams"));
-            let resolvedTeamName = `第${currentStandNumber}立`;
-            let resolvedTeamId = `team_${String(currentStandNumber).padStart(2, "0")}`;
+            const entriesSnapshot = await getDocs(collection(firestoreInstance, "entries"));
+            const standPlayers: Record<string, PlayerScore> = {};
 
-            teamsSnapshot.forEach((tDoc) => {
-              const tData = tDoc.data();
-              if (tData.standNumber === currentStandNumber) {
-                resolvedTeamId = tDoc.id;
-                resolvedTeamName = typeof tData.name === "string" ? tData.name : resolvedTeamName;
+            entriesSnapshot.forEach((docSnap) => {
+              const d = docSnap.data();
+              if (d.standNumber === currentStandNumber) {
+                standPlayers[docSnap.id] = {
+                  playerId: docSnap.id,
+                  playerName: d.playerName || "選手名未設定",
+                  position: d.position || "大前",
+                  entryType: d.entryType || "TEAM",
+                  progressStatus: d.progressStatus || "SHOOTING",
+                  qualificationStatus: d.qualificationStatus || "ACTIVE",
+                  teamId: d.teamId || null,
+                  teamName: d.teamName || "",
+                  arrows: [],
+                  totalHits: 0,
+                  isCompleted: false,
+                  isPerfect: false,
+                  enkinRank: null,
+                  updatedAt: Date.now(),
+                };
               }
             });
 
             const initialData: StandMatchScore = {
               matchId: matchId,
               standNumber: currentStandNumber,
-              teamId: resolvedTeamId,
-              teamName: resolvedTeamName,
+              teamId: `stand_${currentStandNumber}`,
+              teamName: `第${currentStandNumber}立（混成）`,
               format: DEFAULT_MATCH_FORMAT,
               mode: "本戦",
-              playerScores: {
-                [`p_${currentStandNumber}_1`]: { playerId: `p_${currentStandNumber}_1`, playerName: "選手 1", position: "大前", arrows: [], totalHits: 0, isCompleted: false, isPerfect: false, enkinRank: null, updatedAt: 0 },
-                [`p_${currentStandNumber}_2`]: { playerId: `p_${currentStandNumber}_2`, playerName: "選手 2", position: "中", arrows: [], totalHits: 0, isCompleted: false, isPerfect: false, enkinRank: null, updatedAt: 0 },
-                [`p_${currentStandNumber}_3`]: { playerId: `p_${currentStandNumber}_3`, playerName: "選手 3", position: "落", arrows: [], totalHits: 0, isCompleted: false, isPerfect: false, enkinRank: null, updatedAt: 0 },
-              },
+              playerScores: Object.keys(standPlayers).length > 0 ? standPlayers : DEFAULT_MATCH_SCORE.playerScores,
               totalTeamHits: 0,
               updatedAt: Date.now(),
             };
@@ -144,7 +153,7 @@ export function StandScoreContainer() {
     return () => unsubscribe();
   }, [matchId, currentStandNumber]);
 
-  // モード切り替えハンドラ（本戦 ↔ 射詰競射 ↔ 遠近競射）
+  // モード切り替えハンドラ
   const handleModeChange = async (newMode: MatchMode) => {
     setCurrentMode(newMode);
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
@@ -166,39 +175,46 @@ export function StandScoreContainer() {
 
   const currentFormat = matchScore.format || DEFAULT_MATCH_FORMAT;
   const totalArrowsPerPerson = currentFormat.totalArrowsPerPerson || 4;
-  const playersPerTeam = currentFormat.playersPerTeam || 3;
 
-  // フールプルーフ判定: 現在のチーム全選手の行射が規定射数に達しているか検証
-  const isStandFullyCompleted = Object.values(matchScore.playerScores || {}).every(
-    (player) => (player.arrows?.length || 0) >= totalArrowsPerPerson
+  // フールプルーフ判定: 欠席以外の選手が規定射数に達しているか検証
+  const isStandFullyCompleted = Object.values(matchScore.playerScores || {}).every((player) => {
+    if (player.qualificationStatus === "ABSENT") return true;
+    return (player.arrows?.length || 0) >= totalArrowsPerPerson;
+  });
+
+  // 団体選手のみを対象としたチーム総的中数の計算（個人選手は除外するフールプルーフ）
+  const teamOnlyHits: number = Object.values(matchScore.playerScores || {}).reduce<number>(
+    (acc: number, p: PlayerScore) => {
+      if (p.entryType === "TEAM" && p.qualificationStatus !== "ABSENT") {
+        return acc + (p.arrows?.reduce<number>((sum: number, v: HitResult) => sum + v, 0) || 0);
+      }
+      return acc;
+    },
+    0
   );
 
-  // 次のチーム（立）または前の立への遷移要求ハンドラ
-  const handleRequestStandNavigation = (targetStand: number) => {
-    // フールプルーフ: 範囲外への遷移を早期ブロック
-    if (targetStand < 1 || targetStand > maxStandNumber) {
-      return;
-    }
+  const teamMemberCount = Object.values(matchScore.playerScores || {}).filter(
+    (p) => p.entryType === "TEAM" && p.qualificationStatus !== "ABSENT"
+  ).length;
 
-    // 次の立に進む際、未入力の矢が存在する場合は誤操作防止のため警告モーダルを表示（フールプルーフ）
+  const handleRequestStandNavigation = (targetStand: number) => {
+    if (targetStand < 1 || targetStand > maxStandNumber) return;
+
     if (targetStand > currentStandNumber && !isStandFullyCompleted) {
       setPendingTargetStand(targetStand);
       setShowIncompleteWarningModal(true);
       return;
     }
 
-    // 規定射数完了時、または戻る操作時は即時遷移を実行
     executeStandTransition(targetStand);
   };
 
-  // 実際の立遷移実行（フェイルセーフ: Firestore更新と状態同期）
   const executeStandTransition = async (targetStand: number) => {
     setIsTransitioning(true);
     setStatusMessage("");
     setShowIncompleteWarningModal(false);
 
     try {
-      // 進行状況（matches ドキュメント）を同期更新
       if (isFirebaseConfigured && isFirestoreAvailable(db)) {
         const matchDocRef = doc(db, "matches", matchId);
         await setDoc(
@@ -222,13 +238,6 @@ export function StandScoreContainer() {
     }
   };
 
-  // フールプルーフ: チーム総的中数を安全に算出
-  const totalTeamHits: number = Object.values(matchScore.playerScores || {}).reduce<number>(
-    (acc: number, p: PlayerScore) =>
-      acc + (p.arrows?.reduce<number>((sum: number, v: HitResult) => sum + v, 0) || 0),
-    0
-  );
-
   return (
     <div className="w-full bg-slate-50 border border-slate-200 rounded-lg p-4 space-y-4">
       {/* 立情報ヘッダーおよびモード切り替えバー */}
@@ -250,7 +259,7 @@ export function StandScoreContainer() {
           </p>
         </div>
 
-        {/* 競技モード切り替えタブ（フールプルーフUI） */}
+        {/* 競技モード切り替えタブ */}
         <div className="flex items-center gap-1.5 bg-slate-100 p-1 rounded-md border border-slate-200">
           <Button
             size="sm"
@@ -283,9 +292,11 @@ export function StandScoreContainer() {
 
         <div className="flex items-center gap-3">
           <div className="text-right">
-            <span className="text-xs text-slate-500 block leading-none">チーム総的中</span>
-            <span className="text-xl font-black text-red-600">{totalTeamHits}</span>
-            <span className="text-xs text-slate-400"> / {totalArrowsPerPerson * playersPerTeam}</span>
+            <span className="text-xs text-slate-500 block leading-none flex items-center gap-1 justify-end">
+              <Users className="w-3 h-3" /> 団体的中
+            </span>
+            <span className="text-xl font-black text-red-600">{teamOnlyHits}</span>
+            <span className="text-xs text-slate-400"> / {totalArrowsPerPerson * teamMemberCount}</span>
           </div>
           <div
             className={`w-2.5 h-2.5 rounded-full ${isConnected ? "bg-green-500" : "bg-amber-400"}`}
@@ -294,7 +305,7 @@ export function StandScoreContainer() {
         </div>
       </div>
 
-      {/* 各選手のスコア入力カード一覧 */}
+      {/* 各選手のスコア入力カード一覧（個人・団体混成） */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {Object.values(matchScore.playerScores || {}).map((player) => (
           <ScoreButton
@@ -308,7 +319,7 @@ export function StandScoreContainer() {
         ))}
       </div>
 
-      {/* チーム・立 進行ナビゲーション操作バー（次のチーム成績入力へ進むボタン） */}
+      {/* チーム・立 進行ナビゲーション操作バー */}
       <div className="pt-2 border-t border-slate-200 flex flex-col sm:flex-row justify-between items-center gap-3">
         <Button
           type="button"
@@ -339,7 +350,7 @@ export function StandScoreContainer() {
             "立を切り替え中..."
           ) : (
             <>
-              次のチームの成績入力に進む (第{currentStandNumber + 1}立)
+              次のチーム・立の成績入力に進む (第{currentStandNumber + 1}立)
               <ArrowRight className="w-4 h-4 ml-2" />
             </>
           )}

@@ -14,7 +14,8 @@ import {
 } from "@tanstack/react-table";
 import { collection, onSnapshot, query, orderBy } from "firebase/firestore";
 import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
-import { Participant, ParticipantStatus, DivisionType } from "@/types/participant";
+import { Participant } from "@/types/participant";
+import { EntryType, ProgressStatus, QualificationStatus, DivisionType } from "@/types";
 import {
   Table,
   TableBody,
@@ -24,18 +25,16 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
-import { ArrowUpDown, Search, RefreshCcw, Trophy, Download } from "lucide-react";
+import { ArrowUpDown, Search, RefreshCcw, Trophy, Download, Shield, User } from "lucide-react";
 
 // 静的初期フォールバックデータ
 const FALLBACK_PARTICIPANTS: Participant[] = [
-  { id: "p1", standNumber: 1, position: "大前", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "佐藤 健一", division: "一般男子", status: "行射中", totalHits: 4, totalShots: 4, isPerfect: true, enkinRank: null },
-  { id: "p2", standNumber: 1, position: "中", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "鈴木 隆", division: "一般男子", status: "行射中", totalHits: 3, totalShots: 4, isPerfect: false, enkinRank: null },
-  { id: "p3", standNumber: 1, position: "落", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "高橋 誠", division: "一般男子", status: "行射中", totalHits: 2, totalShots: 4, isPerfect: false, enkinRank: null },
-  { id: "p4", standNumber: 2, position: "大前", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "田中 美咲", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
-  { id: "p5", standNumber: 2, position: "中", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "渡辺 彩花", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
-  { id: "p6", standNumber: 2, position: "落", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "小林 葵", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
-  { id: "p7", standNumber: 3, position: "大前", teamId: "team_03", teamName: "第三立（春日白鷺会）", playerName: "伊藤 剛", division: "シニア男子", status: "待機中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: 1 },
-  { id: "p8", standNumber: 3, position: "落", teamId: "team_03", teamName: "第三立（春日白鷺会）", playerName: "山本 翔太", division: "シニア男子", status: "待機中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: 2 },
+  { id: "p1", standNumber: 1, position: "大前", entryType: "TEAM", progressStatus: "SHOOTING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "佐藤 健一", division: "一般男子", totalHits: 4, totalShots: 4, isPerfect: true, enkinRank: null },
+  { id: "p2", standNumber: 1, position: "中", entryType: "TEAM", progressStatus: "SHOOTING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "鈴木 隆", division: "一般男子", totalHits: 3, totalShots: 4, isPerfect: false, enkinRank: null },
+  { id: "p3", standNumber: 1, position: "落", entryType: "TEAM", progressStatus: "SHOOTING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "高橋 誠", division: "一般男子", totalHits: 2, totalShots: 4, isPerfect: false, enkinRank: null },
+  { id: "p4", standNumber: 2, position: "大前", entryType: "TEAM", progressStatus: "CALLED", qualificationStatus: "ACTIVE", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "田中 美咲", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+  { id: "p5", standNumber: 2, position: "中", entryType: "TEAM", progressStatus: "CALLED", qualificationStatus: "ABSENT", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "渡辺 彩花", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+  { id: "p6", standNumber: 2, position: "落", entryType: "INDIVIDUAL", progressStatus: "CALLED", qualificationStatus: "ACTIVE", teamId: null, teamName: "個人枠", playerName: "小林 葵", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
 ];
 
 export function ParticipantDataTable() {
@@ -44,9 +43,9 @@ export function ParticipantDataTable() {
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
   const [globalFilter, setGlobalFilter] = useState<string>("");
   const [selectedDivision, setSelectedDivision] = useState<string>("ALL");
-  const [selectedStatus, setSelectedStatus] = useState<string>("ALL");
+  const [selectedEntryType, setSelectedEntryType] = useState<string>("ALL");
+  const [selectedProgress, setSelectedProgress] = useState<string>("ALL");
 
-  // Firestore `entries` コレクションのリアルタイム購読（フェイルセーフ）
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -64,11 +63,13 @@ export function ParticipantDataTable() {
               id: docSnap.id,
               standNumber: Number(raw.standNumber) || 1,
               position: raw.position || "大前",
-              teamId: raw.teamId || "",
-              teamName: raw.teamName || "所属未設定",
+              entryType: raw.entryType || "TEAM",
+              progressStatus: raw.progressStatus || "WAITING",
+              qualificationStatus: raw.qualificationStatus || "ACTIVE",
+              teamId: raw.teamId || null,
+              teamName: raw.teamName || (raw.entryType === "INDIVIDUAL" ? "個人枠" : "所属未設定"),
               playerName: raw.playerName || "選手名未設定",
               division: raw.division || "一般男子",
-              status: raw.status || "待機中",
               totalHits: Number(raw.totalHits) || 0,
               totalShots: Number(raw.totalShots) || 0,
               isPerfect: Boolean(raw.isPerfect),
@@ -80,40 +81,54 @@ export function ParticipantDataTable() {
         }
       },
       (error) => {
-        console.warn("【警告】entriesコレクション購読失敗。フォールバックデータを使用します:", error);
+        console.warn("【警告】entriesコレクション購読失敗:", error);
       }
     );
 
     return () => unsubscribe();
   }, []);
 
-  const getStatusBadge = (status: ParticipantStatus) => {
+  const getProgressBadge = (status: ProgressStatus) => {
     switch (status) {
-      case "行射中":
+      case "SHOOTING":
         return <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-bold bg-green-100 text-green-800 animate-pulse">行射中</span>;
-      case "招集中":
+      case "CALLED":
         return <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-bold bg-amber-100 text-amber-800">招集中</span>;
-      case "待機中":
+      case "WAITING":
         return <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-700">待機中</span>;
-      case "競技終了":
+      case "COMPLETED":
         return <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800">終了</span>;
-      case "棄権":
-        return <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-700">棄権</span>;
       default:
         return <span className="text-xs text-slate-500">-</span>;
     }
   };
 
-  // CSVエクスポート処理
+  const getQualificationBadge = (qual: QualificationStatus) => {
+    switch (qual) {
+      case "ACTIVE":
+        return <span className="text-[10px] text-slate-600 font-medium">参加</span>;
+      case "ABSENT":
+        return <span className="text-[10px] bg-red-100 text-red-700 font-bold px-1.5 py-0.5 rounded">欠席</span>;
+      case "WITHDRAWN":
+        return <span className="text-[10px] bg-orange-100 text-orange-700 font-bold px-1.5 py-0.5 rounded">棄権</span>;
+      case "DISQUALIFIED":
+        return <span className="text-[10px] bg-red-200 text-red-900 font-bold px-1.5 py-0.5 rounded">失格</span>;
+      default:
+        return null;
+    }
+  };
+
   const handleExportCSV = () => {
-    const headers = ["立順", "立ち位置", "所属チーム", "選手氏名", "部門", "ステータス", "的中数", "射数", "皆中", "遠近順位", "総合確定順位"];
+    const headers = ["立順", "立ち位置", "区分", "所属チーム", "選手氏名", "部門", "進行状態", "資格", "的中数", "射数", "皆中", "遠近順位", "総合順位"];
     const rows = filteredData.map((p) => [
       `第${p.standNumber}立`,
       p.position,
+      p.entryType === "TEAM" ? "団体" : "個人",
       `"${p.teamName}"`,
       `"${p.playerName}"`,
       p.division,
-      p.status,
+      p.progressStatus,
+      p.qualificationStatus,
       p.totalHits,
       p.totalShots,
       p.isPerfect ? "皆中" : "",
@@ -163,6 +178,21 @@ export function ParticipantDataTable() {
         ),
       },
       {
+        accessorKey: "entryType",
+        header: "区分",
+        cell: ({ row }) => {
+          const isTeam = row.getValue<EntryType>("entryType") === "TEAM";
+          return (
+            <span className={`inline-flex items-center gap-1 text-[11px] font-bold px-1.5 py-0.5 rounded ${
+              isTeam ? "bg-blue-50 text-blue-700 border border-blue-200" : "bg-purple-50 text-purple-700 border border-purple-200"
+            }`}>
+              {isTeam ? <Shield className="w-3 h-3" /> : <User className="w-3 h-3" />}
+              {isTeam ? "団体" : "個人"}
+            </span>
+          );
+        },
+      },
+      {
         accessorKey: "teamName",
         header: ({ column }) => (
           <Button
@@ -171,7 +201,7 @@ export function ParticipantDataTable() {
             onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
             className="h-8 px-2 text-xs font-bold"
           >
-            所属チーム
+            所属チーム / 枠
             <ArrowUpDown className="ml-1 h-3 w-3" />
           </Button>
         ),
@@ -192,6 +222,7 @@ export function ParticipantDataTable() {
                 <Trophy className="w-3.5 h-3.5 text-red-600 shrink-0" />
               </span>
             )}
+            {getQualificationBadge(row.original.qualificationStatus)}
           </div>
         ),
       },
@@ -205,9 +236,9 @@ export function ParticipantDataTable() {
         ),
       },
       {
-        accessorKey: "status",
-        header: "状態",
-        cell: ({ row }) => getStatusBadge(row.getValue<ParticipantStatus>("status")),
+        accessorKey: "progressStatus",
+        header: "進行状態",
+        cell: ({ row }) => getProgressBadge(row.getValue<ProgressStatus>("progressStatus")),
       },
       {
         accessorKey: "totalHits",
@@ -235,7 +266,7 @@ export function ParticipantDataTable() {
       },
       {
         accessorKey: "finalRank",
-        header: "確定順位",
+        header: "順位",
         cell: ({ row }) => {
           const rank = row.original.finalRank;
           return (
@@ -262,23 +293,18 @@ export function ParticipantDataTable() {
 
   const filteredData = useMemo(() => {
     return data.filter((item: Participant) => {
-      if (selectedDivision !== "ALL" && item.division !== selectedDivision) {
-        return false;
-      }
-      if (selectedStatus !== "ALL" && item.status !== selectedStatus) {
-        return false;
-      }
+      if (selectedDivision !== "ALL" && item.division !== selectedDivision) return false;
+      if (selectedEntryType !== "ALL" && item.entryType !== selectedEntryType) return false;
+      if (selectedProgress !== "ALL" && item.progressStatus !== selectedProgress) return false;
       if (globalFilter.trim().length > 0) {
         const queryStr = globalFilter.toLowerCase();
         const matchesPlayer = (item.playerName || "").toLowerCase().includes(queryStr);
         const matchesTeam = (item.teamName || "").toLowerCase().includes(queryStr);
-        if (!matchesPlayer && !matchesTeam) {
-          return false;
-        }
+        if (!matchesPlayer && !matchesTeam) return false;
       }
       return true;
     });
-  }, [data, selectedDivision, selectedStatus, globalFilter]);
+  }, [data, selectedDivision, selectedEntryType, selectedProgress, globalFilter]);
 
   // eslint-disable-next-line react-hooks/incompatible-library
   const table = useReactTable({
@@ -304,7 +330,8 @@ export function ParticipantDataTable() {
   const handleResetFilters = () => {
     setGlobalFilter("");
     setSelectedDivision("ALL");
-    setSelectedStatus("ALL");
+    setSelectedEntryType("ALL");
+    setSelectedProgress("ALL");
     setSorting([{ id: "standNumber", desc: false }]);
   };
 
@@ -324,8 +351,18 @@ export function ParticipantDataTable() {
 
         <div className="flex flex-wrap gap-2 items-center">
           <select
+            value={selectedEntryType}
+            onChange={(e) => setSelectedEntryType(e.target.value)}
+            className="p-2 text-sm border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-slate-900 bg-white"
+          >
+            <option value="ALL">全区分（団体/個人）</option>
+            <option value="TEAM">団体選手のみ</option>
+            <option value="INDIVIDUAL">個人選手のみ</option>
+          </select>
+
+          <select
             value={selectedDivision}
-            onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setSelectedDivision(e.target.value)}
+            onChange={(e) => setSelectedDivision(e.target.value)}
             className="p-2 text-sm border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-slate-900 bg-white"
           >
             <option value="ALL">全部門</option>
@@ -336,16 +373,15 @@ export function ParticipantDataTable() {
           </select>
 
           <select
-            value={selectedStatus}
-            onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setSelectedStatus(e.target.value)}
+            value={selectedProgress}
+            onChange={(e) => setSelectedProgress(e.target.value)}
             className="p-2 text-sm border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-slate-900 bg-white"
           >
-            <option value="ALL">全ステータス</option>
-            <option value="待機中">待機中</option>
-            <option value="招集中">招集中</option>
-            <option value="行射中">行射中</option>
-            <option value="競技終了">競技終了</option>
-            <option value="棄権">棄権</option>
+            <option value="ALL">全進行状態</option>
+            <option value="WAITING">待機中</option>
+            <option value="CALLED">招集中</option>
+            <option value="SHOOTING">行射中</option>
+            <option value="COMPLETED">競技終了</option>
           </select>
 
           <Button variant="outline" size="sm" onClick={handleResetFilters} className="h-9 px-3">

@@ -25,7 +25,6 @@ const DEFAULT_MATCH_STATE: MatchState = {
   status: "進行中",
 };
 
-// 初期シード用チームデータ定義（フールプルーフ: 型定義に基づき厳密なnumber型として定義）
 const INITIAL_TEAMS_DATA = [
   { id: "team_01", name: "第一立（福岡弓道倶楽部A）", standNumber: 1, division: "一般男子" },
   { id: "team_02", name: "第二立（博多紅葉会）", standNumber: 2, division: "一般女子" },
@@ -40,10 +39,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
   const [statusMessage, setStatusMessage] = useState<string>("");
 
   useEffect(() => {
-    // フールプルーフ: 型ガードでFirestoreの利用可否を判定
-    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
-      return;
-    }
+    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
     const firestoreInstance = db;
     const matchDocRef = doc(firestoreInstance, "matches", matchId);
@@ -55,7 +51,6 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
           const data = snapshot.data() as MatchState;
           setMatchState(data);
         } else {
-          // 初期ドキュメントが存在しない場合は自動作成（フェイルセーフ）
           setDoc(
             matchDocRef,
             {
@@ -75,7 +70,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
     return () => unsubscribe();
   }, [matchId]);
 
-  // Firestore初期コレクション（teams, matches, entries）の一括投入処理
+  // Firestore初期コレクション（個人/団体3層ステータス対応シード）の一括投入
   const handleSeedFirestore = async () => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
       setStatusMessage("Firebase環境変数が設定されていません。");
@@ -84,10 +79,10 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
 
     const firestoreInstance = db;
     setIsSeeding(true);
-    setStatusMessage("Firestore初期データ（teams, matches, entries）を書き込み中...");
+    setStatusMessage("3層ステータス対応の初期データを書き込み中...");
 
     try {
-      // 1. teams コレクションの初期化
+      // 1. teams コレクション
       for (const team of INITIAL_TEAMS_DATA) {
         const teamDocRef = doc(firestoreInstance, "teams", team.id);
         await setDoc(
@@ -102,7 +97,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
         );
       }
 
-      // 2. matches コレクションの初期化
+      // 2. matches コレクション
       const matchDocRef = doc(firestoreInstance, "matches", matchId);
       await setDoc(
         matchDocRef,
@@ -116,36 +111,40 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
         { merge: true }
       );
 
-      // 3. entries コレクションのサンプル初期化
+      // 3. entries コレクション（団体選手 ＋ 個人参加選手 ＋ 欠席サンプルの完全構成）
       const sampleEntries = [
-        { id: "p1", standNumber: 1, position: "大前", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "佐藤 健一", division: "一般男子", status: "行射中", totalHits: 4, totalShots: 4, isPerfect: true, enkinRank: null },
-        { id: "p2", standNumber: 1, position: "中", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "鈴木 隆", division: "一般男子", status: "行射中", totalHits: 3, totalShots: 4, isPerfect: false, enkinRank: null },
-        { id: "p3", standNumber: 1, position: "落", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "高橋 誠", division: "一般男子", status: "行射中", totalHits: 2, totalShots: 4, isPerfect: false, enkinRank: null },
-        { id: "p4", standNumber: 2, position: "大前", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "田中 美咲", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
-        { id: "p5", standNumber: 2, position: "中", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "渡辺 彩花", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
-        { id: "p6", standNumber: 2, position: "落", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "小林 葵", division: "一般女子", status: "招集中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
-        { id: "p7", standNumber: 3, position: "大前", teamId: "team_03", teamName: "第三立（春日白鷺会）", playerName: "伊藤 剛", division: "シニア男子", status: "待機中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
-        { id: "p8", standNumber: 3, position: "落", teamId: "team_03", teamName: "第三立（春日白鷺会）", playerName: "山本 翔太", division: "シニア男子", status: "待機中", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+        // 第1立: 団体戦（3名正常）
+        { id: "p1", standNumber: 1, position: "大前", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "佐藤 健一", division: "一般男子", totalHits: 4, totalShots: 4, isPerfect: true, enkinRank: null },
+        { id: "p2", standNumber: 1, position: "中", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "鈴木 隆", division: "一般男子", totalHits: 3, totalShots: 4, isPerfect: false, enkinRank: null },
+        { id: "p3", standNumber: 1, position: "落", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "高橋 誠", division: "一般男子", totalHits: 2, totalShots: 4, isPerfect: false, enkinRank: null },
+
+        // 第2立: 団体選手2名 ＋ 欠席1名 ＋ 個人参加1名の混成立ち
+        { id: "p4", standNumber: 2, position: "大前", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "田中 美咲", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+        { id: "p5", standNumber: 2, position: "中", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ABSENT", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "渡辺 彩花 (欠席)", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+        { id: "p6", standNumber: 2, position: "落前", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "松田 栞", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+        { id: "p_indiv_01", standNumber: 2, position: "落", entryType: "INDIVIDUAL", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: null, teamName: "個人参加枠", playerName: "小林 葵 (個人)", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+
+        // 第3立: 団体戦（春日白鷺会）
+        { id: "p7", standNumber: 3, position: "大前", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_03", teamName: "第三立（春日白鷺会）", playerName: "伊藤 剛", division: "シニア男子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+        { id: "p8", standNumber: 3, position: "落", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_03", teamName: "第三立（春日白鷺会）", playerName: "山本 翔太", division: "シニア男子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
       ];
 
       for (const entry of sampleEntries) {
         await setDoc(doc(firestoreInstance, "entries", entry.id), entry, { merge: true });
       }
 
-      setStatusMessage("【成功】Firestoreに teams, matches, entries コレクションが正常に作成されました。");
+      setStatusMessage("【成功】個人/団体・3層ステータス対応の初期シードデータをFirestoreに投入しました。");
     } catch (error: unknown) {
-      console.error("【エラーログ】Firestore初期データ作成中にエラーが発生しました:", error);
-      setStatusMessage("初期データの書き込みに失敗しました。Firestoreルールを確認してください。");
+      console.error("【エラーログ】初期データ作成エラー:", error);
+      setStatusMessage("初期データの書き込みに失敗しました。");
     } finally {
       setIsSeeding(false);
     }
   };
 
-  // 立を進める処理（Cloud Functions の FCM 招集通知トリガー）
   const handleAdvanceStand = async () => {
-    // フールプルーフ: 最大立数超過の進行をブロック
     if (matchState.currentStandNumber >= matchState.maxStandNumber) {
-      setStatusMessage("最終立に達しているため、これ以上進めることはできません。");
+      setStatusMessage("最終立に達しているため進められません。");
       return;
     }
 
@@ -153,7 +152,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
     setStatusMessage("");
 
     const nextStandNumber = matchState.currentStandNumber + 1;
-    const targetCallStand = nextStandNumber + 2; // 2立前呼出ルール
+    const targetCallStand = nextStandNumber + 2;
 
     try {
       if (isFirebaseConfigured && isFirestoreAvailable(db)) {
@@ -168,27 +167,22 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
           { merge: true }
         );
       } else {
-        // ローカルモック動作
         setMatchState((prev) => ({ ...prev, currentStandNumber: nextStandNumber }));
       }
 
       setStatusMessage(
-        `第${nextStandNumber}立を開始しました。（第${targetCallStand}立へ呼出通知が自動送信されます）`
+        `第${nextStandNumber}立を開始しました。（第${targetCallStand}立へ呼出通知が送信されます）`
       );
     } catch (error: unknown) {
-      console.error("【エラーログ】立の進行更新に失敗しました:", error);
-      setStatusMessage("進行の更新に失敗しました。通信環境を確認してください。");
+      console.error("【エラーログ】立の進行更新失敗:", error);
+      setStatusMessage("進行の更新に失敗しました。");
     } finally {
       setIsProcessing(false);
     }
   };
 
-  // 立を1つ戻す処理（緊急対応用）
   const handleRevertStand = async () => {
-    // フールプルーフ: 第0立未満への巻き戻しをブロック
-    if (matchState.currentStandNumber <= 0) {
-      return;
-    }
+    if (matchState.currentStandNumber <= 0) return;
 
     setIsProcessing(true);
     setStatusMessage("");
@@ -213,7 +207,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
 
       setStatusMessage(`第${prevStandNumber}立へ戻しました。`);
     } catch (error: unknown) {
-      console.error("【エラーログ】立の差し戻しに失敗しました:", error);
+      console.error("【エラーログ】立の差し戻し失敗:", error);
       setStatusMessage("更新に失敗しました。");
     } finally {
       setIsProcessing(false);
@@ -228,7 +222,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
         <div>
           <h3 className="font-bold text-slate-900 text-base">大会進行管理 / 招集制御コンソール</h3>
           <p className="text-xs text-slate-500">
-            試合進行ドキュメントの更新に連動してCloud FunctionsがFCM通知を自動発報します
+            立進行ドキュメントの更新に連動してCloud FunctionsがFCM通知（団体/個人）を自動発報します
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -240,7 +234,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
             className="text-xs font-semibold h-8"
           >
             <Database className="w-3.5 h-3.5 mr-1" />
-            {isSeeding ? "作成中..." : "初期データ(teams)生成"}
+            {isSeeding ? "投入中..." : "3層ステータス初期データ生成"}
           </Button>
           <span className="text-xs bg-slate-100 text-slate-800 px-2.5 py-1 rounded font-semibold border border-slate-200">
             試合ID: {matchId}
@@ -259,7 +253,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
             <span className="text-xs text-slate-400">/ 全 {matchState.maxStandNumber} 立</span>
           </div>
           <span className="text-[11px] text-green-700 font-medium flex items-center gap-1">
-            <CheckCircle2 className="w-3.5 h-3.5" /> 行射中・スコア記録中
+            <CheckCircle2 className="w-3.5 h-3.5" /> 行射中・リアルタイムスコア入力中
           </span>
         </div>
 
@@ -271,7 +265,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
             <span className="text-xs text-amber-700">（2立前呼出）</span>
           </div>
           <span className="text-[11px] text-amber-800 font-medium flex items-center gap-1">
-            <AlertTriangle className="w-3.5 h-3.5" /> 自動プッシュ通知発報対象
+            <AlertTriangle className="w-3.5 h-3.5" /> 自動FCMプッシュ発報対象（団体/個人）
           </span>
         </div>
       </div>

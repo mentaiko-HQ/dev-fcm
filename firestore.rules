@@ -13,20 +13,20 @@ service cloud.firestore {
       return request.auth != null && request.auth.uid == userId;
     }
 
-    // users コレクション（FCMトークン・チーム紐付け）
+    // users コレクション（FCMトークン・選択チーム/個人エントリー管理）
     match /users/{userId} {
       allow read: if true;
       allow create, update: if true;
       allow delete: if isAdmin();
     }
 
-    // teams コレクション（立順、チーム構成）
+    // teams コレクション（団体立順、チーム構成）
     match /teams/{teamId} {
       allow read: if true;
       allow create, update, delete: if true;
     }
 
-    // entries コレクション（参加者・立順データ・最終順位）
+    // entries コレクション（参加選手・立順データ・3層ステータス・スコア）
     match /entries/{entryId} {
       allow read: if true;
       allow create, update, delete: if true;
@@ -38,7 +38,7 @@ service cloud.firestore {
       allow create, update, delete: if true;
     }
 
-    // scores コレクション（リアルタイム的中データ）
+    // scores コレクション（リアルタイム的中データ・立単位）
     match /scores/{scoreId} {
       allow read: if true;
       allow create, update, delete: if true;

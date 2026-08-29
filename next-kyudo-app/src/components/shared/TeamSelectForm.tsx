@@ -5,31 +5,32 @@ import { doc, setDoc, getDoc, collection, getDocs } from "firebase/firestore";
 import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
 import { requestFcmToken } from "@/lib/fcm";
 import { Button } from "@/components/ui/button";
+import { Users, User } from "lucide-react";
 
-interface TeamOption {
+interface OptionItem {
   id: string;
   name: string;
+  type: "TEAM" | "INDIVIDUAL";
   standNumber?: number;
 }
 
-// フェイルセーフ: Firestore接続失敗時・データ不在時の静的フォールバックデータ
-const FALLBACK_TEAMS: TeamOption[] = [
-  { id: "team_01", name: "第一立（福岡弓道倶楽部A）", standNumber: 1 },
-  { id: "team_02", name: "第二立（博多紅葉会）", standNumber: 2 },
-  { id: "team_03", name: "第三立（春日白鷺会）", standNumber: 3 },
-  { id: "team_04", name: "第四立（筑紫野葵会）", standNumber: 4 },
+// 静的フォールバックデータ
+const FALLBACK_OPTIONS: OptionItem[] = [
+  { id: "team_01", name: "第一立（福岡弓道倶楽部A）", type: "TEAM", standNumber: 1 },
+  { id: "team_02", name: "第二立（博多紅葉会）", type: "TEAM", standNumber: 2 },
+  { id: "team_03", name: "第三立（春日白鷺会）", type: "TEAM", standNumber: 3 },
+  { id: "p_indiv_01", name: "個人参加枠: 小林 葵 (第2立 落)", type: "INDIVIDUAL", standNumber: 2 },
 ];
 
 export function TeamSelectForm() {
-  const [teams, setTeams] = useState<TeamOption[]>(FALLBACK_TEAMS);
-  const [selectedTeamId, setSelectedTeamId] = useState<string>("");
-  const [currentRegisteredTeam, setCurrentRegisteredTeam] = useState<string | null>(null);
+  const [options, setOptions] = useState<OptionItem[]>(FALLBACK_OPTIONS);
+  const [selectedId, setSelectedId] = useState<string>("");
+  const [currentRegisteredName, setCurrentRegisteredName] = useState<string | null>(null);
   const [currentRegisteredToken, setCurrentRegisteredToken] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>("");
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [localUserId, setLocalUserId] = useState<string>("");
 
-  // フールプルーフ & フェイルセーフ: ハイドレーション不一致を防ぐためマウント後にlocalStorageからデバイスUIDを取得
   useEffect(() => {
     try {
       let uid = localStorage.getItem("kyudo_device_uid");
@@ -39,43 +40,59 @@ export function TeamSelectForm() {
       }
       setLocalUserId(uid);
     } catch (storageError) {
-      console.error("【エラーログ】localStorageへのアクセスに失敗しました:", storageError);
+      console.error("【エラーログ】localStorageアクセス失敗:", storageError);
       setLocalUserId("device_fallback_" + Math.random().toString(36).substring(2, 15));
     }
   }, []);
 
-  // Firestoreからteamsコレクションを動的取得
+  // teamsコレクションとentries(個人枠)から選択肢を動的ロード
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
     const firestoreInstance = db;
     let isMounted = true;
 
-    const fetchTeams = async () => {
+    const fetchOptions = async () => {
       try {
-        const teamsColRef = collection(firestoreInstance, "teams");
-        const snapshot = await getDocs(teamsColRef);
+        const [teamsSnap, entriesSnap] = await Promise.all([
+          getDocs(collection(firestoreInstance, "teams")),
+          getDocs(collection(firestoreInstance, "entries")),
+        ]);
 
-        if (!snapshot.empty && isMounted) {
-          const loadedTeams: TeamOption[] = [];
-          snapshot.forEach((docSnap) => {
-            const data = docSnap.data();
-            loadedTeams.push({
-              id: docSnap.id,
-              name: typeof data.name === "string" ? data.name : docSnap.id,
-              standNumber: typeof data.standNumber === "number" ? data.standNumber : undefined,
-            });
+        const loaded: OptionItem[] = [];
+
+        teamsSnap.forEach((docSnap) => {
+          const d = docSnap.data();
+          loaded.push({
+            id: docSnap.id,
+            name: typeof d.name === "string" ? d.name : docSnap.id,
+            type: "TEAM",
+            standNumber: typeof d.standNumber === "number" ? d.standNumber : undefined,
           });
+        });
 
-          loadedTeams.sort((a, b) => (a.standNumber || 0) - (b.standNumber || 0));
-          setTeams(loadedTeams);
+        entriesSnap.forEach((docSnap) => {
+          const d = docSnap.data();
+          if (d.entryType === "INDIVIDUAL") {
+            loaded.push({
+              id: docSnap.id,
+              name: `個人参加: ${d.playerName} (第${d.standNumber}立 ${d.position})`,
+              type: "INDIVIDUAL",
+              standNumber: typeof d.standNumber === "number" ? d.standNumber : undefined,
+            });
+          }
+        });
+
+        loaded.sort((a, b) => (a.standNumber || 0) - (b.standNumber || 0));
+        if (isMounted && loaded.length > 0) {
+          setOptions(loaded);
         }
       } catch (error) {
-        console.warn("【警告】teamsコレクションの取得に失敗しました。フォールバックデータを使用します:", error);
+        console.warn("【警告】選択肢データの取得に失敗しました:", error);
       }
     };
 
-    fetchTeams();
+    fetchOptions();
 
     return () => {
       isMounted = false;
@@ -89,50 +106,53 @@ export function TeamSelectForm() {
     const firestoreInstance = db;
     let isMounted = true;
 
-    const fetchExistingRegistration = async () => {
+    const fetchExisting = async () => {
       try {
         const userDocRef = doc(firestoreInstance, "users", localUserId);
         const snapshot = await getDoc(userDocRef);
 
         if (snapshot.exists() && isMounted) {
           const data = snapshot.data();
-          if (data && typeof data.selectedTeamId === "string" && data.selectedTeamId.length > 0) {
-            setCurrentRegisteredTeam(data.selectedTeamId);
-            setSelectedTeamId(data.selectedTeamId);
+          const targetId = data.selectedTeamId || data.selectedEntryId;
+          if (targetId) {
+            setSelectedId(targetId);
+            const found = options.find((o) => o.id === targetId);
+            setCurrentRegisteredName(found?.name || targetId);
           }
-          if (data && typeof data.fcmToken === "string" && data.fcmToken.length > 0) {
+          if (data.fcmToken) {
             setCurrentRegisteredToken(data.fcmToken);
           }
         }
       } catch (error) {
-        console.error("【エラーログ】既存チーム情報の復元に失敗しました:", error);
+        console.error("【エラーログ】ユーザー設定の復元失敗:", error);
       }
     };
 
-    fetchExistingRegistration();
+    fetchExisting();
 
     return () => {
       isMounted = false;
     };
-  }, [localUserId]);
+  }, [localUserId, options]);
 
   const handleRegister = async () => {
-    // フールプルーフ: 未選択状態での送信を早期ブロック
-    if (!selectedTeamId) {
-      setStatusMessage("チームを選択してください。");
+    if (!selectedId) {
+      setStatusMessage("チームまたは個人枠を選択してください。");
       return;
     }
 
-    // フェイルセーフ: Firebase未接続環境ではローカル状態のみ更新して安全に動作継続
+    const selectedOption = options.find((o) => o.id === selectedId);
+    const isTeam = selectedOption?.type === "TEAM";
+
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
-      setCurrentRegisteredTeam(selectedTeamId);
-      setStatusMessage("【ローカルモード】チームを選択しました（Firebase未接続のためローカル保持）。");
+      setCurrentRegisteredName(selectedOption?.name || selectedId);
+      setStatusMessage("【ローカルモード】通知枠を選択しました。");
       return;
     }
 
     const firestoreInstance = db;
     setIsProcessing(true);
-    setStatusMessage("端末通知の許可確認および登録を処理中...");
+    setStatusMessage("通知権限の確認およびFCM登録処理中...");
 
     try {
       const token = await requestFcmToken();
@@ -142,41 +162,47 @@ export function TeamSelectForm() {
         userDocRef,
         {
           userId: localUserId,
-          selectedTeamId: selectedTeamId,
+          selectedTeamId: isTeam ? selectedId : null,
+          selectedEntryId: !isTeam ? selectedId : null,
+          entryType: isTeam ? "TEAM" : "INDIVIDUAL",
           fcmToken: token || null,
           updatedAt: Date.now(),
         },
-        { merge: true } // 既存フィールドを破壊しないマージ書き込み
+        { merge: true }
       );
 
-      setCurrentRegisteredTeam(selectedTeamId);
+      // 個人参加の場合はentriesドキュメント側にもuserIdを紐付け（個別通知フェイルセーフ）
+      if (!isTeam) {
+        const entryDocRef = doc(firestoreInstance, "entries", selectedId);
+        await setDoc(entryDocRef, { userId: localUserId }, { merge: true });
+      }
+
+      setCurrentRegisteredName(selectedOption?.name || selectedId);
       setCurrentRegisteredToken(token);
       setStatusMessage(
         token
-          ? "【端末登録完了】FCMトークンが正常に登録されました。2立前に呼出通知が届きます。"
-          : "チームを登録しました（※FCMトークンが未取得のため通知は無効です。ブラウザの通知許可をご確認ください）。"
+          ? "【登録完了】FCMトークンが登録されました。出番の2立前に招集通知（音・振動）が届きます。"
+          : "登録しました（※ブラウザの通知許可がオフのためプッシュ通知は届きません）。"
       );
     } catch (error: unknown) {
-      console.error("【エラーログ】チーム登録・通知設定中にエラーが発生しました:", error);
-      setStatusMessage("登録処理に失敗しました。通信環境をご確認ください。");
+      console.error("【エラーログ】登録処理エラー:", error);
+      setStatusMessage("登録に失敗しました。");
     } finally {
       setIsProcessing(false);
     }
   };
 
   const handleReset = async () => {
-    // フェイルセーフ: Firebase未接続時のローカル解除対応
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
-      setCurrentRegisteredTeam(null);
+      setCurrentRegisteredName(null);
       setCurrentRegisteredToken(null);
-      setSelectedTeamId("");
-      setStatusMessage("【ローカルモード】チームの紐付けを解除しました。");
+      setSelectedId("");
+      setStatusMessage("紐付けを解除しました。");
       return;
     }
 
     const firestoreInstance = db;
     setIsProcessing(true);
-    setStatusMessage("登録解除中...");
 
     try {
       const userDocRef = doc(firestoreInstance, "users", localUserId);
@@ -184,17 +210,18 @@ export function TeamSelectForm() {
         userDocRef,
         {
           selectedTeamId: null,
+          selectedEntryId: null,
           updatedAt: Date.now(),
         },
         { merge: true }
       );
-      setCurrentRegisteredTeam(null);
+      setCurrentRegisteredName(null);
       setCurrentRegisteredToken(null);
-      setSelectedTeamId("");
-      setStatusMessage("チームの紐付けを解除しました。");
-    } catch (error: unknown) {
-      console.error("【エラーログ】チーム紐付け解除中にエラーが発生しました:", error);
-      setStatusMessage("解除処理に失敗しました。");
+      setSelectedId("");
+      setStatusMessage("通知の紐付けを解除しました。");
+    } catch (error) {
+      console.error("【エラーログ】解除エラー:", error);
+      setStatusMessage("解除に失敗しました。");
     } finally {
       setIsProcessing(false);
     }
@@ -203,60 +230,66 @@ export function TeamSelectForm() {
   return (
     <div className="w-full max-w-md p-6 bg-white border border-slate-200 rounded-lg shadow-sm space-y-4">
       <div>
-        <h2 className="text-lg font-bold text-slate-800 mb-1">参加チーム選択 / 招集通知設定</h2>
+        <h2 className="text-lg font-bold text-slate-800 mb-1">参加枠選択 / 招集通知設定</h2>
         <p className="text-sm text-slate-600">
-          所属する立（チーム）を選択して登録すると、この端末に出番の2立前の呼出プッシュ通知が届きます。
+          団体チームまたは個人枠を選択して登録すると、この端末に出番2立前の呼出プッシュ通知（音・振動）が届きます。
         </p>
       </div>
 
-      {currentRegisteredTeam && (
+      {currentRegisteredName && (
         <div className="p-3 bg-slate-50 border border-slate-200 rounded text-sm text-slate-700 space-y-1">
           <div>
-            現在登録中:{" "}
-            <span className="font-semibold text-slate-900">
-              {teams.find((t) => t.id === currentRegisteredTeam)?.name || currentRegisteredTeam}
-            </span>
+            現在登録中: <span className="font-semibold text-slate-900">{currentRegisteredName}</span>
           </div>
           <div className="text-[11px] text-slate-500">
-            FCMトークン（端末状態）:{" "}
+            端末状態:{" "}
             {currentRegisteredToken ? (
               <span className="text-green-600 font-bold">有効（プッシュ通知受信可能）</span>
             ) : (
-              <span className="text-amber-600 font-bold">未取得（通知不可 / ブラウザ許可が必要）</span>
+              <span className="text-amber-600 font-bold">未取得（通知許可が必要）</span>
             )}
           </div>
         </div>
       )}
 
       <div>
-        <label htmlFor="team-select" className="block text-sm font-medium text-slate-700 mb-1">
-          立・チーム選択
+        <label htmlFor="entry-select" className="block text-sm font-medium text-slate-700 mb-1">
+          所属団体・個人枠選択
         </label>
         <select
-          id="team-select"
-          value={selectedTeamId}
-          onChange={(e) => setSelectedTeamId(e.target.value)}
+          id="entry-select"
+          value={selectedId}
+          onChange={(e) => setSelectedId(e.target.value)}
           disabled={isProcessing}
           className="w-full p-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-slate-900 focus:outline-none text-sm bg-white"
         >
-          <option value="">-- チームを選択してください --</option>
-          {teams.map((team) => (
-            <option key={team.id} value={team.id}>
-              {team.name}
-            </option>
-          ))}
+          <option value="">-- 選択してください --</option>
+          <optgroup label="団体戦チーム">
+            {options.filter((o) => o.type === "TEAM").map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name}
+              </option>
+            ))}
+          </optgroup>
+          <optgroup label="個人参加枠">
+            {options.filter((o) => o.type === "INDIVIDUAL").map((i) => (
+              <option key={i.id} value={i.id}>
+                {i.name}
+              </option>
+            ))}
+          </optgroup>
         </select>
       </div>
 
       <div className="flex gap-2">
         <Button
           onClick={handleRegister}
-          disabled={isProcessing || !selectedTeamId}
+          disabled={isProcessing || !selectedId}
           className="flex-1"
         >
-          {isProcessing ? "処理中..." : "この端末をチームに登録 / 更新"}
+          {isProcessing ? "処理中..." : "この端末を登録 / 更新"}
         </Button>
-        {currentRegisteredTeam && (
+        {currentRegisteredName && (
           <Button
             onClick={handleReset}
             variant="outline"
