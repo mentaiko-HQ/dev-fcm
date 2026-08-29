@@ -12,7 +12,7 @@ import {
   SortingState,
   ColumnFiltersState,
 } from "@tanstack/react-table";
-import { collection, onSnapshot, query, orderBy } from "firebase/firestore";
+import { collection, onSnapshot, query, orderBy, writeBatch, doc, getDocs } from "firebase/firestore";
 import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
 import { Participant } from "@/types/participant";
 import { EntryType, ProgressStatus, QualificationStatus, DivisionType } from "@/types";
@@ -25,13 +25,13 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
-import { ArrowUpDown, Search, RefreshCcw, Trophy, Download, Shield, User } from "lucide-react";
+import { ArrowUpDown, Search, RefreshCcw, Trophy, Download, Shield, User, AlertTriangle, Trash2 } from "lucide-react";
 
-// 静的初期フォールバックデータ
+// フールプルーフ: 初期静的データを全て的中0（未入力）として定義
 const FALLBACK_PARTICIPANTS: Participant[] = [
-  { id: "p1", standNumber: 1, position: "大前", entryType: "TEAM", progressStatus: "SHOOTING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "佐藤 健一", division: "一般男子", totalHits: 4, totalShots: 4, isPerfect: true, enkinRank: null },
-  { id: "p2", standNumber: 1, position: "中", entryType: "TEAM", progressStatus: "SHOOTING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "鈴木 隆", division: "一般男子", totalHits: 3, totalShots: 4, isPerfect: false, enkinRank: null },
-  { id: "p3", standNumber: 1, position: "落", entryType: "TEAM", progressStatus: "SHOOTING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "高橋 誠", division: "一般男子", totalHits: 2, totalShots: 4, isPerfect: false, enkinRank: null },
+  { id: "p1", standNumber: 1, position: "大前", entryType: "TEAM", progressStatus: "SHOOTING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "佐藤 健一", division: "一般男子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+  { id: "p2", standNumber: 1, position: "中", entryType: "TEAM", progressStatus: "SHOOTING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "鈴木 隆", division: "一般男子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+  { id: "p3", standNumber: 1, position: "落", entryType: "TEAM", progressStatus: "SHOOTING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "高橋 誠", division: "一般男子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
   { id: "p4", standNumber: 2, position: "大前", entryType: "TEAM", progressStatus: "CALLED", qualificationStatus: "ACTIVE", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "田中 美咲", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
   { id: "p5", standNumber: 2, position: "中", entryType: "TEAM", progressStatus: "CALLED", qualificationStatus: "ABSENT", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "渡辺 彩花", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
   { id: "p6", standNumber: 2, position: "落", entryType: "INDIVIDUAL", progressStatus: "CALLED", qualificationStatus: "ACTIVE", teamId: null, teamName: "個人枠", playerName: "小林 葵", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
@@ -45,6 +45,11 @@ export function ParticipantDataTable() {
   const [selectedDivision, setSelectedDivision] = useState<string>("ALL");
   const [selectedEntryType, setSelectedEntryType] = useState<string>("ALL");
   const [selectedProgress, setSelectedProgress] = useState<string>("ALL");
+
+  // スコア全初期化モーダルの表示制御状態（フールプルーフ）
+  const [showScoreResetModal, setShowScoreResetModal] = useState<boolean>(false);
+  const [isResettingScores, setIsResettingScores] = useState<boolean>(false);
+  const [resetStatusMessage, setResetStatusMessage] = useState<string>("");
 
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
@@ -87,6 +92,100 @@ export function ParticipantDataTable() {
 
     return () => unsubscribe();
   }, []);
+
+  // 1. 検索・絞り込みフィルターのリセット処理
+  const handleResetFilters = () => {
+    setGlobalFilter("");
+    setSelectedDivision("ALL");
+    setSelectedEntryType("ALL");
+    setSelectedProgress("ALL");
+    setSorting([{ id: "standNumber", desc: false }]);
+  };
+
+  // 2. 全選手の成績数値（的中数・射数・矢配列・遠近順位・確定順位）のFirestore一括クリア処理（フェイルセーフ）
+  const handleExecuteScoreReset = async () => {
+    // ローカル State を即座にゼロ初期化（フェイルセーフ）
+    setData((prev) =>
+      prev.map((p) => ({
+        ...p,
+        totalHits: 0,
+        totalShots: 0,
+        isPerfect: false,
+        enkinRank: null,
+        finalRank: null,
+        preliminaryArrows: [],
+        finalArrows: [],
+      }))
+    );
+
+    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
+      setShowScoreResetModal(false);
+      setResetStatusMessage("【ローカル】全選手の成績数値をクリアしました。");
+      return;
+    }
+
+    setIsResettingScores(true);
+    setResetStatusMessage("Firestore上の全成績データをクリア中...");
+
+    try {
+      const firestoreInstance = db;
+      const batch = writeBatch(firestoreInstance);
+
+      // A. entries コレクションのスコアフィールドを全件初期化
+      const entriesSnapshot = await getDocs(collection(firestoreInstance, "entries"));
+      entriesSnapshot.forEach((docSnap) => {
+        batch.update(doc(firestoreInstance, "entries", docSnap.id), {
+          totalHits: 0,
+          totalShots: 0,
+          isPerfect: false,
+          enkinRank: null,
+          finalRank: null,
+          preliminaryArrows: [],
+          finalArrows: [],
+          updatedAt: Date.now(),
+        });
+      });
+
+      // B. scores コレクションの各選手矢配列・的中数を全件初期化
+      const scoresSnapshot = await getDocs(collection(firestoreInstance, "scores"));
+      scoresSnapshot.forEach((docSnap) => {
+        const scoreData = docSnap.data();
+        const playerScores = scoreData.playerScores || {};
+        const resetPlayerScores: Record<string, unknown> = {};
+
+        Object.keys(playerScores).forEach((playerId) => {
+          const p = playerScores[playerId];
+          resetPlayerScores[playerId] = {
+            ...p,
+            preliminaryArrows: [],
+            finalArrows: [],
+            arrows: [],
+            tieBreakerArrows: [],
+            totalHits: 0,
+            isCompleted: false,
+            isPerfect: false,
+            enkinRank: null,
+            updatedAt: Date.now(),
+          };
+        });
+
+        batch.update(doc(firestoreInstance, "scores", docSnap.id), {
+          playerScores: resetPlayerScores,
+          totalTeamHits: 0,
+          updatedAt: Date.now(),
+        });
+      });
+
+      await batch.commit();
+      setShowScoreResetModal(false);
+      setResetStatusMessage("【成功】全選手の成績データ（的中数・射数・矢配列）が完全に初期化されました。");
+    } catch (error: unknown) {
+      console.error("【エラーログ】成績データ初期化中に例外が発生しました:", error);
+      setResetStatusMessage("成績初期化に失敗しました。通信環境を確認してください。");
+    } finally {
+      setIsResettingScores(false);
+    }
+  };
 
   const getProgressBadge = (status: ProgressStatus) => {
     switch (status) {
@@ -327,16 +426,9 @@ export function ParticipantDataTable() {
     },
   });
 
-  const handleResetFilters = () => {
-    setGlobalFilter("");
-    setSelectedDivision("ALL");
-    setSelectedEntryType("ALL");
-    setSelectedProgress("ALL");
-    setSorting([{ id: "standNumber", desc: false }]);
-  };
-
   return (
     <div className="w-full bg-white border border-slate-200 rounded-lg shadow-sm p-4 space-y-4">
+      {/* 検索・絞り込み・各種操作バー */}
       <div className="flex flex-col md:flex-row gap-3 items-stretch md:items-center justify-between">
         <div className="relative flex-1 max-w-sm">
           <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-slate-400" />
@@ -384,9 +476,21 @@ export function ParticipantDataTable() {
             <option value="COMPLETED">競技終了</option>
           </select>
 
+          {/* 検索・絞り込みフィルターのリセット */}
           <Button variant="outline" size="sm" onClick={handleResetFilters} className="h-9 px-3">
             <RefreshCcw className="h-3.5 w-3.5 mr-1" />
-            リセット
+            条件リセット
+          </Button>
+
+          {/* 成績データ一括クリア（フールプルーフ確認モーダルを開く） */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setShowScoreResetModal(true)}
+            className="h-9 px-3 text-red-600 border-red-200 hover:bg-red-50 font-semibold"
+          >
+            <Trash2 className="h-3.5 w-3.5 mr-1" />
+            成績全クリア
           </Button>
 
           <Button variant="outline" size="sm" onClick={handleExportCSV} className="h-9 px-3 font-bold">
@@ -396,6 +500,13 @@ export function ParticipantDataTable() {
         </div>
       </div>
 
+      {resetStatusMessage && (
+        <p className="text-xs text-center font-medium p-2 rounded bg-slate-100 text-slate-700 border border-slate-200">
+          {resetStatusMessage}
+        </p>
+      )}
+
+      {/* 参加者一覧テーブル */}
       <div className="rounded-md border border-slate-200 overflow-hidden">
         <Table>
           <TableHeader>
@@ -460,6 +571,43 @@ export function ParticipantDataTable() {
           </Button>
         </div>
       </div>
+
+      {/* フールプルーフ: 成績全クリア実行前の二重確認モーダル */}
+      {showScoreResetModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-lg p-6 max-w-md w-full shadow-2xl border border-slate-200 space-y-4 animate-in fade-in zoom-in-95">
+            <div className="flex items-center gap-3 text-red-600">
+              <AlertTriangle className="w-6 h-6 shrink-0" />
+              <h4 className="font-bold text-slate-900 text-base">全選手の成績数値をクリアしますか？</h4>
+            </div>
+            <p className="text-sm text-slate-600 leading-relaxed">
+              この操作を実行すると、<strong>全選手の入力済み的中数、射数、矢の記録（〇✕）、遠近順位、確定順位が全て「0（未入力）」に初期化</strong>されます。
+              この操作は取り消せません。
+            </p>
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setShowScoreResetModal(false)}
+                disabled={isResettingScores}
+                className="text-xs font-semibold"
+              >
+                キャンセル
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                onClick={handleExecuteScoreReset}
+                disabled={isResettingScores}
+                className="bg-red-600 hover:bg-red-700 text-white font-bold text-xs"
+              >
+                {isResettingScores ? "クリア実行中..." : "同意して全成績を初期化"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

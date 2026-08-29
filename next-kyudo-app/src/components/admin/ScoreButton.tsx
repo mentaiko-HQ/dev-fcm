@@ -3,35 +3,41 @@
 import React, { useState, useCallback } from "react";
 import { doc, setDoc, serverTimestamp } from "firebase/firestore";
 import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
-import { HitResult, PlayerScore, MatchMode, QualificationStatus } from "@/types";
+import { HitResult, PlayerScore, MatchMode, QualificationStatus, RoundTabType } from "@/types";
 import { Button } from "@/components/ui/button";
-import { UserX, AlertTriangle, CheckCircle } from "lucide-react";
+import { UserX, AlertTriangle } from "lucide-react";
 
 interface ScoreBoardProps {
   matchId: string;
   standNumber: number;
+  currentRound: RoundTabType; // PRELIMINARY (予選) | FINAL (決勝)
   player: PlayerScore;
-  maxArrows: number; // 規定射数（一手なら2、四矢なら4）
-  mode: MatchMode;   // 本戦 / 射詰競射 / 遠近競射
+  maxArrows: number;          // 該当ラウンドの規定射数 (一手: 2, 四矢: 4)
+  mode: MatchMode;            // 本戦 / 射詰競射 / 遠近競射
   isEditable?: boolean;
 }
 
 export function ScoreButton({
   matchId,
   standNumber,
+  currentRound,
   player,
   maxArrows = 4,
   mode = "本戦",
   isEditable = true,
 }: ScoreBoardProps) {
-  const [currentArrows, setCurrentArrows] = useState<HitResult[]>(player.arrows || []);
+  // 現在のラウンド（予選または決勝）に応じた矢配列を選択
+  const activeArrows = currentRound === "PRELIMINARY"
+    ? player.preliminaryArrows || []
+    : player.finalArrows || [];
+
+  const [currentArrows, setCurrentArrows] = useState<HitResult[]>(activeArrows);
   const [tieBreakerArrows, setTieBreakerArrows] = useState<HitResult[]>(player.tieBreakerArrows || []);
   const [enkinRank, setEnkinRank] = useState<number | null>(player.enkinRank ?? null);
   const [qualification, setQualification] = useState<QualificationStatus>(player.qualificationStatus || "ACTIVE");
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string>("");
 
-  // Firestoreへの非同期保存関数（フェイルセーフ: 通信障害時のロールバックと構造化エラーログ）
   const syncScoreToFirestore = useCallback(
     async (
       updatedArrows: HitResult[],
@@ -40,17 +46,14 @@ export function ScoreButton({
       updatedRank: number | null,
       updatedQual: QualificationStatus
     ) => {
-      // 欠席（ABSENT）時は的中数を0に固定（フールプルーフ）
-      const calculatedHits: number = updatedQual === "ABSENT"
+      const calculatedHits = updatedQual === "ABSENT"
         ? 0
         : updatedArrows.reduce<number>((acc: number, cur: HitResult) => acc + cur, 0);
 
-      const isCompleted: boolean = updatedQual === "ABSENT" || updatedArrows.length >= maxArrows;
-      const isPerfect: boolean = calculatedHits === maxArrows && maxArrows > 0 && updatedQual === "ACTIVE";
+      const isCompleted = updatedQual === "ABSENT" || updatedArrows.length >= maxArrows;
+      const isPerfect = calculatedHits === maxArrows && maxArrows > 0 && updatedQual === "ACTIVE";
 
-      if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
-        return;
-      }
+      if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
       setIsSyncing(true);
       setErrorMessage("");
@@ -58,6 +61,8 @@ export function ScoreButton({
       try {
         const matchDocRef = doc(db, "scores", `${matchId}_stand_${standNumber}`);
         const entryDocRef = doc(db, "entries", player.playerId);
+
+        const arrowField = currentRound === "PRELIMINARY" ? "preliminaryArrows" : "finalArrows";
 
         const scorePayload = {
           playerId: player.playerId,
@@ -67,7 +72,7 @@ export function ScoreButton({
           teamId: player.teamId || null,
           teamName: player.teamName || "",
           qualificationStatus: updatedQual,
-          arrows: updatedQual === "ABSENT" ? [] : updatedArrows,
+          [arrowField]: updatedQual === "ABSENT" ? [] : updatedArrows,
           totalHits: calculatedHits,
           isCompleted: isCompleted,
           isPerfect: isPerfect,
@@ -76,13 +81,13 @@ export function ScoreButton({
           updatedAt: Date.now(),
         };
 
-        // scoresコレクションとentriesコレクションの両方を安全に更新
         await Promise.all([
           setDoc(
             matchDocRef,
             {
-              matchId: matchId,
-              standNumber: standNumber,
+              matchId,
+              standNumber,
+              currentRound,
               playerScores: {
                 [player.playerId]: scorePayload,
               },
@@ -93,9 +98,10 @@ export function ScoreButton({
           setDoc(
             entryDocRef,
             {
+              [arrowField]: updatedQual === "ABSENT" ? [] : updatedArrows,
               totalHits: calculatedHits,
               totalShots: updatedQual === "ABSENT" ? 0 : updatedArrows.length,
-              isPerfect: isPerfect,
+              isPerfect,
               qualificationStatus: updatedQual,
               enkinRank: updatedRank,
               updatedAt: Date.now(),
@@ -103,29 +109,18 @@ export function ScoreButton({
             { merge: true }
           ),
         ]);
-      } catch (error: unknown) {
-        const errorDetail =
-          error instanceof Error
-            ? { message: error.message, stack: error.stack }
-            : String(error);
-
-        console.error("【エラーログ】Firestoreへのスコア同期に失敗しました:", {
-          matchId,
-          playerId: player.playerId,
-          error: errorDetail,
-        });
+      } catch (error) {
+        console.error("【エラーログ】スコア同期失敗:", error);
         setCurrentArrows(previousArrows);
-        setErrorMessage("サーバーへのスコア保存に失敗しました。再試行してください。");
+        setErrorMessage("保存に失敗しました。");
       } finally {
         setIsSyncing(false);
       }
     },
-    [matchId, standNumber, player.playerId, player.playerName, player.position, player.entryType, player.teamId, player.teamName, maxArrows]
+    [matchId, standNumber, currentRound, player.playerId, player.playerName, player.position, player.entryType, player.teamId, player.teamName, maxArrows]
   );
 
-  // 本戦スコア入力ハンドラ
   const handleAddArrow = (result: HitResult) => {
-    // フールプルーフ: 欠席・失格選手や上限到達時の入力を物理的に遮断
     if (
       !isEditable ||
       qualification === "ABSENT" ||
@@ -144,11 +139,8 @@ export function ScoreButton({
     syncScoreToFirestore(updated, previous, tieBreakerArrows, enkinRank, qualification);
   };
 
-  // 射詰競射入力ハンドラ
   const handleAddTieBreakerArrow = (result: HitResult) => {
-    if (!isEditable || qualification === "ABSENT" || qualification === "DISQUALIFIED" || isSyncing || mode !== "射詰競射") {
-      return;
-    }
+    if (!isEditable || qualification === "ABSENT" || isSyncing || mode !== "射詰競射") return;
 
     const previous = [...tieBreakerArrows];
     const updated = [...tieBreakerArrows, result];
@@ -157,7 +149,6 @@ export function ScoreButton({
     syncScoreToFirestore(currentArrows, currentArrows, updated, enkinRank, qualification);
   };
 
-  // 遠近競射の順位直接選択ハンドラ
   const handleEnkinRankChange = (rank: number | null) => {
     if (!isEditable || qualification === "ABSENT" || isSyncing || mode !== "遠近競射") return;
 
@@ -165,19 +156,15 @@ export function ScoreButton({
     syncScoreToFirestore(currentArrows, currentArrows, tieBreakerArrows, rank, qualification);
   };
 
-  // 出欠・資格ステータス切り替えハンドラ（フールプルーフ: 欠席時はスコアを即時クリア）
   const handleQualificationChange = (newQual: QualificationStatus) => {
     if (!isEditable || isSyncing) return;
 
     setQualification(newQual);
     const updatedArrows = newQual === "ABSENT" ? [] : currentArrows;
-    if (newQual === "ABSENT") {
-      setCurrentArrows([]);
-    }
+    if (newQual === "ABSENT") setCurrentArrows([]);
     syncScoreToFirestore(updatedArrows, currentArrows, tieBreakerArrows, enkinRank, newQual);
   };
 
-  // 直前の入力を取り消すUndo処理
   const handleUndo = () => {
     if (!isEditable || isSyncing || qualification === "ABSENT") return;
 
@@ -198,19 +185,13 @@ export function ScoreButton({
   };
 
   const isAbsent = qualification === "ABSENT";
-  const isWithdrawn = qualification === "WITHDRAWN";
-  const isDisqualified = qualification === "DISQUALIFIED";
-
-  const totalHits: number = isAbsent
-    ? 0
-    : currentArrows.reduce<number>((sum: number, val: HitResult) => sum + val, 0);
-  const isPerfect: boolean = totalHits === maxArrows && maxArrows > 0 && qualification === "ACTIVE";
+  const totalHits = isAbsent ? 0 : currentArrows.reduce<number>((sum, val) => sum + val, 0);
+  const isPerfect = totalHits === maxArrows && maxArrows > 0 && qualification === "ACTIVE";
 
   return (
     <div className={`p-4 border rounded-lg bg-white shadow-sm flex flex-col gap-3 transition-colors ${
       isAbsent ? "border-slate-300 bg-slate-100 opacity-75" : "border-slate-200"
     }`}>
-      {/* 選手ヘッダー情報（個人/団体バッジ・出欠セレクト） */}
       <div className="flex justify-between items-start gap-2">
         <div>
           <div className="flex items-center gap-1.5 flex-wrap">
@@ -220,7 +201,7 @@ export function ScoreButton({
             <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
               player.entryType === "INDIVIDUAL" ? "bg-purple-100 text-purple-800" : "bg-blue-100 text-blue-800"
             }`}>
-              {player.entryType === "INDIVIDUAL" ? "個人枠" : "団体枠"}
+              {player.entryType === "INDIVIDUAL" ? "個人" : "団体"}
             </span>
             <span className="font-bold text-slate-900">{player.playerName}</span>
             {isPerfect && (
@@ -234,35 +215,26 @@ export function ScoreButton({
           </p>
         </div>
 
-        {/* 出欠・資格ステータス切り替え（フールプルーフUI） */}
         <select
           value={qualification}
           onChange={(e) => handleQualificationChange(e.target.value as QualificationStatus)}
           disabled={!isEditable || isSyncing}
-          className="text-xs p-1 border border-slate-300 rounded bg-white text-slate-700 font-semibold focus:ring-1 focus:ring-slate-900"
+          className="text-xs p-1 border border-slate-300 rounded bg-white text-slate-700 font-semibold"
         >
           <option value="ACTIVE">正常参加</option>
-          <option value="ABSENT">欠席 (不戦)</option>
+          <option value="ABSENT">欠席</option>
           <option value="WITHDRAWN">途中棄権</option>
           <option value="DISQUALIFIED">失格</option>
         </select>
       </div>
 
-      {/* 欠席・棄権・失格時の警告バナー */}
       {isAbsent && (
         <div className="p-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800 font-medium flex items-center gap-1.5">
           <UserX className="w-4 h-4 text-amber-600 shrink-0" />
-          欠席のため入力無効（団体戦は欠員立ちとして集計）
-        </div>
-      )}
-      {isWithdrawn && (
-        <div className="p-2 bg-orange-50 border border-orange-200 rounded text-xs text-orange-800 font-medium flex items-center gap-1.5">
-          <AlertTriangle className="w-4 h-4 text-orange-600 shrink-0" />
-          途中棄権（既に入力された的中は集計に有効）
+          欠席（スコア入力対象外）
         </div>
       )}
 
-      {/* 的中表示インジケーター */}
       {mode === "本戦" && !isAbsent && (
         <div className="grid grid-cols-4 gap-2 py-2 bg-slate-50 border border-slate-100 rounded px-2">
           {Array.from({ length: maxArrows }).map((_, index) => {
@@ -286,7 +258,6 @@ export function ScoreButton({
         </div>
       )}
 
-      {/* 射詰競射モードインジケーター */}
       {mode === "射詰競射" && !isAbsent && (
         <div className="flex gap-1.5 overflow-x-auto py-2 bg-amber-50 border border-amber-200 rounded px-2 items-center">
           <span className="text-xs font-bold text-amber-900 whitespace-nowrap mr-1">射詰:</span>
@@ -307,7 +278,6 @@ export function ScoreButton({
         </div>
       )}
 
-      {/* 遠近競射モードUI */}
       {mode === "遠近競射" && !isAbsent && (
         <div className="p-3 bg-blue-50 border border-blue-200 rounded flex flex-col gap-2">
           <div className="flex justify-between items-center">
@@ -336,13 +306,12 @@ export function ScoreButton({
         </div>
       )}
 
-      {/* スコア入力ボタングループ（欠席時はDisabled化: フールプルーフ） */}
       {mode !== "遠近競射" && (
         <div className="grid grid-cols-3 gap-2">
           <Button
             type="button"
             onClick={() => (mode === "本戦" ? handleAddArrow(1) : handleAddTieBreakerArrow(1))}
-            disabled={!isEditable || isAbsent || isDisqualified || (mode === "本戦" && currentArrows.length >= maxArrows) || isSyncing}
+            disabled={!isEditable || isAbsent || (mode === "本戦" && currentArrows.length >= maxArrows) || isSyncing}
             className="bg-red-600 hover:bg-red-700 text-white font-bold h-12 text-lg shadow-sm active:scale-95 transition-transform disabled:opacity-40"
           >
             〇 (的中)
@@ -350,7 +319,7 @@ export function ScoreButton({
           <Button
             type="button"
             onClick={() => (mode === "本戦" ? handleAddArrow(0) : handleAddTieBreakerArrow(0))}
-            disabled={!isEditable || isAbsent || isDisqualified || (mode === "本戦" && currentArrows.length >= maxArrows) || isSyncing}
+            disabled={!isEditable || isAbsent || (mode === "本戦" && currentArrows.length >= maxArrows) || isSyncing}
             variant="secondary"
             className="font-bold h-12 text-lg text-slate-800 bg-slate-200 hover:bg-slate-300 active:scale-95 transition-transform disabled:opacity-40"
           >
@@ -373,7 +342,6 @@ export function ScoreButton({
         </div>
       )}
 
-      {/* 遠近競射時の取消ボタン */}
       {mode === "遠近競射" && !isAbsent && (
         <Button
           type="button"
@@ -386,9 +354,8 @@ export function ScoreButton({
         </Button>
       )}
 
-      {/* 同期ステータス・エラーログ */}
       {isSyncing && (
-        <p className="text-[11px] text-center text-slate-400 animate-pulse">Firestoreと同期中...</p>
+        <p className="text-[11px] text-center text-slate-400 animate-pulse">Firestore同期中...</p>
       )}
       {errorMessage && (
         <p className="text-[11px] text-center text-red-600 font-medium">{errorMessage}</p>

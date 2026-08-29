@@ -70,7 +70,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
     return () => unsubscribe();
   }, [matchId]);
 
-  // Firestore初期コレクション（個人/団体3層ステータス対応シード）の一括投入
+  // Firestore初期コレクション（的中数0で初期化）の一括投入処理
   const handleSeedFirestore = async () => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
       setStatusMessage("Firebase環境変数が設定されていません。");
@@ -79,7 +79,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
 
     const firestoreInstance = db;
     setIsSeeding(true);
-    setStatusMessage("3層ステータス対応の初期データを書き込み中...");
+    setStatusMessage("初期データ（的中数0）をFirestoreへ書き込み中...");
 
     try {
       // 1. teams コレクション
@@ -111,20 +111,17 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
         { merge: true }
       );
 
-      // 3. entries コレクション（団体選手 ＋ 個人参加選手 ＋ 欠席サンプルの完全構成）
+      // 3. entries コレクション（的中数は全て0でシード）
       const sampleEntries = [
-        // 第1立: 団体戦（3名正常）
-        { id: "p1", standNumber: 1, position: "大前", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "佐藤 健一", division: "一般男子", totalHits: 4, totalShots: 4, isPerfect: true, enkinRank: null },
-        { id: "p2", standNumber: 1, position: "中", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "鈴木 隆", division: "一般男子", totalHits: 3, totalShots: 4, isPerfect: false, enkinRank: null },
-        { id: "p3", standNumber: 1, position: "落", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "高橋 誠", division: "一般男子", totalHits: 2, totalShots: 4, isPerfect: false, enkinRank: null },
+        { id: "p1", standNumber: 1, position: "大前", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "佐藤 健一", division: "一般男子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+        { id: "p2", standNumber: 1, position: "中", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "鈴木 隆", division: "一般男子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
+        { id: "p3", standNumber: 1, position: "落", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_01", teamName: "第一立（福岡弓道倶楽部A）", playerName: "高橋 誠", division: "一般男子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
 
-        // 第2立: 団体選手2名 ＋ 欠席1名 ＋ 個人参加1名の混成立ち
         { id: "p4", standNumber: 2, position: "大前", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "田中 美咲", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
         { id: "p5", standNumber: 2, position: "中", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ABSENT", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "渡辺 彩花 (欠席)", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
         { id: "p6", standNumber: 2, position: "落前", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_02", teamName: "第二立（博多紅葉会）", playerName: "松田 栞", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
         { id: "p_indiv_01", standNumber: 2, position: "落", entryType: "INDIVIDUAL", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: null, teamName: "個人参加枠", playerName: "小林 葵 (個人)", division: "一般女子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
 
-        // 第3立: 団体戦（春日白鷺会）
         { id: "p7", standNumber: 3, position: "大前", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_03", teamName: "第三立（春日白鷺会）", playerName: "伊藤 剛", division: "シニア男子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
         { id: "p8", standNumber: 3, position: "落", entryType: "TEAM", progressStatus: "WAITING", qualificationStatus: "ACTIVE", teamId: "team_03", teamName: "第三立（春日白鷺会）", playerName: "山本 翔太", division: "シニア男子", totalHits: 0, totalShots: 0, isPerfect: false, enkinRank: null },
       ];
@@ -133,7 +130,7 @@ export function MatchControlPanel({ matchId = "match_2026_001" }: MatchControlPa
         await setDoc(doc(firestoreInstance, "entries", entry.id), entry, { merge: true });
       }
 
-      setStatusMessage("【成功】個人/団体・3層ステータス対応の初期シードデータをFirestoreに投入しました。");
+      setStatusMessage("【成功】初期シードデータをFirestoreへ投入しました（全的中数0）。");
     } catch (error: unknown) {
       console.error("【エラーログ】初期データ作成エラー:", error);
       setStatusMessage("初期データの書き込みに失敗しました。");

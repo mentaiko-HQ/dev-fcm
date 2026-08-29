@@ -15,6 +15,7 @@ const db = admin.firestore();
 
 interface MatchDocumentData {
   currentStandNumber?: number;
+  currentRound?: "PRELIMINARY" | "FINAL";
   [key: string]: unknown;
 }
 
@@ -39,7 +40,7 @@ interface UserDocumentData {
 
 /**
  * 試合進行ドキュメント（matches/{matchId}）の更新を監視し、
- * 2つ前の立が開始された時点で対象の団体・個人選手へFCM招集通知を自動送信するCloud Function (v2)
+ * 2つ前の立が開始された時点で対象チームおよび個人選手へFCM招集通知を自動送信するCloud Function (v2)
  */
 export const onMatchProgressUpdated = onDocumentWritten(
   {
@@ -71,7 +72,7 @@ export const onMatchProgressUpdated = onDocumentWritten(
     console.log(`【進行更新検知】第${currentStand}立開始を検知。呼出対象: 第${targetStandNumber}立`);
 
     try {
-      // 1. 呼出対象立に所属する選手エントリー（団体・個人混在）を抽出
+      // 1. 呼出対象立に所属する選手エントリーを抽出
       const entriesSnapshot = await db
         .collection("entries")
         .where("standNumber", "==", targetStandNumber)
@@ -89,7 +90,6 @@ export const onMatchProgressUpdated = onDocumentWritten(
 
       entriesSnapshot.forEach((entryDoc) => {
         const entryData = entryDoc.data() as EntryDocumentData;
-        // 欠席・失格以外の選手のみ招集更新対象
         if (entryData.qualificationStatus === "ACTIVE" || entryData.qualificationStatus === "WITHDRAWN") {
           batch.update(entryDoc.ref, {
             progressStatus: "CALLED",
@@ -119,11 +119,10 @@ export const onMatchProgressUpdated = onDocumentWritten(
 
       await batch.commit();
 
-      // 3. 宛先トークンの収集（団体所属端末 ＋ 個人選手端末のマルチキャスト宛先解決）
+      // 3. 宛先トークンの収集
       const tokens: string[] = [];
       const userDocIds: string[] = [];
 
-      // A. 団体チーム登録端末のFCMトークン取得
       for (const teamId of targetTeamIds) {
         const teamUsersSnapshot = await db
           .collection("users")
@@ -139,7 +138,6 @@ export const onMatchProgressUpdated = onDocumentWritten(
         });
       }
 
-      // B. 個人参加選手登録端末のFCMトークン取得
       for (const userId of targetUserIds) {
         const userDoc = await db.collection("users").doc(userId).get();
         if (userDoc.exists) {
@@ -151,7 +149,6 @@ export const onMatchProgressUpdated = onDocumentWritten(
         }
       }
 
-      // 重複トークンの排除（フールプルーフ）
       const uniqueTokenMap = new Map<string, string>();
       tokens.forEach((t, idx) => {
         uniqueTokenMap.set(t, userDocIds[idx]);
@@ -161,18 +158,17 @@ export const onMatchProgressUpdated = onDocumentWritten(
       const finalUserDocIds = Array.from(uniqueTokenMap.values());
 
       if (finalTokens.length === 0) {
-        console.log(`【招集通知】第${targetStandNumber}立に紐付く有効なFCMトークンがありません。端末登録状況を確認してください。`);
+        console.log(`【招集通知】第${targetStandNumber}立に紐付く有効なFCMトークンがありません。`);
         return;
       }
 
-      console.log(`【通知送信開始】第${targetStandNumber}立（団体/個人混成）の ${finalTokens.length} 件のデバイスへFCM送信を実行します。`);
+      console.log(`【通知送信開始】第${targetStandNumber}立の ${finalTokens.length} 件のデバイスへFCM送信を実行します。`);
 
-      // マルチキャスト通知ペイロードの構築
       const payload: admin.messaging.MulticastMessage = {
         tokens: finalTokens,
         notification: {
           title: "【招集通知】まもなく出番です",
-          body: `現在 第${currentStand}立 が進行中です。第${targetStandNumber}立（団体・個人選手）は弓道場控席へ入場してください。`,
+          body: `現在 第${currentStand}立 が進行中です。第${targetStandNumber}立の選手は弓道場控席へ入場してください。`,
         },
         data: {
           standNumber: String(targetStandNumber),
@@ -198,7 +194,6 @@ export const onMatchProgressUpdated = onDocumentWritten(
       const response: admin.messaging.BatchResponse = await admin.messaging().sendEachForMulticast(payload);
       console.log(`【招集通知完了】第${targetStandNumber}立, 成功: ${response.successCount}件, 失敗: ${response.failureCount}件`);
 
-      // フェイルセーフ: 無効となった古いトークンのクリーンアップ処理（デッドレター対策）
       const staleTokenUpdates: Promise<admin.firestore.WriteResult>[] = [];
       response.responses.forEach((res: admin.messaging.SendResponse, idx: number) => {
         if (!res.success) {
@@ -209,7 +204,6 @@ export const onMatchProgressUpdated = onDocumentWritten(
             errorCode === "messaging/invalid-registration-token" ||
             errorCode === "messaging/registration-token-not-registered"
           ) {
-            console.log(`【トークン削除】無効なトークンをユーザー ${finalUserDocIds[idx]} から削除します。`);
             staleTokenUpdates.push(
               db.collection("users").doc(finalUserDocIds[idx]).update({
                 fcmToken: admin.firestore.FieldValue.delete(),
