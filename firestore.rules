@@ -2,42 +2,37 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ユーザーがシステム管理者（役員）であるか判定するヘルパー関数（フールプルーフ）
+    // 管理者判定ヘルパー関数（フールプルーフ: 管理者ロールの厳密チェック）
     function isAdmin() {
       return request.auth != null && request.auth.token.admin == true;
     }
 
-    // ユーザー自身のリソースであるか判定するヘルパー関数
+    // ユーザー自身であるかの判定
     function isOwner(userId) {
       return request.auth != null && request.auth.uid == userId;
     }
 
-    // users コレクション（FCMトークン・選択チーム管理）
+    // users コレクション（FCMトークン・端末選択管理）
     match /users/{userId} {
       allow read: if true;
       allow create, update: if true;
       allow delete: if isAdmin();
     }
 
-    // teams コレクション（立順、チーム構成）
-    match /teams/{teamId} {
-      allow read: if true;
-      allow create, update, delete: if true;
-    }
-
-    // entries コレクション（参加選手・立順データ・3層ステータス・スコア）
+    // entries コレクション（参加者エントリー・スコア・3層ステータス）
     match /entries/{entryId} {
       allow read: if true;
-      allow create, update, delete: if true;
+      allow create: if true;
+      allow update, delete: if true;
     }
 
-    // matches コレクション（大会設定、進行管理、競技形式設定）
+    // matches コレクション（大会ステータス・進行管理・エントリー期間設定）
     match /matches/{matchId} {
       allow read: if true;
       allow create, update, delete: if true;
     }
 
-    // scores コレクション（予選・決勝スコアデータ）
+    // scores コレクション（立単位スコアデータ）
     match /scores/{scoreId} {
       allow read: if true;
       allow create, update, delete: if true;

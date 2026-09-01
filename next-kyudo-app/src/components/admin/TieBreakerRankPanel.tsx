@@ -4,18 +4,74 @@ import React, { useState, useEffect } from "react";
 import { collection, onSnapshot, query, doc, writeBatch } from "firebase/firestore";
 import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
 import { Participant } from "@/types/participant";
+import { StandOrderType, ShosaType, StaffRoleType, ProgressStatus, QualificationStatus } from "@/types";
 import { Button } from "@/components/ui/button";
-import { Trophy, CheckCircle2, RotateCcw, Shield, User } from "lucide-react";
+import { Trophy, CheckCircle2, RotateCcw } from "lucide-react";
 
 interface TieBreakerRankPanelProps {
   matchId?: string;
 }
 
-export function TieBreakerRankPanel({ matchId = "match_2026_001" }: TieBreakerRankPanelProps) {
+/**
+ * フールプルーフ & フェイルセーフ: 立順(1〜5)の型バリデーションおよび安全側フォールバック
+ * 不正な数値や未定義値がFirestoreから渡された場合でも、確実に 1 | 2 | 3 | 4 | 5 の型に適合させる
+ */
+function sanitizeStandOrder(val: unknown): StandOrderType {
+  const num = typeof val === "number" ? val : Number(val);
+  if (num === 1 || num === 2 || num === 3 || num === 4 || num === 5) {
+    return num;
+  }
+  // フェイルセーフ: 範囲外の場合はデフォルト 1番 を返却
+  return 1;
+}
+
+/**
+ * フールプルーフ & フェイルセーフ: 所作（肌脱ぎ / 襷掛け）のバリデーション
+ */
+function sanitizeShosa(val: unknown): ShosaType {
+  if (val === "襷掛け") return "襷掛け";
+  return "肌脱ぎ";
+}
+
+/**
+ * フールプルーフ & フェイルセーフ: 役員役割のバリデーション
+ */
+function sanitizeStaffRole(val: unknown): StaffRoleType {
+  const validRoles: StaffRoleType[] = ["進行", "記録", "的前", "招集", "運営", "無し"];
+  if (typeof val === "string" && validRoles.includes(val as StaffRoleType)) {
+    return val as StaffRoleType;
+  }
+  return "無し";
+}
+
+/**
+ * フールプルーフ & フェイルセーフ: 進行状態のバリデーション
+ */
+function sanitizeProgressStatus(val: unknown): ProgressStatus {
+  const validStatuses: ProgressStatus[] = ["WAITING", "CALLED", "SHOOTING", "COMPLETED"];
+  if (typeof val === "string" && validStatuses.includes(val as ProgressStatus)) {
+    return val as ProgressStatus;
+  }
+  return "WAITING";
+}
+
+/**
+ * フールプルーフ & フェイルセーフ: 出欠資格のバリデーション
+ */
+function sanitizeQualificationStatus(val: unknown): QualificationStatus {
+  const validQuals: QualificationStatus[] = ["ACTIVE", "ABSENT", "WITHDRAWN", "DISQUALIFIED"];
+  if (typeof val === "string" && validQuals.includes(val as QualificationStatus)) {
+    return val as QualificationStatus;
+  }
+  return "ACTIVE";
+}
+
+export function TieBreakerRankPanel({ matchId = "match_2026_mentaiko" }: TieBreakerRankPanelProps) {
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string>("");
 
+  // Firestoreから選手スコア・遠近順位データをリアルタイム購読
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -31,20 +87,27 @@ export function TieBreakerRankPanel({ matchId = "match_2026_001" }: TieBreakerRa
             const raw = docSnap.data();
             loaded.push({
               id: docSnap.id,
-              standNumber: Number(raw.standNumber) || 1,
-              position: raw.position || "大前",
-              entryType: raw.entryType || "TEAM",
-              progressStatus: raw.progressStatus || "WAITING",
-              qualificationStatus: raw.qualificationStatus || "ACTIVE",
-              teamId: raw.teamId || null,
-              teamName: raw.teamName || (raw.entryType === "INDIVIDUAL" ? "個人枠" : "所属未設定"),
-              playerName: raw.playerName || "選手名未設定",
-              division: raw.division || "一般男子",
-              totalHits: Number(raw.totalHits) || 0,
-              totalShots: Number(raw.totalShots) || 0,
+              bibNumber: typeof raw.bibNumber === "number" ? raw.bibNumber : Number(raw.bibNumber) || 1,
+              name: typeof raw.name === "string" ? raw.name : "選手名未設定",
+              nameKana: typeof raw.nameKana === "string" ? raw.nameKana : "",
+              organization: typeof raw.organization === "string" ? raw.organization : "",
+              shosa: sanitizeShosa(raw.shosa),
+              staffRole: sanitizeStaffRole(raw.staffRole),
+              standGroup: typeof raw.standGroup === "number" ? raw.standGroup : Number(raw.standGroup) || 1,
+              // TS2322 エラー解消: sanitizeStandOrder により型安全に StandOrderType (1〜5) を代入
+              standOrder: sanitizeStandOrder(raw.standOrder),
+              progressStatus: sanitizeProgressStatus(raw.progressStatus),
+              qualificationStatus: sanitizeQualificationStatus(raw.qualificationStatus),
+              stand1_arrows: Array.isArray(raw.stand1_arrows) ? raw.stand1_arrows : [],
+              stand2_arrows: Array.isArray(raw.stand2_arrows) ? raw.stand2_arrows : [],
+              stand3_arrows: Array.isArray(raw.stand3_arrows) ? raw.stand3_arrows : [],
+              totalHits: typeof raw.totalHits === "number" ? raw.totalHits : Number(raw.totalHits) || 0,
+              totalShots: typeof raw.totalShots === "number" ? raw.totalShots : Number(raw.totalShots) || 0,
               isPerfect: Boolean(raw.isPerfect),
               enkinRank: typeof raw.enkinRank === "number" ? raw.enkinRank : null,
               finalRank: typeof raw.finalRank === "number" ? raw.finalRank : null,
+              userId: typeof raw.userId === "string" ? raw.userId : undefined,
+              updatedAt: typeof raw.updatedAt === "number" ? raw.updatedAt : undefined,
             });
           });
           setParticipants(loaded);
@@ -58,16 +121,19 @@ export function TieBreakerRankPanel({ matchId = "match_2026_001" }: TieBreakerRa
     return () => unsubscribe();
   }, []);
 
+  // 既に使用されている遠近順位番号のリスト（フールプルーフ: 重複割り当て防止）
   const assignedRanks = participants
     .map((p) => p.enkinRank)
     .filter((r): r is number => r !== null && r !== undefined);
 
+  // 遠近順位のローカル更新
   const handleAssignRank = (participantId: string, rank: number | null) => {
     setParticipants((prev) =>
       prev.map((p) => (p.id === participantId ? { ...p, enkinRank: rank } : p))
     );
   };
 
+  // 最終順位の一括計算とFirestore確定バッチコミット（フェイルセーフ）
   const handleFinalizeRanks = async () => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
       setStatusMessage("Firebase未接続のためローカル保持のみとなります。");
@@ -88,7 +154,7 @@ export function TieBreakerRankPanel({ matchId = "match_2026_001" }: TieBreakerRa
         if (a.enkinRank && b.enkinRank) return a.enkinRank - b.enkinRank;
         if (a.enkinRank && !b.enkinRank) return -1;
         if (!a.enkinRank && b.enkinRank) return 1;
-        return b.totalHits - a.totalHits;
+        return (b.totalHits || 0) - (a.totalHits || 0);
       });
 
       sorted.forEach((p, index) => {
@@ -118,6 +184,7 @@ export function TieBreakerRankPanel({ matchId = "match_2026_001" }: TieBreakerRa
     }
   };
 
+  // 遠近順位のリセット処理
   const handleResetEnkinRanks = () => {
     setParticipants((prev) => prev.map((p) => ({ ...p, enkinRank: null })));
     setStatusMessage("遠近順位の選択をリセットしました。");
@@ -132,7 +199,7 @@ export function TieBreakerRankPanel({ matchId = "match_2026_001" }: TieBreakerRa
             遠近判定・順位確定コントロールパネル
           </h3>
           <p className="text-xs text-slate-500">
-            同中発生時の目視遠近判定結果を入力し、個人・団体の最終順位を確定します
+            同中発生時の目視遠近判定結果を入力し、個人戦の最終順位を確定します
           </p>
         </div>
         <div className="flex gap-2">
@@ -171,27 +238,25 @@ export function TieBreakerRankPanel({ matchId = "match_2026_001" }: TieBreakerRa
               <div>
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-xs font-bold bg-slate-200 text-slate-700 px-1.5 py-0.5 rounded">
-                    第{p.standNumber}立 {p.position}
+                    第{String(p.standGroup).padStart(2, "0")}立 {p.standOrder}番
                   </span>
-                  <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
-                    p.entryType === "INDIVIDUAL" ? "bg-purple-100 text-purple-800" : "bg-blue-100 text-blue-800"
-                  }`}>
-                    {p.entryType === "INDIVIDUAL" ? "個人" : "団体"}
+                  <span className="text-xs font-semibold px-2 py-0.5 rounded bg-slate-100 text-slate-700">
+                    No.{p.bibNumber}
                   </span>
-                  <span className="font-bold text-slate-900 text-sm">{p.playerName}</span>
-                  <span className="text-xs text-slate-500">({p.teamName})</span>
+                  <span className="font-bold text-slate-900 text-sm">{p.name}</span>
+                  <span className="text-xs text-slate-500">({p.organization || "所属未設定"})</span>
                   {isAbsent && <span className="text-[10px] text-red-600 font-bold">【欠席】</span>}
                 </div>
                 <div className="text-xs text-slate-600 mt-1">
-                  的中数: <span className="font-bold text-red-600">{p.totalHits}</span> 中
-                  {p.isPerfect && <span className="ml-1 text-red-600 font-bold">【皆中】</span>}
+                  的中数: <span className="font-bold text-red-600">{p.totalHits}</span> / 8 中
+                  {p.isPerfect && <span className="ml-1 text-red-600 font-bold">【8射皆中】</span>}
                 </div>
               </div>
 
               {!isAbsent ? (
                 <div className="flex items-center gap-1">
                   <span className="text-xs font-semibold text-slate-600 mr-1">判定順位:</span>
-                  {[1, 2, 3, 4, 5].map((rankNum) => {
+                  {[1, 2, 3, 4, 5, 6].map((rankNum) => {
                     const isSelected = p.enkinRank === rankNum;
                     const isTakenByOther = assignedRanks.includes(rankNum) && !isSelected;
 
