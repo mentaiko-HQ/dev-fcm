@@ -20,10 +20,6 @@ interface CSVImportScheduleWizardProps {
   matchId?: string;
 }
 
-/**
- * フールプルーフ & フェイルセーフ: 立順(1〜5)の型バリデーションおよび安全側フォールバック
- * 入力値が不正または範囲外の場合でも、確実に 1 | 2 | 3 | 4 | 5 の型を保証する
- */
 function sanitizeStandOrder(val: unknown): StandOrderType {
   const num = typeof val === "number" ? val : Number(val);
   if (num === 1 || num === 2 || num === 3 || num === 4 || num === 5) {
@@ -32,17 +28,11 @@ function sanitizeStandOrder(val: unknown): StandOrderType {
   return 1;
 }
 
-/**
- * フールプルーフ & フェイルセーフ: 所作（肌脱ぎ / 襷掛け）のバリデーション
- */
 function sanitizeShosa(val: unknown): ShosaType {
   if (val === "襷掛け") return "襷掛け";
   return "肌脱ぎ";
 }
 
-/**
- * フールプルーフ & フェイルセーフ: 称号・段位のバリデーション
- */
 function sanitizeRankTitle(val: unknown): RankTitleType {
   if (val === "称号を取得している" || val === "段位は四段以上" || val === "段位は三段以下") {
     return val;
@@ -50,21 +40,6 @@ function sanitizeRankTitle(val: unknown): RankTitleType {
   return "段位は三段以下";
 }
 
-/**
- * CSV一括インポート ＆ 立ちグループ編成ウィザードコンポーネント
- * 
- * 【機能要件】
- * - 入力例付きCSVテンプレートのダウンロード機能（Blobを用いたクライアントサイド生成）
- * - ゼッケン番号なし（自動連番採番）での一括インポート処理
- * - 称号・段位データの解析・登録対応
- * 
- * 【フールプルーフ】
- * - 必須項目（選手氏名）の欠損行の検出とスキップ処理
- * 
- * 【フェイルセーフ】
- * - 既存のFirestore登録数を自動取得し、重複しないゼッケン番号を安全に連番採番
- * - 500件上限を回避する400件単位のチャンク分割バッチコミット
- */
 export function CSVImportScheduleWizard({ matchId = "match_2026_mentaiko" }: CSVImportScheduleWizardProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
@@ -73,10 +48,6 @@ export function CSVImportScheduleWizard({ matchId = "match_2026_mentaiko" }: CSV
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<{ type: "success" | "error" | "info"; text: string } | null>(null);
 
-  /**
-   * フールプルーフ: 入力例付き統合CSVテンプレートのダウンロード機能
-   * Excelでの文字化けを防ぐため、BOM付きUTF-8 (¥uFEFF) を付与してBlobを生成する
-   */
   const handleDownloadTemplate = () => {
     const headers = [
       "選手氏名",
@@ -94,7 +65,6 @@ export function CSVImportScheduleWizard({ matchId = "match_2026_mentaiko" }: CSV
       "備考"
     ];
 
-    // 実用的な入力例（サンプルデータ）
     const sampleRows = [
       ["早田 豊", "はやた ゆたか", "福岡弓道倶楽部", "肌脱ぎ", "称号を取得している", "希望", "不要", "早田 豊", "090-1234-5678", "hayata@example.com", "1", "1", "半日役員協力可能"],
       ["佐藤 健一", "さとう けんいち", "博多弓友会", "襷掛け", "段位は四段以上", "なし", "要サポート", "早田 豊", "090-1234-5678", "hayata@example.com", "1", "2", "本座での襷掛けサポート希望"],
@@ -125,7 +95,6 @@ export function CSVImportScheduleWizard({ matchId = "match_2026_mentaiko" }: CSV
   };
 
   const parseCSV = async (csvFile: File) => {
-    // フェイルセーフ: Firestoreの既存エントリー数を取得し、ゼッケン自動採番の起点を安全に決定する
     let existingCount = 0;
     try {
       if (isFirebaseConfigured && isFirestoreAvailable(db)) {
@@ -206,7 +175,6 @@ export function CSVImportScheduleWizard({ matchId = "match_2026_mentaiko" }: CSV
           const isVolunteer = ["true", "1", "有", "有り", "希望", "希望あり", "yes"].includes(volRaw.toLowerCase());
           const needsSupport = ["true", "1", "要", "要サポート", "希望", "yes"].includes(supRaw.toLowerCase());
 
-          // ゼッケン番号の自動連番採番
           const bibNumber = existingCount + i;
           const standGroup = groupRaw && !isNaN(Number(groupRaw)) ? Number(groupRaw) : Math.floor((i - 1) / 3) + 1;
           const rawOrder = orderRaw && !isNaN(Number(orderRaw)) ? Number(orderRaw) : ((i - 1) % 3) + 1;
@@ -222,6 +190,7 @@ export function CSVImportScheduleWizard({ matchId = "match_2026_mentaiko" }: CSV
             rankTitle: sanitizeRankTitle(rankRaw),
             staffRole: isVolunteer ? "運営" : "無し",
             staffDutyShift: isVolunteer ? "AM" : "無し",
+            checkInStatus: "UNCHECKED",
             isStaffVolunteer: isVolunteer,
             needsSupport,
             standGroup,
@@ -320,7 +289,6 @@ export function CSVImportScheduleWizard({ matchId = "match_2026_mentaiko" }: CSV
           </p>
         </div>
 
-        {/* テンプレートダウンロードボタン */}
         <Button
           type="button"
           variant="outline"

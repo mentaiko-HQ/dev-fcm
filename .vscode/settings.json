@@ -6,5 +6,6 @@
     "${workspaceFolder}/next-kyudo-api/venv/Lib/site-packages"
   ],
   "python.analysis.autoSearchPaths": true,
-  "python.analysis.typeCheckingMode": "basic"
+  "python.analysis.typeCheckingMode": "basic",
+  "python-envs.defaultEnvManager": "ms-python.python:system"
 }

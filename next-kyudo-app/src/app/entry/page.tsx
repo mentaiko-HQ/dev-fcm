@@ -25,7 +25,6 @@ import {
 
 const ENTRY_FEE_PER_PERSON = 1500;
 
-// フールプルーフ: 称号・段位の安全側サニタイズ
 function sanitizeRankTitle(val: unknown): RankTitleType {
   if (val === "称号を取得している" || val === "段位は四段以上" || val === "段位は三段以下") {
     return val;
@@ -36,7 +35,6 @@ function sanitizeRankTitle(val: unknown): RankTitleType {
 export default function EntryFormPage() {
   const router = useRouter();
 
-  // フールプルーフ: 要項同意フラグの検証（未同意アクセスの遮断）
   useEffect(() => {
     try {
       const agreed = sessionStorage.getItem("mentaiko_terms_agreed");
@@ -48,7 +46,6 @@ export default function EntryFormPage() {
     }
   }, [router]);
 
-  // 代表者情報および複数選手リストの状態管理（rankTitle を初期追加）
   const [formData, setFormData] = useState<RepresentativeEntryFormData>({
     representativeName: "",
     representativeEmail: "",
@@ -71,6 +68,7 @@ export default function EntryFormPage() {
   const [isSuccess, setIsSuccess] = useState<boolean>(false);
   const [registeredPlayers, setRegisteredPlayers] = useState<Array<{ name: string; bibNumber: number }>>([]);
   const [errorMessage, setErrorMessage] = useState<string>("");
+  const [emailStatusMessage, setEmailStatusMessage] = useState<string>("");
 
   const handleRepresentativeChange = (
     field: keyof Omit<RepresentativeEntryFormData, "players">,
@@ -151,6 +149,7 @@ export default function EntryFormPage() {
 
     setIsSubmitting(true);
     setErrorMessage("");
+    setEmailStatusMessage("");
 
     try {
       const assignedList: Array<{ name: string; bibNumber: number }> = [];
@@ -183,6 +182,7 @@ export default function EntryFormPage() {
             rankTitle: sanitizeRankTitle(player.rankTitle),
             staffRole: player.isStaffVolunteer ? "運営" : "無し",
             staffDutyShift: player.isStaffVolunteer ? "AM" : "無し",
+            checkInStatus: "UNCHECKED",
             isStaffVolunteer: player.isStaffVolunteer,
             needsSupport: player.needsSupport,
             standGroup,
@@ -217,6 +217,29 @@ export default function EntryFormPage() {
         });
       }
 
+      // 【FastAPIバックエンド経由でResendメール送信を呼び出し】
+      try {
+        const response = await fetch("http://127.0.0.1:8000/api/v1/email/send-confirmation", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            to_email: formData.representativeEmail.trim(),
+            representative_name: formData.representativeName.trim(),
+            player_names: formData.players.map((p) => p.name.trim()),
+            total_fee: formData.players.length * ENTRY_FEE_PER_PERSON,
+          }),
+        });
+        const result = await response.json();
+        if (!result.success) {
+          setEmailStatusMessage(`メール送信警告: ${result.message}`);
+        } else {
+          setEmailStatusMessage("確認メールを正常に送信しました。");
+        }
+      } catch (mailErr) {
+        console.error("【メール送信API通信エラー】", mailErr);
+        setEmailStatusMessage("バックエンドAPIサーバーに接続できず、メール送信に失敗しました。");
+      }
+
       setRegisteredPlayers(assignedList);
       setIsSuccess(true);
     } catch (err: unknown) {
@@ -241,6 +264,26 @@ export default function EntryFormPage() {
             <h2 className="text-xl font-black text-slate-900">エントリーを受け付けました</h2>
             <p className="text-xs text-slate-500 mt-1">
               第5回めんたいこ杯争奪弓道大会（代表者: {formData.representativeName} 様）
+            </p>
+          </div>
+
+          {/* メール送信結果メッセージ通知 */}
+          <div className={`p-4 rounded-lg text-xs space-y-1.5 leading-relaxed border ${
+            emailStatusMessage.includes("警告") || emailStatusMessage.includes("失敗")
+              ? "bg-red-50 border-red-200 text-red-950"
+              : "bg-blue-50 border-blue-200 text-blue-950"
+          }`}>
+            <p className="font-bold flex items-center gap-1.5">
+              <Mail className="w-4 h-4 text-blue-600" /> 仮エントリー受付メールの送信結果
+            </p>
+            <p>
+              入力されたメールアドレス（<strong className="text-slate-900 font-mono">{formData.representativeEmail}</strong>）宛に仮エントリー受付メールを送信いたしました。
+            </p>
+            <p className="font-semibold text-xs mt-1">
+              {emailStatusMessage}
+            </p>
+            <p className="text-[11px] text-slate-600 pt-1 border-t border-blue-200/60">
+              ※しばらく経ってもメールが届かない場合は、メールアドレスの間違いが考えられます。お手数ですが、再度エントリーをお願いいたします。
             </p>
           </div>
 
@@ -323,7 +366,6 @@ export default function EntryFormPage() {
 
         <form onSubmit={handleSubmitEntry} className="space-y-8 text-xs">
           
-          {/* 1. 代表者情報セクション */}
           <section className="space-y-4 p-5 bg-slate-50 border border-slate-200 rounded-lg">
             <div className="border-b border-slate-200 pb-2">
               <h2 className="text-sm font-bold text-slate-900 flex items-center gap-1.5">
@@ -356,7 +398,7 @@ export default function EntryFormPage() {
                 </label>
                 <input
                   type="text"
-                  placeholder="例: 福岡弓道倶楽部（無所属の場合は空欄）"
+                  placeholder="例: 福岡弓道倶楽部"
                   value={formData.representativeOrganization}
                   onChange={(e) => handleRepresentativeChange("representativeOrganization", e.target.value)}
                   className="w-full p-2.5 text-sm border border-slate-300 rounded-md bg-white focus:ring-2 focus:ring-slate-900 focus:outline-none text-slate-900"
@@ -393,16 +435,8 @@ export default function EntryFormPage() {
                 />
               </div>
             </div>
-
-            <div className="p-3 bg-blue-50 border border-blue-200 rounded-md text-blue-900 text-[11px] leading-relaxed flex items-start gap-2">
-              <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-              <span>
-                <strong>【ご注意】</strong> 代表者様ご自身も選手として出場される場合は、下の【参加選手情報】欄にもお名前をご入力ください。
-              </span>
-            </div>
           </section>
 
-          {/* 2. 参加選手情報セクション */}
           <section className="space-y-4">
             <div className="flex justify-between items-center border-b border-slate-200 pb-2">
               <div>
@@ -483,7 +517,6 @@ export default function EntryFormPage() {
                   </div>
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    {/* 所作選択 */}
                     <div>
                       <label className="block font-bold text-slate-700 mb-1">
                         所作の選択 <span className="text-red-600">*</span>
@@ -505,7 +538,6 @@ export default function EntryFormPage() {
                       </div>
                     </div>
 
-                    {/* 称号・段位選択 */}
                     <div>
                       <label className="block font-bold text-slate-700 mb-1 flex items-center gap-1">
                         <Award className="w-3.5 h-3.5 text-amber-600" />
@@ -523,7 +555,6 @@ export default function EntryFormPage() {
                     </div>
                   </div>
 
-                  {/* チェックボックス群 */}
                   <div className="space-y-2 pt-1">
                     <label className="flex items-start gap-2.5 p-2.5 bg-slate-50 border border-slate-200 rounded-md cursor-pointer select-none">
                       <input
@@ -569,21 +600,6 @@ export default function EntryFormPage() {
             </Button>
           </section>
 
-          {/* 3. 役員案内 */}
-          <section className="p-4 bg-slate-50 border border-slate-200 rounded-lg space-y-2 text-slate-700">
-            <h3 className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
-              <HelpCircle className="w-4 h-4 text-slate-600" />
-              大会役員協力に関するご案内
-            </h3>
-            <ul className="list-disc list-inside space-y-1 text-[11px] text-slate-600 leading-relaxed bg-white p-3 rounded border border-slate-200">
-              <li>役員担当時間は<strong>終日ではなく「半日」</strong>となります。</li>
-              <li>ご協力いただいた方には<strong>薄礼（報酬）</strong>をご用意しております。</li>
-              <li>担当役割（進行、的前、招集、記録、カメラマン等）は<strong>大会運営側にて設定・割り当て</strong>を行います。</li>
-              <li>当日の立順や射場配置の都合上、<strong>他チーム・他道場の方と組み合わせ</strong>になる場合がございます。</li>
-            </ul>
-          </section>
-
-          {/* 4. 備考欄 */}
           <section className="space-y-1.5">
             <label className="block font-bold text-slate-700 text-xs">
               運営に伝えたいこと（備考欄）
@@ -597,7 +613,6 @@ export default function EntryFormPage() {
             />
           </section>
 
-          {/* 5. 合計参加費 */}
           <section className="p-4 bg-slate-900 text-white rounded-lg space-y-3">
             <div className="flex justify-between items-center border-b border-slate-700 pb-2">
               <span className="text-xs text-slate-300">
