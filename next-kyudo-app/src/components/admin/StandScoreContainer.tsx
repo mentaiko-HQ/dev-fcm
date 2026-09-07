@@ -1,373 +1,379 @@
+/**
+ * 【競技記録員用スコア入力コンソール】
+ * 立ちグループおよび立（第1立・第2立・第3立）を選択し、各選手の的中状況（〇✕）をリアルタイムで入力・保存するコンポーネント。
+ * 
+ * 【フールプルーフ】型制約（PlayerScore, StandMatchScore, StandRoundIndex）を明示し、unknown 型の暗黙的エラーを防止。
+ * 【フェイルセーフ】Firestoreインスタンスの接続検証（isFirestoreAvailable）を行い、型エラー（型 'Firestore | null'）を完全に解消。
+ */
+
 "use client";
 
-import React, { useEffect, useState } from "react";
-import { doc, onSnapshot, setDoc, getDocs, collection, serverTimestamp } from "firebase/firestore";
+import React, { useState, useEffect } from "react";
+import { collection, doc, onSnapshot, setDoc, query } from "firebase/firestore";
 import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
-import { StandMatchScore, PlayerScore, TournamentConfig, StandRoundIndex, MatchMode } from "@/types";
-import { ScoreButton } from "./ScoreButton";
+import { TournamentConfig, PlayerScore, StandMatchScore, StandRoundIndex, HitResult, STAND_CONFIGS } from "@/types";
+import { Participant } from "@/types/participant";
+import { ScoreButton, calculateTotalHits } from "@/components/admin/ScoreButton";
 import { Button } from "@/components/ui/button";
-import { Trophy, Target, ShieldCheck, ArrowRight, ArrowLeft, AlertCircle, CheckCircle2, CircleDot } from "lucide-react";
+import { Loader2, CheckCircle2, AlertCircle, Save, ShieldCheck } from "lucide-react";
 
 interface StandScoreContainerProps {
   tournamentConfig: TournamentConfig;
 }
 
-const DEFAULT_MATCH_SCORE: StandMatchScore = {
-  matchId: "match_2026_mentaiko",
-  standGroup: 1,
-  currentStandRound: 1,
-  mode: "本戦",
-  playerScores: {},
-  updatedAt: Date.now(),
-};
-
 export function StandScoreContainer({ tournamentConfig }: StandScoreContainerProps) {
-  const [currentStandRound, setCurrentStandRound] = useState<StandRoundIndex>(1); // 1: 一手(2), 2: 一手(2), 3: 四ツ矢(4)
-  const [currentStandGroup, setCurrentStandGroup] = useState<number>(1);
-  const [matchScore, setMatchScore] = useState<StandMatchScore>(DEFAULT_MATCH_SCORE);
-  const [isConnected, setIsConnected] = useState<boolean>(false);
-  const [currentMode, setCurrentMode] = useState<MatchMode>("本戦");
-  const [isTransitioning, setIsTransitioning] = useState<boolean>(false);
-  const [showIncompleteWarningModal, setShowIncompleteWarningModal] = useState<boolean>(false);
-  const [pendingTargetGroup, setPendingTargetGroup] = useState<number | null>(null);
+  const [selectedRound, setSelectedRound] = useState<StandRoundIndex>(1);
+  const [selectedGroup, setSelectedGroup] = useState<number>(1);
+  const [participantsInGroup, setParticipantsInGroup] = useState<Participant[]>([]);
+  const [playerScoresMap, setPlayerScoresMap] = useState<Record<string, PlayerScore>>({});
+  const [isSaving, setIsSaving] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string>("");
+  const [errorMessage, setErrorMessage] = useState<string>("");
 
-  const matchId = tournamentConfig.matchId;
-  const maxArrowsForCurrentRound = currentStandRound === 3 ? 4 : 2;
+  const currentStandConfig = STAND_CONFIGS[selectedRound];
 
-  // 立ちグループ（currentStandGroup）のスコアデータをリアルタイム購読
+  /**
+   * 【フェイルセーフ ＆ リアルタイム同期】
+   * 選択された立（Round）と立ちグループ（Group）に該当する参加者データを Firestore の entries から取得。
+   */
   useEffect(() => {
-    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
-      setIsConnected(false);
-      return;
-    }
-
-    const firestoreInstance = db;
-    const scoreDocRef = doc(firestoreInstance, "scores", `${matchId}_group_${currentStandGroup}`);
-
-    const unsubscribe = onSnapshot(
-      scoreDocRef,
-      async (snapshot) => {
-        setIsConnected(true);
-        if (snapshot.exists()) {
-          const rawData = snapshot.data() as Partial<StandMatchScore>;
-          setMatchScore((prev) => ({
-            ...prev,
-            ...rawData,
-            standGroup: currentStandGroup,
-            currentStandRound,
-            mode: rawData.mode || prev.mode || "本戦",
-            playerScores: {
-              ...prev.playerScores,
-              ...(rawData.playerScores || {}),
-            },
-          }));
-          if (rawData.mode) setCurrentMode(rawData.mode);
-        } else {
-          // 初期ドキュメント不在時のフォールバック自動構築
-          try {
-            const entriesSnapshot = await getDocs(collection(firestoreInstance, "entries"));
-            const groupPlayers: Record<string, PlayerScore> = {};
-
-            entriesSnapshot.forEach((docSnap) => {
-              const d = docSnap.data();
-              if (d.standGroup === currentStandGroup) {
-                groupPlayers[docSnap.id] = {
-                  playerId: docSnap.id,
-                  bibNumber: d.bibNumber || 1,
-                  name: d.name || "選手名未設定",
-                  nameKana: d.nameKana || "",
-                  organization: d.organization || "",
-                  shosa: d.shosa || "肌脱ぎ",
-                  staffRole: d.staffRole || "無し",
-                  standGroup: d.standGroup || currentStandGroup,
-                  standOrder: d.standOrder || 1,
-                  progressStatus: d.progressStatus || "SHOOTING",
-                  qualificationStatus: d.qualificationStatus || "ACTIVE",
-                  stand1_arrows: d.stand1_arrows || [],
-                  stand2_arrows: d.stand2_arrows || [],
-                  stand3_arrows: d.stand3_arrows || [],
-                  totalHits: d.totalHits || 0,
-                  isCompleted: false,
-                  isPerfect: false,
-                  enkinRank: null,
-                  updatedAt: Date.now(),
-                };
-              }
-            });
-
-            const initialData: StandMatchScore = {
-              matchId,
-              standGroup: currentStandGroup,
-              currentStandRound,
-              mode: "本戦",
-              playerScores: groupPlayers,
-              updatedAt: Date.now(),
-            };
-
-            await setDoc(scoreDocRef, { ...initialData, lastUpdated: serverTimestamp() }, { merge: true });
-            setMatchScore(initialData);
-          } catch (initErr) {
-            console.error("【エラーログ】立ちグループ初期化失敗:", initErr);
-          }
-        }
-      },
-      (error) => {
-        console.error("【エラーログ】Firestore購読失敗:", error);
-        setIsConnected(false);
-      }
-    );
-
-    return () => unsubscribe();
-  }, [matchId, currentStandGroup, currentStandRound]);
-
-  const handleModeChange = async (newMode: MatchMode) => {
-    setCurrentMode(newMode);
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
-    try {
-      const scoreDocRef = doc(db, "scores", `${matchId}_group_${currentStandGroup}`);
-      await setDoc(scoreDocRef, { mode: newMode, lastUpdated: serverTimestamp() }, { merge: true });
-    } catch (error) {
-      console.error("【エラーログ】モード更新失敗:", error);
-    }
+    // 【フェイルセーフ】dbが非nullであることを明示してオーバーロードエラーを解消
+    const firestoreInstance = db;
+    if (!firestoreInstance) return;
+
+    const q = query(collection(firestoreInstance, "entries"));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const loaded: Participant[] = [];
+      snapshot.forEach((docSnap) => {
+        const raw = docSnap.data();
+        const rawAssignments = raw.standAssignments || {};
+        const safeAssignments: Record<StandRoundIndex, { standGroup: number; standOrder: 1 | 2 | 3 | 4 | 5 }> = {
+          1: {
+            standGroup: Number(rawAssignments[1]?.standGroup || raw.standGroup || 1),
+            standOrder: Number(rawAssignments[1]?.standOrder || raw.standOrder || 1) as 1 | 2 | 3 | 4 | 5,
+          },
+          2: {
+            standGroup: Number(rawAssignments[2]?.standGroup || raw.standGroup || 1),
+            standOrder: Number(rawAssignments[2]?.standOrder || raw.standOrder || 1) as 1 | 2 | 3 | 4 | 5,
+          },
+          3: {
+            standGroup: Number(rawAssignments[3]?.standGroup || 1),
+            standOrder: Number(rawAssignments[3]?.standOrder || 1) as 1 | 2 | 3 | 4 | 5,
+          },
+        };
+
+        loaded.push({
+          id: docSnap.id,
+          bibNumber: typeof raw.bibNumber === "number" ? raw.bibNumber : Number(raw.bibNumber) || 1,
+          name: typeof raw.name === "string" ? raw.name : "選手名未設定",
+          nameKana: typeof raw.nameKana === "string" ? raw.nameKana : "",
+          organization: typeof raw.organization === "string" ? raw.organization : "",
+          shosa: raw.shosa || "肌脱ぎ",
+          rankTitle: raw.rankTitle || "段位は三段以下",
+          staffRole: raw.staffRole || "無し",
+          checkInStatus: raw.checkInStatus || "UNCHECKED",
+          isPaid: Boolean(raw.isPaid),
+          standAssignments: safeAssignments,
+          progressStatus: raw.progressStatus || "WAITING",
+          qualificationStatus: raw.qualificationStatus || "ACTIVE",
+          stand1_arrows: Array.isArray(raw.stand1_arrows) ? raw.stand1_arrows : [],
+          stand2_arrows: Array.isArray(raw.stand2_arrows) ? raw.stand2_arrows : [],
+          stand3_arrows: Array.isArray(raw.stand3_arrows) ? raw.stand3_arrows : [],
+          totalHits: typeof raw.totalHits === "number" ? raw.totalHits : 0,
+          totalShots: typeof raw.totalShots === "number" ? raw.totalShots : 8,
+          isPerfect: Boolean(raw.isPerfect),
+        });
+      });
+
+      // 選択された立グループに所属する選手のみを抽出し、立順（standOrder）の昇順にソート
+      const filtered = loaded.filter((p: Participant) => {
+        const assignment = p.standAssignments[selectedRound];
+        return assignment && assignment.standGroup === selectedGroup;
+      }).sort((a: Participant, b: Participant) => {
+        const orderA = a.standAssignments[selectedRound]?.standOrder || 1;
+        const orderB = b.standAssignments[selectedRound]?.standOrder || 1;
+        return orderA - orderB;
+      });
+
+      setParticipantsInGroup(filtered);
+    }, (err: unknown) => {
+      console.error("【選手データ取得エラー】", err);
+    });
+
+    return () => unsubscribe();
+  }, [selectedRound, selectedGroup]);
+
+  /**
+   * 【スコアデータのリアルタイム同期】
+   * 該当する立・グループのスコアドキュメントを scores コレクションから購読。
+   */
+  useEffect(() => {
+    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
+
+    const firestoreInstance = db;
+    if (!firestoreInstance) return;
+
+    const scoreDocId = `${tournamentConfig.matchId}_round_${selectedRound}_group_${selectedGroup}`;
+    const scoreDocRef = doc(firestoreInstance, "scores", scoreDocId);
+
+    const unsubscribe = onSnapshot(scoreDocRef, (snap) => {
+      if (snap.exists()) {
+        const data = snap.data() as StandMatchScore;
+        setPlayerScoresMap(data.playerScores || {});
+      } else {
+        setPlayerScoresMap({});
+      }
+    }, (err: unknown) => {
+      console.error("【スコアデータ取得エラー】", err);
+    });
+
+    return () => unsubscribe();
+  }, [tournamentConfig.matchId, selectedRound, selectedGroup]);
+
+  /**
+   * 【スコア変更ハンドラー】
+   * 特定の選手の特定のアロー（射）の的中結果を更新する。
+   */
+  const handleArrowChange = (playerId: string, arrowIndex: number, value: HitResult) => {
+    const participant = participantsInGroup.find((p) => p.id === playerId);
+    if (!participant) return;
+
+    setPlayerScoresMap((prev: Record<string, PlayerScore>) => {
+      const existing: PlayerScore = prev[playerId] || {
+        playerId,
+        playerName: participant.name,
+        bibNumber: participant.bibNumber,
+        name: participant.name,
+        nameKana: participant.nameKana,
+        organization: participant.organization,
+        shosa: participant.shosa,
+        staffRole: participant.staffRole,
+        qualificationStatus: participant.qualificationStatus,
+        standAssignments: participant.standAssignments,
+        stand1_arrows: [...participant.stand1_arrows],
+        stand2_arrows: [...participant.stand2_arrows],
+        stand3_arrows: [...participant.stand3_arrows],
+        totalHits: 0,
+        isCompleted: false,
+        isPerfect: false,
+      };
+
+      const targetKey = selectedRound === 1 ? "stand1_arrows" : selectedRound === 2 ? "stand2_arrows" : "stand3_arrows";
+      const currentArrows = [...(existing[targetKey] || [])];
+      
+      while (currentArrows.length < arrowIndex) {
+        currentArrows.push(0);
+      }
+      currentArrows[arrowIndex - 1] = value;
+
+      const updatedPlayer: PlayerScore = {
+        ...existing,
+        [targetKey]: currentArrows,
+        totalHits: calculateTotalHits(currentArrows),
+      };
+
+      return {
+        ...prev,
+        [playerId]: updatedPlayer,
+      };
+    });
   };
 
-  // フールプルーフ: 現在の回次の規定射数入力完了検証
-  const isStandFullyCompleted = Object.values(matchScore.playerScores || {}).every((player) => {
-    if (player.qualificationStatus === "ABSENT") return true;
-    const arrows = currentStandRound === 1
-      ? player.stand1_arrows
-      : currentStandRound === 2
-      ? player.stand2_arrows
-      : player.stand3_arrows;
-    return (arrows?.length || 0) >= maxArrowsForCurrentRound;
-  });
-
-  const handleRequestGroupNavigation = (targetGroup: number) => {
-    if (targetGroup < 1 || targetGroup > tournamentConfig.maxStandGroup) return;
-
-    if (targetGroup > currentStandGroup && !isStandFullyCompleted) {
-      setPendingTargetGroup(targetGroup);
-      setShowIncompleteWarningModal(true);
+  /**
+   * 【スコア保存処理】
+   * 入力されたスコアを Firestore の `scores` コレクションに反映させる。
+   */
+  const handleSaveScores = async () => {
+    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
+      alert("Firestoreデータベースが利用可能な状態ではありません。");
       return;
     }
 
-    executeGroupTransition(targetGroup);
-  };
-
-  const executeGroupTransition = async (targetGroup: number) => {
-    setIsTransitioning(true);
+    setIsSaving(true);
     setStatusMessage("");
-    setShowIncompleteWarningModal(false);
+    setErrorMessage("");
+    const now = Date.now();
 
     try {
-      if (isFirebaseConfigured && isFirestoreAvailable(db)) {
-        const matchDocRef = doc(db, "matches", matchId);
-        await setDoc(matchDocRef, { currentStandGroup: targetGroup, updatedAt: serverTimestamp() }, { merge: true });
-      }
-      setCurrentStandGroup(targetGroup);
-      setStatusMessage(`第${String(targetGroup).padStart(2, "0")}立グループの成績入力画面へ切り替えました。`);
-    } catch (error) {
-      console.error("【エラーログ】立ちグループ切り替え失敗:", error);
-      setStatusMessage("切り替えに失敗しました。");
+      const firestoreInstance = db;
+      if (!firestoreInstance) return;
+
+      const scoreDocId = `${tournamentConfig.matchId}_round_${selectedRound}_group_${selectedGroup}`;
+      const scoreDocRef = doc(firestoreInstance, "scores", scoreDocId);
+
+      const scorePayload: StandMatchScore = {
+        matchId: tournamentConfig.matchId,
+        standGroup: selectedGroup,
+        roundIndex: selectedRound,
+        playerScores: playerScoresMap,
+        isLocked: false,
+        updatedAt: now,
+      };
+
+      await setDoc(scoreDocRef, scorePayload, { merge: true });
+      setStatusMessage("スコアが正常に保存されました。");
+    } catch (err: unknown) {
+      console.error("【スコア保存失敗】", err);
+      setErrorMessage("スコアの保存に失敗しました。通信環境を確認してください。");
     } finally {
-      setIsTransitioning(false);
-      setPendingTargetGroup(null);
+      setIsSaving(false);
     }
   };
 
   return (
-    <div className="w-full bg-slate-50 border border-slate-200 rounded-lg p-4 space-y-4">
-      {/* 3立の回次タブ（第1立:一手2射 / 第2立:一手2射 / 第3立:四ツ矢4射） */}
-      <div className="flex border-b border-slate-200 pb-2 justify-between items-center flex-wrap gap-2">
-        <div className="flex items-center gap-1.5">
-          <Button
-            type="button"
-            variant={currentStandRound === 1 ? "default" : "outline"}
-            onClick={() => setCurrentStandRound(1)}
-            className={`font-bold text-xs h-9 ${
-              currentStandRound === 1 ? "bg-slate-900 text-white" : "bg-white text-slate-700"
-            }`}
-          >
-            <CircleDot className="w-3.5 h-3.5 mr-1" />
-            1立目：一手 (2射)
-          </Button>
-
-          <Button
-            type="button"
-            variant={currentStandRound === 2 ? "default" : "outline"}
-            onClick={() => setCurrentStandRound(2)}
-            className={`font-bold text-xs h-9 ${
-              currentStandRound === 2 ? "bg-slate-900 text-white" : "bg-white text-slate-700"
-            }`}
-          >
-            <CircleDot className="w-3.5 h-3.5 mr-1" />
-            2立目：一手 (2射)
-          </Button>
-
-          <Button
-            type="button"
-            variant={currentStandRound === 3 ? "default" : "outline"}
-            onClick={() => setCurrentStandRound(3)}
-            className={`font-bold text-xs h-9 ${
-              currentStandRound === 3 ? "bg-red-600 hover:bg-red-700 text-white" : "bg-white text-slate-700"
-            }`}
-          >
-            <CircleDot className="w-3.5 h-3.5 mr-1" />
-            3立目：四ツ矢 (4射)
-          </Button>
-        </div>
-
-        <div className="flex items-center gap-1.5 bg-slate-200/70 p-1 rounded-md">
-          <Button
-            size="sm"
-            variant={currentMode === "本戦" ? "default" : "ghost"}
-            onClick={() => handleModeChange("本戦")}
-            className="h-7 text-xs font-bold"
-          >
-            <ShieldCheck className="w-3.5 h-3.5 mr-1" />
-            本戦
-          </Button>
-          <Button
-            size="sm"
-            variant={currentMode === "射詰競射" ? "default" : "ghost"}
-            onClick={() => handleModeChange("射詰競射")}
-            className="h-7 text-xs font-bold"
-          >
-            <Target className="w-3.5 h-3.5 mr-1" />
-            射詰競射
-          </Button>
-          <Button
-            size="sm"
-            variant={currentMode === "遠近競射" ? "default" : "ghost"}
-            onClick={() => handleModeChange("遠近競射")}
-            className="h-7 text-xs font-bold"
-          >
-            <Trophy className="w-3.5 h-3.5 mr-1" />
-            遠近競射
-          </Button>
-        </div>
-      </div>
-
-      {/* 立情報ヘッダー */}
-      <div className="flex flex-col md:flex-row justify-between items-start md:items-center bg-white p-3 rounded-md border border-slate-200 gap-3">
+    <div className="bg-white border border-slate-200 rounded-lg p-6 space-y-6 shadow-xs text-slate-900">
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b border-slate-100 pb-4 gap-4">
         <div>
-          <div className="flex items-center gap-2">
-            <span className="font-bold text-slate-900 text-base">
-              第 {String(matchScore.standGroup).padStart(2, "0")} 立グループ （{currentStandRound === 3 ? "四ツ矢 4射" : "一手 2射"}）
-            </span>
-            {isStandFullyCompleted && (
-              <span className="text-[11px] bg-green-100 text-green-800 font-bold px-2 py-0.5 rounded flex items-center gap-1 border border-green-200">
-                <CheckCircle2 className="w-3 h-3" /> 行射完了
-              </span>
-            )}
-          </div>
-          <p className="text-xs text-slate-500 mt-0.5">
-            第５回めんたいこ杯争奪弓道大会 個人戦（全3立・計8射）
+          <h3 className="font-black text-slate-900 text-sm flex items-center gap-2">
+            <ShieldCheck className="w-4 h-4 text-slate-700" /> 競技記録員用 スコア入力コンソール
+          </h3>
+          <p className="text-xs text-slate-500 font-medium mt-0.5">
+            立（Round）と立ちグループを選択し、選手ごとの的中（〇✕）を迅速に入力・保存します。
           </p>
         </div>
 
-        <div
-          className={`w-2.5 h-2.5 rounded-full ${isConnected ? "bg-green-500" : "bg-amber-400"}`}
-          title={isConnected ? "Firestore同期中" : "ローカル動作中"}
-        />
-      </div>
-
-      {/* 選手別スコア入力カード一覧（立順1〜5昇順） */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-        {Object.values(matchScore.playerScores || {})
-          .sort((a, b) => a.standOrder - b.standOrder)
-          .map((player) => (
-            <ScoreButton
-              key={player.playerId}
-              matchId={matchScore.matchId}
-              standGroup={matchScore.standGroup}
-              currentStandRound={currentStandRound}
-              player={player}
-              mode={currentMode}
-            />
+        {/* 立（Round）切り替えボタン群 */}
+        <div className="flex gap-1.5 bg-slate-100 p-1 rounded-lg">
+          {([1, 2, 3] as StandRoundIndex[]).map((rIdx) => (
+            <button
+              key={rIdx}
+              type="button"
+              onClick={() => setSelectedRound(rIdx)}
+              className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all ${
+                selectedRound === rIdx
+                  ? "bg-slate-900 text-white shadow-xs"
+                  : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              {STAND_CONFIGS[rIdx].name}
+            </button>
           ))}
+        </div>
       </div>
 
-      {/* 立ちグループ進行ナビゲーション */}
-      <div className="pt-2 border-t border-slate-200 flex flex-col sm:flex-row justify-between items-center gap-3">
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => handleRequestGroupNavigation(currentStandGroup - 1)}
-          disabled={currentStandGroup <= 1 || isTransitioning}
-          className="w-full sm:w-auto h-11 text-xs font-semibold text-slate-700"
-        >
-          <ArrowLeft className="w-4 h-4 mr-1.5" />
-          前の立ちグループへ戻る (第{String(currentStandGroup - 1).padStart(2, "0")}立)
-        </Button>
+      {/* 立ちグループ選択バー */}
+      <div className="flex items-center gap-3 p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs">
+        <span className="font-bold text-slate-700">立ちグループ選択:</span>
+        <div className="flex gap-2">
+          {[1, 2, 3, 4, 5].map((gNum) => (
+            <button
+              key={gNum}
+              type="button"
+              onClick={() => setSelectedGroup(gNum)}
+              className={`px-3 py-1.5 rounded font-mono font-bold transition-all ${
+                selectedGroup === gNum
+                  ? "bg-amber-500 text-slate-950 shadow-2xs"
+                  : "bg-white border border-slate-300 text-slate-700 hover:bg-slate-100"
+              }`}
+            >
+              第{gNum}立
+            </button>
+          ))}
+        </div>
+      </div>
 
-        <div className="text-xs font-medium text-slate-500 text-center">
-          立ちグループ: <span className="font-bold text-slate-900">{String(currentStandGroup).padStart(2, "0")}</span> / {String(tournamentConfig.maxStandGroup).padStart(2, "0")}
+      {/* 選手別スコア入力テーブル */}
+      <div className="space-y-4">
+        <div className="overflow-x-auto border border-slate-200 rounded-lg">
+          <table className="w-full text-xs text-left">
+            <thead className="bg-slate-100 text-slate-700 font-bold border-b border-slate-200">
+              <tr>
+                <th className="p-3">ゼッケン / 立順</th>
+                <th className="p-3">選手氏名 / 所属</th>
+                <th className="p-3">的中入力 ({currentStandConfig.arrowCount}射)</th>
+                <th className="p-3 text-center">的中数</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {participantsInGroup.length > 0 ? (
+                participantsInGroup.map((p) => {
+                  const assignment = p.standAssignments[selectedRound] || { standGroup: selectedGroup, standOrder: 1 };
+                  const pScore = playerScoresMap[p.id];
+                  
+                  const targetArrows = selectedRound === 1 
+                    ? (pScore?.stand1_arrows || p.stand1_arrows || [])
+                    : selectedRound === 2 
+                    ? (pScore?.stand2_arrows || p.stand2_arrows || [])
+                    : (pScore?.stand3_arrows || p.stand3_arrows || []);
+
+                  return (
+                    <tr key={p.id} className="hover:bg-slate-50/60 transition-colors">
+                      <td className="p-3 font-mono">
+                        <div className="font-bold text-slate-900">No.{p.bibNumber}</div>
+                        <div className="text-[10px] text-slate-500">{assignment.standOrder}番立</div>
+                      </td>
+                      <td className="p-3 font-bold text-slate-900">
+                        <div>{p.name}</div>
+                        <div className="text-[10px] text-slate-400 font-normal">{p.organization || "-"}</div>
+                      </td>
+                      <td className="p-3">
+                        <div className="flex flex-wrap gap-3">
+                          {Array.from({ length: currentStandConfig.arrowCount }).map((_, aIdx) => {
+                            const arrowNum = aIdx + 1;
+                            const val = targetArrows[aIdx] as HitResult | undefined;
+                            return (
+                              <ScoreButton
+                                key={arrowNum}
+                                arrowIndex={arrowNum}
+                                currentValue={val}
+                                onChange={(newVal: HitResult) => handleArrowChange(p.id, arrowNum, newVal)}
+                              />
+                            );
+                          })}
+                        </div>
+                      </td>
+                      <td className="p-3 text-center font-mono font-black text-sm text-slate-900">
+                        {calculateTotalHits(targetArrows)} / {currentStandConfig.arrowCount}
+                      </td>
+                    </tr>
+                  );
+                })
+              ) : (
+                <tr>
+                  <td colSpan={4} className="py-12 text-center text-slate-400 font-medium">
+                    第{selectedGroup}立に登録されている選手がいません。
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
         </div>
 
-        <Button
-          type="button"
-          onClick={() => handleRequestGroupNavigation(currentStandGroup + 1)}
-          disabled={currentStandGroup >= tournamentConfig.maxStandGroup || isTransitioning}
-          className={`w-full sm:w-auto h-11 px-6 text-sm font-bold shadow-md ${
-            isStandFullyCompleted
-              ? "bg-red-600 hover:bg-red-700 text-white"
-              : "bg-slate-900 hover:bg-slate-800 text-white"
-          }`}
-        >
-          {isTransitioning ? (
-            "切り替え中..."
-          ) : (
-            <>
-              次の立ちグループへ進む (第{String(currentStandGroup + 1).padStart(2, "0")}立)
-              <ArrowRight className="w-4 h-4 ml-2" />
-            </>
-          )}
-        </Button>
-      </div>
-
-      {statusMessage && (
-        <p className="text-xs text-center text-slate-700 font-medium bg-white p-2 rounded border border-slate-200 shadow-sm">
-          {statusMessage}
-        </p>
-      )}
-
-      {/* フールプルーフ: 未入力警告モーダル */}
-      {showIncompleteWarningModal && pendingTargetGroup && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white rounded-lg p-6 max-w-md w-full shadow-2xl border border-slate-200 space-y-4 animate-in fade-in zoom-in-95">
-            <div className="flex items-center gap-3 text-amber-600">
-              <AlertCircle className="w-6 h-6 shrink-0" />
-              <h4 className="font-bold text-slate-900 text-base">未入力の選手が存在します</h4>
-            </div>
-            <p className="text-sm text-slate-600 leading-relaxed">
-              第{String(currentStandGroup).padStart(2, "0")}立グループの一部の選手で行射（全{maxArrowsForCurrentRound}射）の入力が完了していません。
-              このまま第{String(pendingTargetGroup).padStart(2, "0")}立グループの入力に進みますか？
-            </p>
-            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => setShowIncompleteWarningModal(false)}
-                className="text-xs font-semibold"
-              >
-                入力を続ける
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                onClick={() => executeGroupTransition(pendingTargetGroup)}
-                className="bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs"
-              >
-                強制的に次へ進む
-              </Button>
-            </div>
+        {statusMessage && (
+          <div className="flex items-center gap-2 p-3 bg-emerald-50 border border-emerald-200 rounded-lg text-emerald-900 text-xs font-bold">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>{statusMessage}</span>
           </div>
+        )}
+
+        {errorMessage && (
+          <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-900 text-xs font-bold">
+            <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+            <span>{errorMessage}</span>
+          </div>
+        )}
+
+        <div className="flex justify-end pt-2">
+          <Button
+            type="button"
+            onClick={handleSaveScores}
+            disabled={isSaving || participantsInGroup.length === 0}
+            className="bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs px-6 py-2.5 rounded-xl shadow-xs"
+          >
+            {isSaving ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" /> 保存中...
+              </>
+            ) : (
+              <>
+                <Save className="w-3.5 h-3.5 mr-1.5 text-amber-400" /> 入力したスコアを保存する
+              </>
+            )}
+          </Button>
         </div>
-      )}
+      </div>
     </div>
   );
 }

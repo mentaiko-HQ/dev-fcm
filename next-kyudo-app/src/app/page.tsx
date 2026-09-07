@@ -1,3 +1,13 @@
+/**
+ * 【トップページ / 選手用ポータル】
+ * / パスに対応するページコンポーネント。
+ * 新仕様（第1立・第2立の個別立グループ・立順設定を持つ `standAssignments`）に対応させ、
+ * トップレベルの旧プロパティ（`standGroup`, `standOrder`）を廃止し、型エラー（エラー2353, 2339）を完全に解消します。
+ * 
+ * 【フールプルーフ】バリデーションにより不適切なデータの混入や存在しないインデックスへのアクセスを防止。
+ * 【フェイルセーフ】データベース接続エラーやデータ不在時にもアプリがクラッシュしない安全なフォールバック設計。
+ */
+
 "use client";
 
 import React, { useEffect, useState } from "react";
@@ -5,21 +15,11 @@ import { useRouter } from "next/navigation";
 import { collection, onSnapshot, query, doc, orderBy } from "firebase/firestore";
 import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
 import { Participant } from "@/types/participant";
-import {
-  TournamentConfig,
-  ProgressStatus,
-  ShosaType,
-  StaffRoleType,
-  StandOrderType,
-  HitResult,
-  RankTitleType
-} from "@/types";
-import { TeamSelectForm } from "@/components/shared/TeamSelectForm";
-import { AwardSummaryCard } from "@/components/admin/AwardSummaryCard";
-import { setupForegroundMessageListener, playNotificationSound, triggerDeviceVibration } from "@/lib/fcm";
-import { Bell, Volume2, Clock, Search, Trophy } from "lucide-react";
+import { TournamentConfig, ShosaType, StaffRoleType, StandOrderType, ProgressStatus, RankTitleType, StandRoundIndex, CheckInStatus } from "@/types";
 import { Button } from "@/components/ui/button";
+import { ShieldAlert, Users, QrCode, Calendar, ArrowRight, Award } from "lucide-react";
 
+// フェイルセーフ: Firestore未接続またはドキュメント不在時に使用する安全側デフォルト設定
 const DEFAULT_TOURNAMENT_CONFIG: TournamentConfig = {
   matchId: "match_2026_mentaiko",
   title: "第5回めんたいこ杯争奪弓道大会",
@@ -34,6 +34,9 @@ const DEFAULT_TOURNAMENT_CONFIG: TournamentConfig = {
   isEntryEnabled: true,
 };
 
+/**
+ * 【フールプルーフ & フェイルセーフ】立順(1〜5)の型バリデーションおよび安全側フォールバック
+ */
 function sanitizeStandOrder(val: unknown): StandOrderType {
   const num = typeof val === "number" ? val : Number(val);
   if (num === 1 || num === 2 || num === 3 || num === 4 || num === 5) {
@@ -42,11 +45,17 @@ function sanitizeStandOrder(val: unknown): StandOrderType {
   return 1;
 }
 
+/**
+ * 【フールプルーフ & フェイルセーフ】所作（肌脱ぎ / 襷掛け）のバリデーション
+ */
 function sanitizeShosa(val: unknown): ShosaType {
   if (val === "襷掛け") return "襷掛け";
   return "肌脱ぎ";
 }
 
+/**
+ * 【フールプルーフ & フェイルセーフ】称号・段位のバリデーション
+ */
 function sanitizeRankTitle(val: unknown): RankTitleType {
   if (val === "称号を取得している" || val === "段位は四段以上" || val === "段位は三段以下") {
     return val;
@@ -54,6 +63,9 @@ function sanitizeRankTitle(val: unknown): RankTitleType {
   return "段位は三段以下";
 }
 
+/**
+ * 【フールプルーフ & フェイルセーフ】役員役割のバリデーション
+ */
 function sanitizeStaffRole(val: unknown): StaffRoleType {
   const validRoles: StaffRoleType[] = ["進行", "的前", "招集", "記録", "カメラマン", "運営", "無し"];
   if (typeof val === "string" && validRoles.includes(val as StaffRoleType)) {
@@ -62,6 +74,9 @@ function sanitizeStaffRole(val: unknown): StaffRoleType {
   return "無し";
 }
 
+/**
+ * 【フールプルーフ & フェイルセーフ】進行状態のバリデーション
+ */
 function sanitizeProgressStatus(val: unknown): ProgressStatus {
   const validStatuses: ProgressStatus[] = ["WAITING", "CALLED", "SHOOTING", "COMPLETED"];
   if (typeof val === "string" && validStatuses.includes(val as ProgressStatus)) {
@@ -70,13 +85,23 @@ function sanitizeProgressStatus(val: unknown): ProgressStatus {
   return "WAITING";
 }
 
-export default function PlayerPortalPage() {
+/**
+ * 【フールプルーフ & フェイルセーフ】チェックイン状態のバリデーション
+ */
+function sanitizeCheckInStatus(val: unknown): CheckInStatus {
+  const validStatuses: CheckInStatus[] = ["UNCHECKED", "CHECKED_IN", "ABSENT"];
+  if (typeof val === "string" && validStatuses.includes(val as CheckInStatus)) {
+    return val as CheckInStatus;
+  }
+  return "UNCHECKED";
+}
+
+export default function PortalHomePage() {
   const router = useRouter();
   const [tournamentConfig, setTournamentConfig] = useState<TournamentConfig>(DEFAULT_TOURNAMENT_CONFIG);
   const [participants, setParticipants] = useState<Participant[]>([]);
-  const [bannerNotification, setBannerNotification] = useState<{ title: string; body: string } | null>(null);
-  const [searchQuery, setSearchQuery] = useState<string>("");
 
+  // 大会設定情報のリアルタイム購読
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -90,10 +115,6 @@ export default function PlayerPortalPage() {
             ...prev,
             ...data,
             title: typeof data.title === "string" ? data.title : prev.title,
-            currentStandGroup: typeof data.currentStandGroup === "number" ? data.currentStandGroup : prev.currentStandGroup,
-            maxStandGroup: typeof data.maxStandGroup === "number" ? data.maxStandGroup : prev.maxStandGroup,
-            entryStartDate: typeof data.entryStartDate === "string" ? data.entryStartDate : prev.entryStartDate,
-            entryEndDate: typeof data.entryEndDate === "string" ? data.entryEndDate : prev.entryEndDate,
             isEntryEnabled: typeof data.isEntryEnabled === "boolean" ? data.isEntryEnabled : prev.isEntryEnabled,
           }));
         }
@@ -106,6 +127,7 @@ export default function PlayerPortalPage() {
     return () => unsubscribe();
   }, [tournamentConfig.matchId]);
 
+  // 参加者データのリアルタイム購読（新仕様の standAssignments に対応）
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -117,6 +139,24 @@ export default function PlayerPortalPage() {
           const loaded: Participant[] = [];
           snapshot.forEach((docSnap) => {
             const raw = docSnap.data();
+
+            // 【フェイルセーフ】古いデータ形式やトップレベルの指定に備えて第1立・第2立の割り当てを安全に復元
+            const rawAssignments = raw.standAssignments || {};
+            const safeAssignments: Record<StandRoundIndex, { standGroup: number; standOrder: 1 | 2 | 3 | 4 | 5 }> = {
+              1: {
+                standGroup: Number(rawAssignments[1]?.standGroup || raw.standGroup || 1),
+                standOrder: sanitizeStandOrder(rawAssignments[1]?.standOrder || raw.standOrder || 1),
+              },
+              2: {
+                standGroup: Number(rawAssignments[2]?.standGroup || raw.standGroup || 1),
+                standOrder: sanitizeStandOrder(rawAssignments[2]?.standOrder || raw.standOrder || 1),
+              },
+              3: {
+                standGroup: Number(rawAssignments[3]?.standGroup || 1),
+                standOrder: sanitizeStandOrder(rawAssignments[3]?.standOrder || 1),
+              },
+            };
+
             loaded.push({
               id: docSnap.id,
               bibNumber: typeof raw.bibNumber === "number" ? raw.bibNumber : Number(raw.bibNumber) || 1,
@@ -127,17 +167,18 @@ export default function PlayerPortalPage() {
               rankTitle: sanitizeRankTitle(raw.rankTitle),
               staffRole: sanitizeStaffRole(raw.staffRole),
               staffDutyShift: raw.staffDutyShift || "無し",
+              checkInStatus: sanitizeCheckInStatus(raw.checkInStatus),
+              checkInAt: typeof raw.checkInAt === "number" ? raw.checkInAt : null,
               isStaffVolunteer: Boolean(raw.isStaffVolunteer),
               needsSupport: Boolean(raw.needsSupport),
-              standGroup: typeof raw.standGroup === "number" ? raw.standGroup : Number(raw.standGroup) || 1,
-              standOrder: sanitizeStandOrder(raw.standOrder),
+              standAssignments: safeAssignments,
               progressStatus: sanitizeProgressStatus(raw.progressStatus),
               qualificationStatus: raw.qualificationStatus || "ACTIVE",
               stand1_arrows: Array.isArray(raw.stand1_arrows) ? raw.stand1_arrows : [],
               stand2_arrows: Array.isArray(raw.stand2_arrows) ? raw.stand2_arrows : [],
               stand3_arrows: Array.isArray(raw.stand3_arrows) ? raw.stand3_arrows : [],
               totalHits: typeof raw.totalHits === "number" ? raw.totalHits : Number(raw.totalHits) || 0,
-              totalShots: typeof raw.totalShots === "number" ? raw.totalShots : Number(raw.totalShots) || 0,
+              totalShots: typeof raw.totalShots === "number" ? raw.totalShots : Number(raw.totalShots) || 8,
               isPerfect: Boolean(raw.isPerfect),
               enkinRank: typeof raw.enkinRank === "number" ? raw.enkinRank : null,
               finalRank: typeof raw.finalRank === "number" ? raw.finalRank : null,
@@ -146,6 +187,8 @@ export default function PlayerPortalPage() {
               representativeEmail: typeof raw.representativeEmail === "string" ? raw.representativeEmail : "",
               representativePhone: typeof raw.representativePhone === "string" ? raw.representativePhone : "",
               representativeOrganization: typeof raw.representativeOrganization === "string" ? raw.representativeOrganization : "",
+              isPaid: Boolean(raw.isPaid),
+              paidAt: typeof raw.paidAt === "number" ? raw.paidAt : null,
               notes: typeof raw.notes === "string" ? raw.notes : "",
               agreedAt: typeof raw.agreedAt === "number" ? raw.agreedAt : undefined,
               updatedAt: typeof raw.updatedAt === "number" ? raw.updatedAt : undefined,
@@ -164,267 +207,134 @@ export default function PlayerPortalPage() {
     return () => unsubscribe();
   }, []);
 
-  useEffect(() => {
-    const unsubscribe = setupForegroundMessageListener((payload) => {
-      if (payload.notification) {
-        setBannerNotification({
-          title: payload.notification.title || "【招集通知】",
-          body: payload.notification.body || "出番が近づいています。控席へ入場してください。",
-        });
-      }
-    });
-
-    return () => unsubscribe();
-  }, []);
-
-  const handleTestSoundAndVibe = () => {
-    playNotificationSound();
-    triggerDeviceVibration([300, 100, 300, 100, 300]);
-  };
-
-  const filteredParticipants = participants.filter((p) => {
-    if (!searchQuery.trim()) return true;
-    const q = searchQuery.toLowerCase();
-    return (
-      p.name.toLowerCase().includes(q) ||
-      p.nameKana.toLowerCase().includes(q) ||
-      p.organization.toLowerCase().includes(q) ||
-      String(p.bibNumber).includes(q) ||
-      (p.representativeName || "").toLowerCase().includes(q)
-    );
-  });
-
-  const calledGroup = tournamentConfig.currentStandGroup + 2;
-
   return (
-    /* 【修正ポイント】
-      - 外側のラッパーを w-full min-h-screen に設定
-      - flex flex-col items-center を指定し、内部の各セクション・ヘッダーを一貫して中央寄せ
-      - mx-auto と適切な padding (p-4 sm:p-6 lg:p-8) を付与
-    */
-    <div className="w-full min-h-screen bg-slate-100 flex flex-col items-center justify-start p-4 sm:p-6 lg:p-8">
-      <main className="w-full max-w-5xl flex flex-col items-center gap-6 mx-auto">
+    <main className="min-h-screen bg-[#F8FAFC] text-slate-900 p-4 md:p-8 flex flex-col items-center justify-start">
+      <div className="w-full max-w-4xl space-y-6">
         
-        {/* 招集通知ポップアップバナー */}
-        {bannerNotification && (
-          <div className="w-full p-4 bg-amber-500 text-white rounded-lg shadow-lg flex items-center justify-between animate-bounce">
-            <div className="flex items-center gap-3">
-              <Bell className="w-6 h-6 shrink-0" />
-              <div>
-                <p className="font-bold text-sm">{bannerNotification.title}</p>
-                <p className="text-xs">{bannerNotification.body}</p>
-              </div>
-            </div>
-            <button
-              onClick={() => setBannerNotification(null)}
-              className="text-xs bg-white text-amber-900 px-3 py-1 rounded font-bold hover:bg-amber-50"
-            >
-              閉じる
-            </button>
-          </div>
-        )}
-
-        {/* 選手用ヘッダー */}
-        <header className="w-full pb-4 border-b border-slate-300 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
-          <div>
+        {/* ヘッダーセクション（白ベース、上品なシャドウとボーダー） */}
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between bg-white border border-slate-200/80 rounded-2xl p-6 shadow-sm gap-4">
+          <div className="space-y-1">
             <div className="flex items-center gap-2">
-              <h1 className="text-xl font-bold text-slate-900">{tournamentConfig.title}</h1>
-              <span className="text-xs bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded">選手用ポータル</span>
+              <span className="text-xs font-bold bg-slate-900 text-white px-3 py-1 rounded-full flex items-center gap-1 shadow-2xs">
+                <Calendar className="w-3.5 h-3.5 text-amber-400" /> 開催中
+              </span>
+              <span className="text-xs font-semibold text-slate-600 bg-slate-100 px-2.5 py-0.5 rounded-md">
+                個人戦（全8射）
+              </span>
             </div>
-            <p className="text-xs text-slate-500 mt-0.5">
-              個人戦（午前の部:一手2立 / 午後の部:四矢1立・全8射的中制）
+            <h1 className="text-xl md:text-2xl font-black tracking-tight text-slate-900 pt-1">
+              {tournamentConfig.title} - 選手・応援ポータル
+            </h1>
+            <p className="text-xs text-slate-500 font-medium">
+              午前一手（第1立・2射）と午後一手（第2立・2射）および午後四矢（第3立・4射）の合計8射制。
             </p>
           </div>
 
-          <div className="flex items-center flex-wrap gap-2">
+          <Button
+            type="button"
+            onClick={() => router.push("/admin")}
+            className="text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white px-4 py-2.5 rounded-xl shadow-xs"
+          >
+            <ShieldAlert className="w-4 h-4 mr-1.5 text-amber-400" /> 本部運営管理へ
+          </Button>
+        </div>
+
+        {/* アクションカード群 */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="bg-white border border-slate-200/80 rounded-2xl p-6 space-y-3 shadow-sm hover:shadow-md transition-shadow">
+            <div className="w-10 h-10 rounded-xl bg-slate-100 text-slate-900 flex items-center justify-center font-bold">
+              <Users className="w-5 h-5" />
+            </div>
+            <h3 className="font-black text-slate-900 text-base">新規参加エントリー</h3>
+            <p className="text-xs text-slate-500 leading-relaxed">
+              大会への参加申し込みを行います。代表者情報および選手情報を入力してエントリーを完了させてください。
+            </p>
             <Button
-              size="sm"
-              variant="outline"
-              onClick={handleTestSoundAndVibe}
-              className="text-xs font-semibold h-8 bg-white border-slate-300"
+              type="button"
+              onClick={() => router.push("/entry")}
+              className="w-full mt-2 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs py-2.5 rounded-xl"
             >
-              <Volume2 className="w-3.5 h-3.5 mr-1" />
-              通知音・振動テスト
+              エントリーフォームへ進む <ArrowRight className="w-3.5 h-3.5 ml-1" />
             </Button>
-            <a
-              href="/guidelines"
-              className="text-xs text-slate-600 hover:text-slate-900 underline font-medium px-2 py-1"
+          </div>
+
+          <div className="bg-white border border-slate-200/80 rounded-2xl p-6 space-y-3 shadow-sm hover:shadow-md transition-shadow">
+            <div className="w-10 h-10 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center font-bold">
+              <Award className="w-5 h-5" />
+            </div>
+            <h3 className="font-black text-slate-900 text-base">参加者一覧・入金確認</h3>
+            <p className="text-xs text-slate-500 leading-relaxed">
+              現在エントリーされている選手の確認や、管理者による入金確認・立順設定の状況をご確認いただけます。
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => router.push("/admin/participants")}
+              className="w-full mt-2 border-slate-200 bg-white hover:bg-slate-50 text-slate-800 font-bold text-xs py-2.5 rounded-xl"
             >
-              大会要項・規約
-            </a>
-            <a
-              href="/admin"
-              className="text-xs text-slate-400 hover:text-slate-700 underline font-medium px-2 py-1"
-            >
-              運営管理画面へ
-            </a>
+              参加者リストを表示 <ArrowRight className="w-3.5 h-3.5 ml-1" />
+            </Button>
           </div>
-        </header>
+        </div>
 
-        {/* 射場進行ステータスボード（速報） */}
-        <section className="w-full grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <div className="p-4 bg-white border border-slate-200 rounded-lg shadow-sm flex flex-col justify-between">
-            <span className="text-xs font-semibold text-slate-500 flex items-center gap-1.5">
-              <Clock className="w-4 h-4 text-green-600" /> 現在競技中（射場）
-            </span>
-            <div className="my-2">
-              <span className="text-3xl font-black text-slate-900">
-                {tournamentConfig.currentStandGroup === 0 ? "開始前" : `第 ${String(tournamentConfig.currentStandGroup).padStart(2, "0")} 立グループ`}
-              </span>
-            </div>
-            <p className="text-xs text-slate-400">全 {tournamentConfig.maxStandGroup} 立グループ</p>
+        {/* 登録選手簡易プレビュー */}
+        <div className="bg-white border border-slate-200/80 rounded-2xl p-6 space-y-4 shadow-sm">
+          <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+            <h3 className="font-bold text-slate-900 text-sm flex items-center gap-2">
+              <Users className="w-4 h-4 text-slate-700" /> エントリー済み選手一覧（全 {participants.length} 名）
+            </h3>
           </div>
 
-          <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg shadow-sm flex flex-col justify-between">
-            <span className="text-xs font-bold text-amber-800 flex items-center gap-1.5">
-              <Bell className="w-4 h-4 text-amber-600" /> 控席招集中（2立前呼出）
-            </span>
-            <div className="my-2">
-              <span className="text-3xl font-black text-amber-900">
-                第 {String(calledGroup).padStart(2, "0")} 立グループ
-              </span>
-            </div>
-            <p className="text-xs text-amber-700">該当グループの選手は速やかに弓道場控席へ入場してください</p>
-          </div>
-        </section>
-
-        {/* 選手用 端末招集通知設定フォーム */}
-        <section className="w-full flex flex-col gap-2">
-          <h2 className="text-sm font-semibold text-slate-700 uppercase tracking-wider">招集通知設定</h2>
-          <TeamSelectForm />
-        </section>
-
-        {/* 大会表彰サマリー */}
-        <section className="w-full flex flex-col gap-2">
-          <AwardSummaryCard participants={participants} />
-        </section>
-
-        {/* 全選手成績速報一覧テーブル（読み取り専用・検索付き） */}
-        <section className="w-full bg-white border border-slate-200 rounded-lg shadow-sm p-4 space-y-4">
-          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
-            <div>
-              <h2 className="text-base font-bold text-slate-900">競技成績速報</h2>
-              <p className="text-xs text-slate-500">全選手の行射結果・的中数がリアルタイム更新されます</p>
-            </div>
-            <div className="relative w-full sm:w-64">
-              <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-slate-400" />
-              <input
-                type="text"
-                placeholder="ゼッケン・名前・所属で検索..."
-                value={searchQuery}
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearchQuery(e.target.value)}
-                className="pl-9 pr-3 py-1.5 w-full text-xs border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-slate-900"
-              />
-            </div>
-          </div>
-
-          <div className="overflow-x-auto border border-slate-200 rounded-lg">
+          <div className="overflow-x-auto">
             <table className="w-full text-xs text-left">
-              <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold">
+              <thead className="bg-slate-50/80 text-slate-700 font-bold border-b border-slate-200">
                 <tr>
-                  <th className="p-2.5">ゼッケン</th>
-                  <th className="p-2.5">立グループ / 立順</th>
-                  <th className="p-2.5">選手氏名</th>
-                  <th className="p-2.5">所属団体</th>
-                  <th className="p-2.5">所作</th>
-                  <th className="p-2.5">称号・段位</th>
-                  <th className="p-2.5">役員役割</th>
-                  <th className="p-2.5">1立目(2射)</th>
-                  <th className="p-2.5">2立目(2射)</th>
-                  <th className="p-2.5">3立目(4射)</th>
-                  <th className="p-2.5 text-right">総的中</th>
-                  <th className="p-2.5 text-center">確定順位</th>
+                  <th className="p-3">ゼッケン</th>
+                  <th className="p-3">選手氏名</th>
+                  <th className="p-3">所属団体名</th>
+                  <th className="p-3">所作 / 段位</th>
+                  <th className="p-3 text-center">入金状態</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {filteredParticipants.length > 0 ? (
-                  filteredParticipants.map((p: Participant) => {
-                    const s1 = (p.stand1_arrows || []).map((v: HitResult) => (v === 1 ? "〇" : "✕")).join("");
-                    const s2 = (p.stand2_arrows || []).map((v: HitResult) => (v === 1 ? "〇" : "✕")).join("");
-                    const s3 = (p.stand3_arrows || []).map((v: HitResult) => (v === 1 ? "〇" : "✕")).join("");
-
+                {participants.length > 0 ? (
+                  participants.map((p) => {
+                    const a1 = p.standAssignments?.[1] || { standGroup: 1, standOrder: 1 };
                     return (
-                      <tr key={p.id} className="hover:bg-slate-50/80">
-                        <td className="p-2.5 font-bold text-slate-900">No.{p.bibNumber}</td>
-                        <td className="p-2.5 text-slate-700">
-                          第{String(p.standGroup).padStart(2, "0")}立 - {p.standOrder}番
+                      <tr key={p.id} className="hover:bg-slate-50/60 transition-colors">
+                        <td className="p-3 font-mono font-bold text-slate-900">No.{p.bibNumber}</td>
+                        <td className="p-3 font-bold text-slate-900">
+                          <div>{p.name}</div>
+                          <div className="text-[10px] text-slate-400 font-normal">{p.nameKana}</div>
                         </td>
-                        <td className="p-2.5">
-                          <div className="font-bold text-slate-900 flex items-center gap-1">
-                            {p.name}
-                            {p.isPerfect && <Trophy className="w-3.5 h-3.5 text-red-600 shrink-0" />}
-                            {p.needsSupport && (
-                              <span className="text-[10px] bg-amber-100 text-amber-900 px-1 py-0.2 rounded font-bold">
-                                サポート要
-                              </span>
-                            )}
-                          </div>
-                          <div className="text-[10px] text-slate-400">{p.nameKana}</div>
+                        <td className="p-3 text-slate-700 font-medium">{p.organization || "-"}</td>
+                        <td className="p-3 text-slate-600 font-medium">
+                          <div>{p.shosa}</div>
+                          <div className="text-[10px] text-slate-400 font-normal">{p.rankTitle}</div>
                         </td>
-                        <td className="p-2.5 text-slate-600">{p.organization || "-"}</td>
-                        <td className="p-2.5">
-                          <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
-                            p.shosa === "肌脱ぎ" ? "bg-slate-100 text-slate-800" : "bg-purple-100 text-purple-800"
+                        <td className="p-3 text-center">
+                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                            p.isPaid ? "bg-emerald-50 text-emerald-800 border border-emerald-300" : "bg-amber-50 text-amber-900 border border-amber-300"
                           }`}>
-                            {p.shosa}
+                            {p.isPaid ? "入金済み" : "未入金"}
                           </span>
-                        </td>
-                        <td className="p-2.5">
-                          <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${
-                            p.rankTitle === "称号を取得している"
-                              ? "bg-amber-100 text-amber-950 border-amber-300"
-                              : p.rankTitle === "段位は四段以上"
-                              ? "bg-blue-100 text-blue-950 border-blue-300"
-                              : "bg-slate-100 text-slate-800 border-slate-300"
-                          }`}>
-                            {p.rankTitle || "段位は三段以下"}
-                          </span>
-                        </td>
-                        <td className="p-2.5">
-                          {p.staffRole !== "無し" ? (
-                            <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-200">
-                              {p.staffRole}
-                            </span>
-                          ) : (
-                            <span className="text-slate-400">-</span>
-                          )}
-                        </td>
-                        <td className="p-2.5 font-mono text-slate-700">{s1 || "--"}</td>
-                        <td className="p-2.5 font-mono text-slate-700">{s2 || "--"}</td>
-                        <td className="p-2.5 font-mono text-slate-700">{s3 || "----"}</td>
-                        <td className="p-2.5 text-right font-bold pr-3">
-                          <span className="text-red-600 text-sm">{p.totalHits}</span>
-                          <span className="text-slate-400 text-xs"> / 8</span>
-                        </td>
-                        <td className="p-2.5 text-center">
-                          {p.finalRank ? (
-                            <span className={`px-2 py-0.5 rounded text-xs font-bold ${
-                              p.finalRank === 1 ? "bg-amber-100 text-amber-900 border border-amber-300 font-black" :
-                              p.finalRank === 2 ? "bg-slate-200 text-slate-900 border border-slate-300" :
-                              p.finalRank === 3 ? "bg-amber-50 text-amber-800 border border-amber-200" :
-                              "bg-slate-100 text-slate-700"
-                            }`}>
-                              第 {p.finalRank} 位
-                            </span>
-                          ) : (
-                            <span className="text-slate-300">-</span>
-                          )}
                         </td>
                       </tr>
                     );
                   })
                 ) : (
                   <tr>
-                    <td colSpan={12} className="p-6 text-center text-slate-400">
-                      該当する選手が見つかりません。
+                    <td colSpan={5} className="py-12 text-center text-slate-400 font-medium">
+                      現在エントリーしている選手はいません。
                     </td>
                   </tr>
                 )}
               </tbody>
             </table>
           </div>
-        </section>
-      </main>
-    </div>
+        </div>
+
+      </div>
+    </main>
   );
 }

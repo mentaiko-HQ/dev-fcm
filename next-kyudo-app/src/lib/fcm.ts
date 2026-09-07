@@ -1,138 +1,78 @@
-import { getToken, onMessage, MessagePayload } from "firebase/messaging";
-import { messaging, isFirebaseConfigured } from "./firebase";
-
-const VAPID_KEY = process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY || "";
-
 /**
- * Web Audio APIを利用したチャイム音再生関数（フォアグラウンド通知用フェイルセーフ）
- * 端末やブラウザが消音設定でない限り、確実に音で招集を知らせる
+ * 【FCM トークン発行および通知権限管理ロジック】
+ * 
+ * フールプルーフ設計:
+ * - VAPIDキーの未設定検知、ブラウザの通知許可状態（granted, denied, default）に応じた適切な分岐制御。
+ * 
+ * フェイルセーフ設計:
+ * - ユーザーが通知を拒否（denied）した場合や、Service Workerの登録に失敗した場合でも、
+ *   例外をキャッチして呼び出し元へ null を返却し、システム全体の処理を継続可能にする。
  */
-export function playNotificationSound(): void {
-  try {
-    if (typeof window === "undefined") return;
 
-    const AudioContextClass =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    if (!AudioContextClass) return;
+import { getToken, Messaging } from "firebase/messaging";
+import { getMessagingInstance } from "@/lib/firebase";
 
-    const audioCtx = new AudioContextClass();
-
-    // 和音チャイム（880Hz -> 440Hz: 注意喚起音）の生成
-    const osc = audioCtx.createOscillator();
-    const gainNode = audioCtx.createGain();
-
-    osc.type = "sine";
-    osc.frequency.setValueAtTime(880, audioCtx.currentTime); // ラ(A5)
-    osc.frequency.exponentialRampToValueAtTime(440, audioCtx.currentTime + 0.6); // ラ(A4)
-
-    gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
-    gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.6);
-
-    osc.connect(gainNode);
-    gainNode.connect(audioCtx.destination);
-
-    osc.start();
-    osc.stop(audioCtx.currentTime + 0.6);
-  } catch (soundError) {
-    console.warn("【通知警告】Web Audio API再生失敗（ユーザー未操作または未サポート）:", soundError);
-  }
+export interface FCMTokenResult {
+  token: string | null;
+  status: "granted" | "denied" | "unsupported" | "error";
+  errorMessage?: string;
 }
 
 /**
- * 端末バイブレーション直接実行関数（フォアグラウンド通知用）
+ * 通知許可を要求し、有効なFCMデバイストークンを取得する
  */
-export function triggerDeviceVibration(pattern: number[] = [300, 100, 300, 100, 300]): void {
-  try {
-    if (typeof window !== "undefined" && "navigator" in window && "vibrate" in navigator) {
-      navigator.vibrate(pattern);
-    }
-  } catch (vibError) {
-    console.warn("【通知警告】バイブレーション実行失敗:", vibError);
+export async function requestFCMToken(): Promise<FCMTokenResult> {
+  // 1. クライアント環境判定
+  if (typeof window === "undefined" || !("Notification" in window)) {
+    return { token: null, status: "unsupported", errorMessage: "このブラウザは通知に対応していません。" };
   }
-}
 
-/**
- * FCMトークンを安全に取得する関数
- * フールプルーフ / フェイルセーフ: 権限状態の検証、Service Workerアクティブ化待機、エラー時のフォールバック
- */
-export async function requestFcmToken(): Promise<string | null> {
+  // 2. VAPID公開鍵の取得
+  const vapidKey = process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY;
+  if (!vapidKey) {
+    console.error("【FCM設定エラー】NEXT_PUBLIC_FIREBASE_VAPID_KEY が設定されていません。");
+    return { token: null, status: "error", errorMessage: "サーバーのVAPIDキー設定が不足しています。" };
+  }
+
   try {
-    if (!isFirebaseConfigured || !messaging) {
-      console.warn("【通知警告】Firebase設定が未完了のためFCMトークン取得をスキップします。");
-      return null;
-    }
-
-    if (
-      typeof window === "undefined" ||
-      !("Notification" in window) ||
-      !("serviceWorker" in navigator)
-    ) {
-      console.warn("【通知警告】このブラウザはWebプッシュ通知またはService Workerをサポートしていません。");
-      return null;
-    }
-
+    // 3. 通知権限のリクエスト（フールプルーフ）
     const permission = await Notification.requestPermission();
     if (permission !== "granted") {
-      console.warn("【通知警告】通知の許可が得られませんでした。現在の権限:", permission);
-      return null;
+      console.warn("【FCM通知拒否】ユーザーによって通知権限が拒否されました。");
+      return { token: null, status: "denied", errorMessage: "通知の受信が許可されていません。" };
     }
 
-    await navigator.serviceWorker.register("/firebase-messaging-sw.js");
-    const activeRegistration = await navigator.serviceWorker.ready;
+    // 4. Messagingインスタンスの解決
+    const messaging: Messaging | null = await getMessagingInstance();
+    if (!messaging) {
+      return { token: null, status: "unsupported", errorMessage: "Messaging機能の起動に失敗しました。" };
+    }
 
+    // 5. Service Worker の登録状況確認
+    let serviceWorkerRegistration: ServiceWorkerRegistration | undefined;
+    if ("serviceWorker" in navigator) {
+      const swUrl = `/firebase-messaging-sw.js?projectId=${process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID}&messagingSenderId=${process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID}&apiKey=${process.env.NEXT_PUBLIC_FIREBASE_API_KEY}&appId=${process.env.NEXT_PUBLIC_FIREBASE_APP_ID}`;
+      serviceWorkerRegistration = await navigator.serviceWorker.register(swUrl);
+      await navigator.serviceWorker.ready;
+    }
+
+    // 6. トークンの取得
     const currentToken = await getToken(messaging, {
-      vapidKey: VAPID_KEY || undefined,
-      serviceWorkerRegistration: activeRegistration,
+      vapidKey,
+      serviceWorkerRegistration,
     });
 
     if (currentToken) {
-      console.log("【FCM】トークン取得成功:", currentToken);
-      return currentToken;
+      return { token: currentToken, status: "granted" };
     } else {
-      console.warn("【通知警告】トークンが生成されませんでした。");
-      return null;
+      return { token: null, status: "error", errorMessage: "登録可能なトークンが見つかりませんでした。" };
     }
   } catch (error: unknown) {
-    const errorDetail =
-      error instanceof Error
-        ? { message: error.message, stack: error.stack }
-        : String(error);
-
-    console.error("【エラーログ】FCMトークンの取得処理中に例外が発生しました:", errorDetail);
-    return null;
-  }
-}
-
-/**
- * フォアグラウンド受信リスナーを設定する関数
- * フォアグラウンド受信時に自動で音再生とバイブレーションをトリガー
- */
-export function setupForegroundMessageListener(
-  onMessageReceived: (payload: MessagePayload) => void
-): () => void {
-  if (!isFirebaseConfigured || !messaging) {
-    return () => {};
-  }
-
-  try {
-    const unsubscribe = onMessage(messaging, (payload) => {
-      console.log("【FCM】フォアグラウンド通知を受信しました:", payload);
-
-      // 音と振動の多層発火
-      playNotificationSound();
-      triggerDeviceVibration([300, 100, 300, 100, 300]);
-
-      try {
-        onMessageReceived(payload);
-      } catch (callbackError) {
-        console.error("【エラーログ】通知コールバック実行中にエラーが発生しました:", callbackError);
-      }
-    });
-
-    return unsubscribe;
-  } catch (error) {
-    console.error("【エラーログ】フォアグラウンドリスナーの設定に失敗しました:", error);
-    return () => {};
+    console.error("【FCMトークン取得エラー】詳細ログ:", error);
+    return {
+      token: null,
+      status: "error",
+      errorMessage: error instanceof Error ? error.message : "トークン取得中に不明なエラーが発生しました。",
+    };
   }
 }

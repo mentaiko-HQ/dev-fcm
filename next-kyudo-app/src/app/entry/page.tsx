@@ -1,10 +1,26 @@
+/**
+ * 【参加者エントリーページ】
+ * /entry パスに対応するページコンポーネント。
+ * 新仕様（第1立・第2立の個別立グループ・立順設定を持つ standAssignments）に完全対応。
+ * Firestoreへの一括バッチ登録後、FastAPIバックエンド経由で確認メールを送信する。
+ * 
+ * フールプルーフ設計:
+ * - 必須項目（代表者氏名、メールアドレス、電話番号、選手氏名、ふりがな）の事前バリデーション。
+ * - 多重クリックによる二重登録防止（isSubmittingによるボタン非活性化）。
+ * 
+ * フェイルセーフ設計:
+ * - AbortControllerを用いた5秒タイムアウト制御。FastAPIサーバーが停止・応答不能でもブラウザがフリーズしない。
+ * - メール送信に失敗（Failed to fetch / CORSエラー / バックエンドダウン等）した場合でも、
+ *   Firestoreへのエントリー保存は正常に確定させ、画面上でPayPay送金案内を表示してフローを継続。
+ */
+
 "use client";
 
 import React, { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { collection, doc, writeBatch, getDocs } from "firebase/firestore";
 import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
-import { RepresentativeEntryFormData, EntryPlayerItem, ShosaType, RankTitleType } from "@/types";
+import { RepresentativeEntryFormData, EntryPlayerItem, ShosaType, RankTitleType, StandRoundIndex } from "@/types";
 import { Participant } from "@/types/participant";
 import { Button } from "@/components/ui/button";
 import {
@@ -15,15 +31,14 @@ import {
   UserPlus,
   Trash2,
   Users,
-  Info,
   UserCheck,
   Mail,
   Phone,
-  HelpCircle,
   Award
 } from "lucide-react";
 
 const ENTRY_FEE_PER_PERSON = 1500;
+const API_TIMEOUT_MS = 5000;
 
 function sanitizeRankTitle(val: unknown): RankTitleType {
   if (val === "称号を取得している" || val === "段位は四段以上" || val === "段位は三段以下") {
@@ -35,6 +50,7 @@ function sanitizeRankTitle(val: unknown): RankTitleType {
 export default function EntryFormPage() {
   const router = useRouter();
 
+  // 【フールプルーフ】要項同意セッションがない場合は強制的に要項ページへリダイレクト
   useEffect(() => {
     try {
       const agreed = sessionStorage.getItem("mentaiko_terms_agreed");
@@ -119,9 +135,16 @@ export default function EntryFormPage() {
     setErrorMessage("");
   };
 
+  /**
+   * 【データ登録・メール送信処理】
+   * 1. 入力内容のバリデーション
+   * 2. Firestore への一括バッチ保存
+   * 3. FastAPI への非同期メール送信リクエスト（タイムアウト＆例外安全）
+   */
   const handleSubmitEntry = async (e: React.FormEvent) => {
     e.preventDefault();
 
+    // 【フールプルーフ】代表者情報の必須検証
     if (!formData.representativeName.trim()) {
       setErrorMessage("参加申し込み代表者のお名前を入力してください。");
       return;
@@ -135,6 +158,7 @@ export default function EntryFormPage() {
       return;
     }
 
+    // 【フールプルーフ】全登録選手の必須検証
     for (let i = 0; i < formData.players.length; i++) {
       const player = formData.players[i];
       if (!player.name.trim()) {
@@ -154,6 +178,7 @@ export default function EntryFormPage() {
     try {
       const assignedList: Array<{ name: string; bibNumber: number }> = [];
 
+      // 1. Firestore へのデータ書き込み
       if (isFirebaseConfigured && isFirestoreAvailable(db)) {
         const firestoreInstance = db;
         const entriesSnap = await getDocs(collection(firestoreInstance, "entries"));
@@ -172,6 +197,12 @@ export default function EntryFormPage() {
           const newEntryId = `player_${bibNumber}`;
           const entryDocRef = doc(firestoreInstance, "entries", newEntryId);
 
+          const safeAssignments: Record<StandRoundIndex, { standGroup: number; standOrder: 1 | 2 | 3 | 4 | 5 }> = {
+            1: { standGroup, standOrder },
+            2: { standGroup, standOrder },
+            3: { standGroup: 1, standOrder: 1 },
+          };
+
           const newParticipant: Participant = {
             id: newEntryId,
             bibNumber,
@@ -185,15 +216,16 @@ export default function EntryFormPage() {
             checkInStatus: "UNCHECKED",
             isStaffVolunteer: player.isStaffVolunteer,
             needsSupport: player.needsSupport,
-            standGroup,
-            standOrder,
+            isPaid: false,
+            paidAt: null,
+            standAssignments: safeAssignments,
             progressStatus: "WAITING",
             qualificationStatus: "ACTIVE",
             stand1_arrows: [],
             stand2_arrows: [],
             stand3_arrows: [],
             totalHits: 0,
-            totalShots: 0,
+            totalShots: 8,
             isPerfect: false,
             enkinRank: null,
             finalRank: null,
@@ -217,11 +249,16 @@ export default function EntryFormPage() {
         });
       }
 
-      // 【FastAPIバックエンド経由でResendメール送信を呼び出し】
+      // 2. FastAPIバックエンド経由でResendメール送信呼び出し
+      // 【フェイルセーフ】AbortControllerによるタイムアウト制御および通信失敗ハンドリング
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+
       try {
         const response = await fetch("http://127.0.0.1:8000/api/v1/email/send-confirmation", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
           body: JSON.stringify({
             to_email: formData.representativeEmail.trim(),
             representative_name: formData.representativeName.trim(),
@@ -229,21 +266,31 @@ export default function EntryFormPage() {
             total_fee: formData.players.length * ENTRY_FEE_PER_PERSON,
           }),
         });
-        const result = await response.json();
-        if (!result.success) {
-          setEmailStatusMessage(`メール送信警告: ${result.message}`);
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          setEmailStatusMessage(`メール配信サーバー警告（HTTP ${response.status}）: メールの送信が行えませんでした。`);
         } else {
-          setEmailStatusMessage("確認メールを正常に送信しました。");
+          const result = await response.json();
+          if (!result.success) {
+            setEmailStatusMessage(`メール送信案内: ${result.message}`);
+          } else {
+            setEmailStatusMessage("確認メールを正常に送信しました。");
+          }
         }
-      } catch (mailErr) {
-        console.error("【メール送信API通信エラー】", mailErr);
-        setEmailStatusMessage("バックエンドAPIサーバーに接続できず、メール送信に失敗しました。");
+      } catch (mailErr: unknown) {
+        clearTimeout(timeoutId);
+        // 【フェイルセーフ】Failed to fetch等の通信切断時でもエントリー確定を維持
+        console.error("【メール送信API通信例外】詳細ログ:", mailErr);
+        setEmailStatusMessage("確認メール送信APIへの接続に失敗しました（エントリー登録は正常に完了しています）。");
       }
 
       setRegisteredPlayers(assignedList);
       setIsSuccess(true);
     } catch (err: unknown) {
-      console.error("【エラーログ】一括エントリー送信失敗:", err);
+      // 【フェイルセーフ】エントリー全体処理の失敗ハンドリング
+      console.error("【一括エントリー送信失敗】詳細ログ:", err);
       setErrorMessage("エントリー登録に失敗しました。通信環境をご確認の上、再度お試しください。");
     } finally {
       setIsSubmitting(false);
@@ -267,26 +314,27 @@ export default function EntryFormPage() {
             </p>
           </div>
 
-          {/* メール送信結果メッセージ通知 */}
+          {/* メール送信結果通知 */}
           <div className={`p-4 rounded-lg text-xs space-y-1.5 leading-relaxed border ${
             emailStatusMessage.includes("警告") || emailStatusMessage.includes("失敗")
-              ? "bg-red-50 border-red-200 text-red-950"
+              ? "bg-amber-50 border-amber-200 text-amber-950"
               : "bg-blue-50 border-blue-200 text-blue-950"
           }`}>
             <p className="font-bold flex items-center gap-1.5">
               <Mail className="w-4 h-4 text-blue-600" /> 仮エントリー受付メールの送信結果
             </p>
             <p>
-              入力されたメールアドレス（<strong className="text-slate-900 font-mono">{formData.representativeEmail}</strong>）宛に仮エントリー受付メールを送信いたしました。
+              入力されたメールアドレス（<strong className="text-slate-900 font-mono">{formData.representativeEmail}</strong>）宛への送信状態:
             </p>
             <p className="font-semibold text-xs mt-1">
               {emailStatusMessage}
             </p>
-            <p className="text-[11px] text-slate-600 pt-1 border-t border-blue-200/60">
-              ※しばらく経ってもメールが届かない場合は、メールアドレスの間違いが考えられます。お手数ですが、再度エントリーをお願いいたします。
+            <p className="text-[11px] text-slate-600 pt-1 border-t border-slate-200/60">
+              ※万が一メールが未達の場合でも、下記手順でPayPay送金を完了していただければ参加資格は確定いたします。
             </p>
           </div>
 
+          {/* 登録選手一覧 */}
           <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg space-y-2">
             <p className="text-xs font-bold text-slate-700 border-b border-slate-200 pb-1 flex items-center gap-1.5">
               <Users className="w-4 h-4 text-slate-600" />
@@ -307,6 +355,7 @@ export default function EntryFormPage() {
             </div>
           </div>
 
+          {/* PayPay送金手順案内 */}
           <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-950 space-y-2">
             <p className="font-bold flex items-center gap-1.5 text-amber-900 text-sm">
               <CreditCard className="w-4 h-4" /> PayPay送金のお願い（参加確定手順）
@@ -345,12 +394,9 @@ export default function EntryFormPage() {
               <span className="text-xs font-bold bg-red-600 text-white px-2 py-0.5 rounded">
                 参加申込
               </span>
-              <span className="text-xs bg-slate-100 text-slate-700 font-semibold px-2 py-0.5 rounded">
-                代表者まとめてエントリー
-              </span>
             </div>
             <h1 className="text-xl font-black text-slate-900">
-              第5回めんたいこ杯 参加エントリーフォーム
+              第5回めんたいこ杯争奪弓道大会 参加エントリーフォーム
             </h1>
           </div>
           <Button

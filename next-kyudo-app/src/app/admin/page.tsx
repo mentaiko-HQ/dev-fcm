@@ -1,3 +1,14 @@
+/**
+ * 【管理者向け本部運営ページ】
+ * /admin パスに対応するページコンポーネント。
+ * 新仕様（第1立・第2立の個別立グループ・立順設定を持つ `standAssignments`）に対応させ、
+ * 旧仕様のトップレベル `standGroup` / `standOrder` プロパティの読み込みを廃止。
+ * 
+ * 【フールプルーフ】型制約により不正なデータ構造の混入を防止。
+ * 【フェイルセーフ】データが存在しない場合や破損している場合でも安全なデフォルト値へフォールバック。
+ * 【修正内容】Participant 型定義の必須プロパティである `checkInStatus` のマッピング漏れを解消。
+ */
+
 "use client";
 
 import React, { useEffect, useState } from "react";
@@ -5,7 +16,7 @@ import { useRouter } from "next/navigation";
 import { collection, onSnapshot, query, doc, orderBy } from "firebase/firestore";
 import { db, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
 import { Participant } from "@/types/participant";
-import { TournamentConfig, ShosaType, StaffRoleType, StandOrderType, ProgressStatus, RankTitleType } from "@/types";
+import { TournamentConfig, ShosaType, StaffRoleType, StandOrderType, ProgressStatus, RankTitleType, StandRoundIndex, CheckInStatus } from "@/types";
 import { ParticipantDataTable } from "@/components/admin/ParticipantDataTable";
 import { StandScoreContainer } from "@/components/admin/StandScoreContainer";
 import { MatchControlPanel } from "@/components/admin/MatchControlPanel";
@@ -82,6 +93,17 @@ function sanitizeProgressStatus(val: unknown): ProgressStatus {
   return "WAITING";
 }
 
+/**
+ * フールプルーフ & フェイルセーフ: チェックイン状態のバリデーション
+ */
+function sanitizeCheckInStatus(val: unknown): CheckInStatus {
+  const validStatuses: CheckInStatus[] = ["UNCHECKED", "CHECKED_IN", "ABSENT"];
+  if (typeof val === "string" && validStatuses.includes(val as CheckInStatus)) {
+    return val as CheckInStatus;
+  }
+  return "UNCHECKED";
+}
+
 export default function AdminConsolePage() {
   const router = useRouter();
   const [tournamentConfig, setTournamentConfig] = useState<TournamentConfig>(DEFAULT_TOURNAMENT_CONFIG);
@@ -117,7 +139,7 @@ export default function AdminConsolePage() {
     return () => unsubscribe();
   }, [tournamentConfig.matchId]);
 
-  // entries コレクションより選手データを購読（rankTitle プロパティ等の型安全性を完全担保）
+  // entries コレクションより選手データを購読（新仕様の standAssignments に完全対応）
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -129,6 +151,24 @@ export default function AdminConsolePage() {
           const loaded: Participant[] = [];
           snapshot.forEach((docSnap) => {
             const raw = docSnap.data();
+
+            // 【フェイルセーフ】古いデータ形式やトップレベルの指定に備えて第1立・第2立の割り当てを安全に復元
+            const rawAssignments = raw.standAssignments || {};
+            const safeAssignments: Record<StandRoundIndex, { standGroup: number; standOrder: 1 | 2 | 3 | 4 | 5 }> = {
+              1: {
+                standGroup: Number(rawAssignments[1]?.standGroup || raw.standGroup || 1),
+                standOrder: sanitizeStandOrder(rawAssignments[1]?.standOrder || raw.standOrder || 1),
+              },
+              2: {
+                standGroup: Number(rawAssignments[2]?.standGroup || raw.standGroup || 1),
+                standOrder: sanitizeStandOrder(rawAssignments[2]?.standOrder || raw.standOrder || 1),
+              },
+              3: {
+                standGroup: Number(rawAssignments[3]?.standGroup || 1),
+                standOrder: sanitizeStandOrder(rawAssignments[3]?.standOrder || 1),
+              },
+            };
+
             loaded.push({
               id: docSnap.id,
               bibNumber: typeof raw.bibNumber === "number" ? raw.bibNumber : Number(raw.bibNumber) || 1,
@@ -139,17 +179,18 @@ export default function AdminConsolePage() {
               rankTitle: sanitizeRankTitle(raw.rankTitle),
               staffRole: sanitizeStaffRole(raw.staffRole),
               staffDutyShift: raw.staffDutyShift || "無し",
+              checkInStatus: sanitizeCheckInStatus(raw.checkInStatus),
+              checkInAt: typeof raw.checkInAt === "number" ? raw.checkInAt : null,
               isStaffVolunteer: Boolean(raw.isStaffVolunteer),
               needsSupport: Boolean(raw.needsSupport),
-              standGroup: typeof raw.standGroup === "number" ? raw.standGroup : Number(raw.standGroup) || 1,
-              standOrder: sanitizeStandOrder(raw.standOrder),
+              standAssignments: safeAssignments,
               progressStatus: sanitizeProgressStatus(raw.progressStatus),
               qualificationStatus: raw.qualificationStatus || "ACTIVE",
               stand1_arrows: Array.isArray(raw.stand1_arrows) ? raw.stand1_arrows : [],
               stand2_arrows: Array.isArray(raw.stand2_arrows) ? raw.stand2_arrows : [],
               stand3_arrows: Array.isArray(raw.stand3_arrows) ? raw.stand3_arrows : [],
               totalHits: typeof raw.totalHits === "number" ? raw.totalHits : Number(raw.totalHits) || 0,
-              totalShots: typeof raw.totalShots === "number" ? raw.totalShots : Number(raw.totalShots) || 0,
+              totalShots: typeof raw.totalShots === "number" ? raw.totalShots : Number(raw.totalShots) || 8,
               isPerfect: Boolean(raw.isPerfect),
               enkinRank: typeof raw.enkinRank === "number" ? raw.enkinRank : null,
               finalRank: typeof raw.finalRank === "number" ? raw.finalRank : null,
@@ -158,6 +199,8 @@ export default function AdminConsolePage() {
               representativeEmail: typeof raw.representativeEmail === "string" ? raw.representativeEmail : "",
               representativePhone: typeof raw.representativePhone === "string" ? raw.representativePhone : "",
               representativeOrganization: typeof raw.representativeOrganization === "string" ? raw.representativeOrganization : "",
+              isPaid: Boolean(raw.isPaid),
+              paidAt: typeof raw.paidAt === "number" ? raw.paidAt : null,
               notes: typeof raw.notes === "string" ? raw.notes : "",
               agreedAt: typeof raw.agreedAt === "number" ? raw.agreedAt : undefined,
               updatedAt: typeof raw.updatedAt === "number" ? raw.updatedAt : undefined,
@@ -178,7 +221,7 @@ export default function AdminConsolePage() {
 
   return (
     <div className="w-full min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-start p-4 sm:p-6 lg:p-8">
-      <div className="w-full max-w-5xl flex flex-col gap-6 mx-auto">
+      <div className="max-w-5xl flex flex-col gap-6 mx-auto w-full">
         
         {/* 本部運営ヘッダー */}
         <header className="border-b border-slate-800 pb-4 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
