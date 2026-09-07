@@ -2,40 +2,52 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // 管理者判定ヘルパー関数（フールプルーフ: 管理者ロールの厳密チェック）
+    // 【フールプルーフ】管理者権限の検証（カスタムクレーム admin の厳密なブール値判定）
     function isAdmin() {
       return request.auth != null && request.auth.token.admin == true;
     }
 
-    // ユーザー自身であるかの判定
+    // 【フールプルーフ】リソース所有者の検証（認証UIDとドキュメントIDの一致判定）
     function isOwner(userId) {
       return request.auth != null && request.auth.uid == userId;
     }
 
-    // users コレクション（FCMトークン・端末選択管理）
+    // 【users コレクション】
+    // 選手本人のみ読み取り・作成・更新可能。管理者は全操作可能。第三者のなりすまし更新を遮断。
     match /users/{userId} {
-      allow read: if true;
-      allow create, update: if true;
+      allow read: if request.auth != null && (isOwner(userId) || isAdmin());
+      allow create: if request.auth != null && isOwner(userId);
+      allow update: if request.auth != null && (isOwner(userId) || isAdmin());
       allow delete: if isAdmin();
     }
 
-    // entries コレクション（参加者エントリー・スコア・3層ステータス）
+    // 【teams コレクション】
+    // チーム選択のために全ユーザー読み取り許可。更新・削除は管理者のみに制限。
+    match /teams/{teamId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    // 【entries コレクション】
+    // 選手一覧・立順確認のため全ユーザー読み取り許可。エントリー登録は認証済みユーザー、更新・削除は管理者のみ。
     match /entries/{entryId} {
       allow read: if true;
-      allow create: if true;
-      allow update, delete: if true;
+      allow create: if request.auth != null;
+      allow update, delete: if isAdmin();
     }
 
-    // matches コレクション（大会ステータス・進行管理・エントリー期間設定）
+    // 【matches コレクション】
+    // 試合進行状況は選手・観客ともに閲覧可能。立進行の更新は管理者のみに制限。
     match /matches/{matchId} {
       allow read: if true;
-      allow create, update, delete: if true;
+      allow create, update, delete: if isAdmin();
     }
 
-    // scores コレクション（立単位スコアデータ）
+    // 【scores コレクション】
+    // 成績閲覧のため全ユーザー読み取り許可。的中スコアの登録・修正は管理者（記録員）のみに制限。
     match /scores/{scoreId} {
       allow read: if true;
-      allow create, update, delete: if true;
+      allow create, update, delete: if isAdmin();
     }
   }
 }
