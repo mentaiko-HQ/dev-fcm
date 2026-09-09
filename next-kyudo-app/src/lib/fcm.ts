@@ -1,12 +1,13 @@
 /**
- * 【FCM トークン発行および通知権限管理ロジック】
+ * 【FCM トークン発行および通知権限管理モジュール】
  * 
  * フールプルーフ設計:
- * - VAPIDキーの未設定検知、ブラウザの通知許可状態（granted, denied, default）に応じた適切な分岐制御。
+ * - VAPIDキー未設定の検知およびコンソールへの設定催促ログ出力。
+ * - Notification API の対応状況、通知許可状態（granted, denied, default）に応じた厳密な分岐判定。
  * 
  * フェイルセーフ設計:
- * - ユーザーが通知を拒否（denied）した場合や、Service Workerの登録に失敗した場合でも、
- *   例外をキャッチして呼び出し元へ null を返却し、システム全体の処理を継続可能にする。
+ * - ユーザーによる通知拒否（denied）や Service Worker 登録失敗時でも、例外をスローせず
+ *   判定ステータスと null トークンを返却し、システム全体の処理停止を防止。
  */
 
 import { getToken, Messaging } from "firebase/messaging";
@@ -19,33 +20,51 @@ export interface FCMTokenResult {
 }
 
 /**
- * 通知許可を要求し、有効なFCMデバイストークンを取得する
+ * ブラウザに通知権限を要求し、有効な FCM トークンを取得する関数
  */
 export async function requestFCMToken(): Promise<FCMTokenResult> {
-  // 1. クライアント環境判定
+  // 1. クライアント環境および Notification API の対応検証（フールプルーフ）
   if (typeof window === "undefined" || !("Notification" in window)) {
-    return { token: null, status: "unsupported", errorMessage: "このブラウザは通知に対応していません。" };
+    console.warn("【FCM警告】このブラウザはWebプッシュ通知に対応していません。");
+    return {
+      token: null,
+      status: "unsupported",
+      errorMessage: "ご利用のブラウザはプッシュ通知に対応していません。",
+    };
   }
 
-  // 2. VAPID公開鍵の取得
+  // 2. VAPID公開鍵の存在検証（フールプルーフ）
   const vapidKey = process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY;
   if (!vapidKey) {
     console.error("【FCM設定エラー】NEXT_PUBLIC_FIREBASE_VAPID_KEY が設定されていません。");
-    return { token: null, status: "error", errorMessage: "サーバーのVAPIDキー設定が不足しています。" };
+    return {
+      token: null,
+      status: "error",
+      errorMessage: "プッシュ通知用公開鍵が未設定です。",
+    };
   }
 
   try {
-    // 3. 通知権限のリクエスト（フールプルーフ）
+    // 3. 通知権限のリクエスト
     const permission = await Notification.requestPermission();
     if (permission !== "granted") {
-      console.warn("【FCM通知拒否】ユーザーによって通知権限が拒否されました。");
-      return { token: null, status: "denied", errorMessage: "通知の受信が許可されていません。" };
+      console.warn("【FCM通知未許可】ユーザーにより通知が許可されませんでした。ステータス:", permission);
+      return {
+        token: null,
+        status: "denied",
+        errorMessage: "通知の受信が許可されていません。",
+      };
     }
 
-    // 4. Messagingインスタンスの解決
+    // 4. Messaging インスタンスの取得（フェイルセーフ）
     const messaging: Messaging | null = await getMessagingInstance();
     if (!messaging) {
-      return { token: null, status: "unsupported", errorMessage: "Messaging機能の起動に失敗しました。" };
+      console.error("【FCMエラー】Messaging機能の起動に失敗しました。");
+      return {
+        token: null,
+        status: "unsupported",
+        errorMessage: "Messaging機能の起動に失敗しました。",
+      };
     }
 
     // 5. Service Worker の登録状況確認
@@ -56,7 +75,7 @@ export async function requestFCMToken(): Promise<FCMTokenResult> {
       await navigator.serviceWorker.ready;
     }
 
-    // 6. トークンの取得
+    // 6. トークンの取得実行
     const currentToken = await getToken(messaging, {
       vapidKey,
       serviceWorkerRegistration,
@@ -65,10 +84,16 @@ export async function requestFCMToken(): Promise<FCMTokenResult> {
     if (currentToken) {
       return { token: currentToken, status: "granted" };
     } else {
-      return { token: null, status: "error", errorMessage: "登録可能なトークンが見つかりませんでした。" };
+      console.warn("【FCM警告】利用可能なFCMトークンが生成されませんでした。");
+      return {
+        token: null,
+        status: "error",
+        errorMessage: "利用可能なFCMトークンが生成されませんでした。",
+      };
     }
   } catch (error: unknown) {
-    console.error("【FCMトークン取得エラー】詳細ログ:", error);
+    // 例外発生時もアプリをクラッシュさせずに安全にエラー情報を返却（フェイルセーフ）
+    console.error("【FCMトークン取得例外】詳細ログ:", error);
     return {
       token: null,
       status: "error",
