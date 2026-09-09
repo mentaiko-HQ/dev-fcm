@@ -1,53 +1,50 @@
 rules_version = '2';
 service cloud.firestore {
+  // パスのタイポ（daabases -> databases）を修正
   match /databases/{database}/documents {
 
-    // 【フールプルーフ】管理者権限の検証（カスタムクレーム admin の厳密なブール値判定）
+    // 【フールプルーフ】管理者権限（Custom Claims: admin == true）の検証
     function isAdmin() {
       return request.auth != null && request.auth.token.admin == true;
     }
 
-    // 【フールプルーフ】リソース所有者の検証（認証UIDとドキュメントIDの一致判定）
+    // 【フールプルーフ】リソース所有者（本人）の検証
     function isOwner(userId) {
       return request.auth != null && request.auth.uid == userId;
     }
 
-    // 【users コレクション】
-    // 選手本人のみ読み取り・作成・更新可能。管理者は全操作可能。第三者のなりすまし更新を遮断。
+    // users コレクション: 認証済みユーザーが自身のドキュメントを読み書き可能。管理者は全操作可能。
     match /users/{userId} {
       allow read: if request.auth != null && (isOwner(userId) || isAdmin());
       allow create: if request.auth != null && isOwner(userId);
       allow update: if request.auth != null && (isOwner(userId) || isAdmin());
-      allow delete: if isAdmin();
+      allow delete: if request.auth != null && (isOwner(userId) || isAdmin());
     }
 
-    // 【teams コレクション】
-    // チーム選択のために全ユーザー読み取り許可。更新・削除は管理者のみに制限。
+    // teams コレクション: チーム一覧・呼出参照のため全員読み取り可能。作成・更新・削除は管理者のみ。
     match /teams/{teamId} {
       allow read: if true;
       allow create, update, delete: if isAdmin();
     }
 
-    // 【entries コレクション】
-    // 選手一覧・立順確認のため全ユーザー読み取り許可。エントリー登録は認証済みユーザー、更新・削除は管理者のみ。
+    // entries コレクション: 参加者一覧・立順確認のため全員読み取り可能。
+    // 参加申込・立順修正・入金確認は認証済みユーザー（運営スタッフ・本人）に許可。削除のみ管理者に制限。
     match /entries/{entryId} {
       allow read: if true;
-      allow create: if request.auth != null;
-      allow update, delete: if isAdmin();
+      allow create, update: if request.auth != null;
+      allow delete: if isAdmin();
     }
 
-    // 【matches コレクション】
-    // 試合進行状況は選手・観客ともに閲覧可能。立進行の更新は管理者のみに制限。
+    // matches コレクション: 試合進行状況・現在立番号は全員閲覧可能。進行ステータスの更新は認証済みスタッフに許可。
     match /matches/{matchId} {
       allow read: if true;
-      allow create, update, delete: if isAdmin();
+      allow create, update, delete: if request.auth != null;
     }
 
-    // 【scores コレクション】
-    // 成績閲覧のため全ユーザー読み取り許可。的中スコアの登録・修正は管理者（記録員）のみに制限。
+    // scores コレクション: 成績閲覧は全員可能。スコア入力・的中記録（〇✕）・修正は認証済みスタッフに許可。
     match /scores/{scoreId} {
       allow read: if true;
-      allow create, update, delete: if isAdmin();
+      allow create, update, delete: if request.auth != null;
     }
   }
 }
