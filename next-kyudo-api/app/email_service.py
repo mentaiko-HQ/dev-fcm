@@ -33,13 +33,13 @@ def send_entry_confirmation_email(payload: EmailPayload) -> tuple[bool, str]:
     subject = "【第5回めんたいこ杯争奪弓道大会】仮エントリー受付完了のお知らせ"
 
     players_list_html = "".join([f"<li>{name} 様</li>" for name in payload.player_names])
-    
+
     html_content = f"""
     <div style="font-family: sans-serif; color: #1e293b; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px; background-color: #ffffff;">
       <h2 style="color: #0f172a; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px;">仮エントリー受付完了</h2>
       <p><strong>{payload.representative_name} 様</strong></p>
       <p>第5回めんたいこ杯争奪弓道大会への参加申し込み（仮エントリー）を受け付けました。</p>
-      
+
       <div style="background-color: #f8fafc; padding: 15px; border-radius: 6px; margin: 15px 0;">
         <p style="margin: 0 0 10px 0;"><strong>登録選手一覧:</strong></p>
         <ul style="margin: 0; padding-left: 20px;">
@@ -57,7 +57,7 @@ def send_entry_confirmation_email(payload: EmailPayload) -> tuple[bool, str]:
 
       <p style="font-size: 12px; color: #64748b; margin-top: 30px; border-top: 1px solid #e2e8f0; padding-top: 10px;">
         第5回めんたいこ杯争奪弓道大会 運営事務局<br>
-        お問い合わせ: info@mentaikotrophy-hq.com
+        お問い合わせ: mentaiko.trophy.hq@gmail.com
       </p>
     </div>
     """

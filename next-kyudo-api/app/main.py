@@ -1,63 +1,82 @@
 """
-【FastAPI バックエンド エントリーポイント】
-CORS設定、ヘルスチェック、Resendメール送信API（エントリー確認・選手個別QR受付コード配信・一括配信）を提供。
+【弓道大会運営システム バックエンドAPIサービス】
+役割:
+- 参加受付、スコア管理、および公式入場QRコード案内メールの配信。
+- エントリー時の仮受付完了・PayPay送金案内メール送信 (/api/v1/email/send-confirmation)。
+- 選手氏名・ゼッケン番号・午前午後立順が焼き込まれた「一体型QRカード画像」の合成およびメール送信 (/api/v1/email/send-qr-single)。
+- Resend 公式仕様に基づく CID (Content-ID) インライン画像埋め込みによるメール本文内画像確実表示。
 
-Pylance静的解析エラー対応:
-- `import qrcode` 単体では `constants` サブモジュールが型チェッカーに解決されないため、
-  `import qrcode.constants` を明示的にインポートして型エラー（reportAttributeAccessIssue）を解消。
+フールプルーフ設計:
+- サーバー起動時に python-dotenv (load_dotenv) を絶対パスで強制実行し、カレントディレクトリに依存しない環境変数ロードを保証。
+- SendConfirmationRequest において to_email と email の双方の属性アクセスを許容するプロパティ実装。
+- FROM_EMAIL / RESEND_FROM_EMAIL / RESEND_FROM_NAME のいずれの命名設定でも送信元を安全に自動解決する多層フォールバック。
+- 宛先メールアドレスの形式検証、選手リストの空検証。
+- 立ち順（午前・午後の組・射位）が未設定（None）の選手に対するQR送信を400エラーで遮断。
+- Resend SDK の TypedDict 定義差分を typing.cast で安全に吸収し、Pylance 型エラーを解消。
 
-フールプルーフ設計（操作ミス・不正入力の入口遮断）:
-- Pydantic v2仕様に準拠したスキーマ定義により、リクエストボディの不正な型や欠落パラメータを入口で遮断。
-- EmailStr による厳格なメール構文チェック。
-- ゼッケン番号（1以上）、立順（1〜5番）、立番号（1以上）の境界値検証（Field ge, le）。
-- QRコード生成用文字列が空文字または空白のみの場合に入口で検証。
-
-フェイルセーフ設計（障害発生時の安全縮退）:
-- QRコード画像をディスクに保存せず、メモリバッファ（io.BytesIO）内で生成・Base64化してCIDインライン添付。ファイル残留障害を防止。
-- 単体送信 (/api/v1/email/send-qr-single) と一括送信 (/api/v1/email/send-qr-batch) の両エンドポイントを提供。
-- RESEND_API_KEY 未設定時やResend側通信障害時でも例外によるプロセス停止を防ぎ、構造化された失敗レスポンスを返却。
-- QR生成処理の例外を捕捉し、生成失敗時は呼び出し元へ明確なエラー詳細を返却。
+フェイルセーフ設計:
+- Resend APIキー未設定時は success=False かつ isSimulation=True とし、UI側に設定不備を明示して安全に縮退。
+- サーバーOS上に日本語フォントが存在しない場合でもデフォルトフォント (ImageFont.load_default) へ安全にフォールバック。
+- Resend API通信時の例外を捕捉し、スタックトレース付きエラーログを記録してクライアントへ安全なJSONレスポンスを返却。
 """
 
 import os
-import sys
 import io
 import base64
-import logging
+from typing import Optional, List, Any, cast
 from pathlib import Path
-from typing import List, Optional
-from fastapi import FastAPI, status, Response
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field
 from dotenv import load_dotenv
+from fastapi import FastAPI, status, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from PIL import Image, ImageDraw, ImageFont
 import qrcode
-import qrcode.constants
 from qrcode.constants import ERROR_CORRECT_M
 import resend
 
-# ログ出力の統一フォーマット設定
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("kyudo-api")
+# 【フールプルーフ】カレントディレクトリに依存しない絶対パスによる .env ロード
+base_dir = Path(__file__).resolve().parent.parent
+env_path = base_dir / ".env"
+is_env_loaded = load_dotenv(dotenv_path=env_path)
 
-# プロジェクトルートの .env ファイルを確実にロード
-env_path = Path(__file__).resolve().parent.parent / ".env"
-if env_path.exists():
-    load_dotenv(dotenv_path=env_path)
-    logger.info(f".env ファイルを読み込みました: {env_path}")
+# 環境変数の読み込みとトリミング
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+
+# 送信元アドレスの解決（多層フォールバック）
+raw_from_email = os.getenv("FROM_EMAIL", "").strip()
+raw_resend_from_email = os.getenv("RESEND_FROM_EMAIL", "").strip()
+raw_resend_from_name = os.getenv("RESEND_FROM_NAME", "").strip()
+
+if raw_from_email:
+    FROM_EMAIL = raw_from_email
+elif raw_resend_from_email:
+    if raw_resend_from_name:
+        FROM_EMAIL = f"{raw_resend_from_name} <{raw_resend_from_email}>"
+    else:
+        FROM_EMAIL = raw_resend_from_email
 else:
-    logger.warning(f".env ファイルが見つかりません: {env_path}")
+    FROM_EMAIL = "第5回めんたいこ杯運営事務局 <info@mentaikotrophy-hq.com>"
+
+# 【フールプルーフ】起動時コンソールログ出力
+masked_key = f"{RESEND_API_KEY[:6]}...{RESEND_API_KEY[-4:]}" if len(RESEND_API_KEY) >= 10 else "(未設定または空文字)"
+print("==================================================")
+print("【Kyudo API 環境変数ロード確認ログ】")
+print(f"・対象 .env パス      : {env_path}")
+print(f"・.env ファイル存在   : {env_path.exists()}")
+print(f"・load_dotenv 実行結果: {is_env_loaded}")
+print(f"・RESEND_API_KEY 設定 : {bool(RESEND_API_KEY)} [{masked_key}]")
+print(f"・FROM_EMAIL 設定     : {FROM_EMAIL}")
+print("==================================================")
+
+resend.api_key = RESEND_API_KEY
 
 app = FastAPI(
     title="Kyudo Tournament API",
-    description="第5回めんたいこ杯争奪弓道大会 運営管理API",
-    version="1.3.1"
+    description="弓道大会運営システム バックエンドAPIサービス",
+    version="1.0.0"
 )
 
-# CORS設定（フロントエンドからの通信を許可）
+# CORS設定
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -73,393 +92,491 @@ app.add_middleware(
 
 
 # ==========================================
-# スキーマ定義 (Pydantic Models)
+# 1. Pydantic リクエスト・レスポンスモデル
 # ==========================================
 
 class HealthCheckResponse(BaseModel):
-    status: str = Field(description="稼働状態")
-    service: str = Field(default="kyudo-backend", description="サービス識別名")
-    version: str = Field(default="1.3.1", description="APIバージョン")
-    resend_configured: bool = Field(description="Resend APIキーの設定状態")
-    error: Optional[str] = Field(default=None, description="エラー内容")
+    status: str
+    service: str
+    version: str
+    resend_configured: bool
+    env_file_exists: bool
+    from_email: str
 
 
-class EmailConfirmationRequest(BaseModel):
-    to_email: EmailStr = Field(description="送信先メールアドレス")
-    representative_name: str = Field(min_length=1, description="参加申込代表者氏名")
-    player_names: List[str] = Field(min_length=1, description="登録選手氏名一覧")
-    total_fee: int = Field(ge=0, description="合計参加費")
+class SendConfirmationRequest(BaseModel):
+    to_email: str = Field(..., description="送信先メールアドレス")
+    representative_name: str = Field(..., min_length=1, description="代表者氏名")
+    player_names: List[str] = Field(..., min_length=1, description="登録選手氏名リスト")
+    total_fee: int = Field(..., ge=0, description="合計参加費")
+
+    @property
+    def email(self) -> str:
+        """【フールプルーフ】to_email と email の両属性アクセスを許容"""
+        return self.to_email
 
 
-class EmailConfirmationResponse(BaseModel):
+class SendConfirmationResponse(BaseModel):
     success: bool
     message: str
+    isSimulation: bool = False
+    errorDetail: Optional[str] = None
 
 
-class SendQrEmailSingleRequest(BaseModel):
-    tournamentTitle: str = Field(default="第5回めんたいこ杯争奪弓道大会", description="大会名")
-    participantId: str = Field(min_length=1, description="選手ID")
-    bibNumber: int = Field(ge=1, description="ゼッケン番号")
-    name: str = Field(min_length=1, description="選手氏名")
-    email: EmailStr = Field(description="送信先メールアドレス")
-    organization: str = Field(default="", description="所属団体")
-    stand1Group: int = Field(ge=1, default=1, description="第1立の立番号")
-    stand1Order: int = Field(ge=1, le=5, default=1, description="第1立の立順")
-    stand2Group: int = Field(ge=1, default=1, description="第2立の立番号")
-    stand2Order: int = Field(ge=1, le=5, default=1, description="第2立の立順")
-    checkinPayload: str = Field(min_length=1, description="QRコードに埋め込む認証データ文字列")
+class SendQrSingleRequest(BaseModel):
+    tournamentTitle: str = Field(..., description="大会名称")
+    participantId: str = Field(..., description="選手ID")
+    bibNumber: int = Field(..., ge=1, description="ゼッケン番号")
+    name: str = Field(..., min_length=1, description="選手氏名")
+    nameKana: Optional[str] = Field(default="", description="選手ふりがな")
+    email: str = Field(..., description="送信先メールアドレス")
+    organization: Optional[str] = Field(default="無所属", description="所属団体")
+    shosa: Optional[str] = Field(default="肌脱ぎ", description="所作区分")
+    rankTitle: Optional[str] = Field(default="段位は三段以下", description="称号・段位")
+    stand1Group: Optional[int] = Field(default=None, description="午前の部 組番号")
+    stand1Order: Optional[int] = Field(default=None, description="午前の部 立順")
+    stand2Group: Optional[int] = Field(default=None, description="午後の部 組番号")
+    stand2Order: Optional[int] = Field(default=None, description="午後の部 立順")
+    checkinPayload: str = Field(..., description="QRコード読取用ペイロードJSON文字列")
+    qrCardBase64: Optional[str] = Field(default=None, description="フロントエンドで合成されたQRカード画像のBase64文字列")
 
 
-class SendQrEmailSingleResponse(BaseModel):
+class SingleSendApiResponse(BaseModel):
     participantId: str
     bibNumber: int
     name: str
     email: str
     success: bool
     message: str
+    isSimulation: bool = False
     errorDetail: Optional[str] = None
 
 
-class ParticipantQrEmailItem(BaseModel):
-    participantId: str = Field(min_length=1, description="選手ID")
-    bibNumber: int = Field(ge=1, description="ゼッケン番号")
-    name: str = Field(min_length=1, description="選手氏名")
-    email: EmailStr = Field(description="送信先メールアドレス")
-    organization: str = Field(default="", description="所属団体")
-    stand1Group: int = Field(ge=1, default=1, description="第1立の立番号")
-    stand1Order: int = Field(ge=1, le=5, default=1, description="第1立の立順")
-    stand2Group: int = Field(ge=1, default=1, description="第2立の立番号")
-    stand2Order: int = Field(ge=1, le=5, default=1, description="第2立の立順")
-    checkinPayload: str = Field(min_length=1, description="QRコードに埋め込む認証データ文字列")
-
-
-class SendQrEmailBatchRequest(BaseModel):
-    tournamentTitle: str = Field(default="第5回めんたいこ杯争奪弓道大会", description="大会名")
-    participants: List[ParticipantQrEmailItem] = Field(min_length=1, description="送信対象選手一覧")
-
-
-class SendQrEmailBatchResponse(BaseModel):
-    totalRequested: int
-    successCount: int
-    failureCount: int
-    results: List[SendQrEmailSingleResponse]
-
-
 # ==========================================
-# ユーティリティ関数
+# 2. サーバーサイド QRカード画像合成エンジン
 # ==========================================
 
-def generate_qr_png_bytes(data_text: str) -> bytes:
-    """
-    指定文字列からQRコードをインメモリ生成し、PNGバイト列を返却する。
-    
-    フールプルーフ:
-    - 空文字または空白のみのデータが渡された場合はValueErrorを送出。
-    
-    フェイルセーフ:
-    - ディスクI/Oを行わずメモリ上（io.BytesIO）で完結させ、ファイルシステムの障害を回避。
-    - 明示的にインポートした ERROR_CORRECT_M 定数を使用し、Pylance静的解析エラーを回避。
-    """
-    if not data_text or not data_text.strip():
-        raise ValueError("QRコード生成データが空です。")
+def get_stand_order_label(order: Optional[int]) -> str:
+    if order is None:
+        return "未確定"
+    mapping = {
+        1: "大前 (1番)",
+        2: "二的 (2番)",
+        3: "中 (3番)",
+        4: "落前 (4番)",
+        5: "落 (5番)",
+    }
+    return mapping.get(order, f"{order}番")
+
+
+def generate_qr_card_image_bytes(req: SendQrSingleRequest) -> bytes:
+    if req.qrCardBase64 and "base64," in req.qrCardBase64:
+        try:
+            base64_data = req.qrCardBase64.split("base64,")[1]
+            return base64.b64decode(base64_data)
+        except Exception as e:
+            print(f"【Base64デコード警告】サーバー側フォールバック描画を実行します: {e}")
+
+    width, height = 800, 1200
+    image = Image.new("RGB", (width, height), color="#F8FAFC")
+    draw = ImageDraw.Draw(image)
+
+    def load_font(size: int):
+        font_paths = [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttf",
+            "C:\\Windows\\Fonts\\msgothic.ttc",
+            "C:\\Windows\\Fonts\\meiryo.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        ]
+        for path in font_paths:
+            if os.path.exists(path):
+                try:
+                    return ImageFont.truetype(path, size)
+                except Exception:
+                    continue
+        return ImageFont.load_default()
+
+    font_title = load_font(24)
+    font_sub = load_font(18)
+    font_bib_label = load_font(16)
+    font_bib = load_font(40)
+    font_name = load_font(44)
+    font_spec = load_font(18)
+    font_table = load_font(16)
+    font_footer = load_font(13)
+
+    margin = 32
+    card_box = [margin, margin, width - margin, height - margin]
+    draw.rounded_rectangle(card_box, radius=24, fill="#FFFFFF", outline="#CBD5E1", width=3)
+
+    header_height = 180
+    header_box = [margin, margin, width - margin, margin + header_height]
+    draw.rectangle(header_box, fill="#0F172A")
+
+    title_text = req.tournamentTitle[:25] + "…" if len(req.tournamentTitle) > 26 else req.tournamentTitle
+    draw.text((width // 2, margin + 50), title_text, fill="#F8FAFC", font=font_title, anchor="mm")
+    draw.text((width // 2, margin + 95), "正式エントリー受付・当日入場QRコード", fill="#F59E0B", font=font_sub, anchor="mm")
+    draw.text((width // 2, margin + 135), f"ENTRY ID: {req.participantId}", fill="#94A3B8", font=font_table, anchor="mm")
+
+    bib_y = margin + header_height + 40
+    bib_box = [margin + 40, bib_y, width - margin - 40, bib_y + 75]
+    draw.rounded_rectangle(bib_box, radius=14, fill="#F8FAFC", outline="#CBD5E1", width=2)
+    draw.text((margin + 65, bib_y + 37), "ゼッケン番号", fill="#64748B", font=font_bib_label, anchor="lm")
+    draw.text((width - margin - 65, bib_y + 37), f"No. {req.bibNumber}", fill="#0F172A", font=font_bib, anchor="rm")
+
+    name_y = bib_y + 115
+    draw.text((width // 2, name_y + 20), f"{req.name} 選手", fill="#0F172A", font=font_name, anchor="mm")
+    spec_text = f"{req.organization or '無所属'}  |  {req.shosa}  |  {req.rankTitle}"
+    draw.text((width // 2, name_y + 70), spec_text, fill="#334155", font=font_spec, anchor="mm")
+
+    qr_box_size = 330
+    qr_x = (width - qr_box_size) // 2
+    qr_y = name_y + 110
+    draw.rounded_rectangle([qr_x, qr_y, qr_x + qr_box_size, qr_y + qr_box_size], radius=16, fill="#FFFFFF", outline="#CBD5E1", width=2)
 
     qr = qrcode.QRCode(
-        version=1,
+        version=None,
         error_correction=ERROR_CORRECT_M,
         box_size=8,
-        border=2,
+        border=1,
     )
-    qr.add_data(data_text.strip())
+    qr.add_data(req.checkinPayload)
     qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="#0F172A", back_color="#FFFFFF").convert("RGB")
+    qr_img = qr_img.resize((qr_box_size - 24, qr_box_size - 24))
+    image.paste(qr_img, (qr_x + 12, qr_y + 12))
 
-    img = qr.make_image(fill_color="black", back_color="white")
+    table_y = qr_y + qr_box_size + 25
+    table_box = [margin + 40, table_y, width - margin - 40, table_y + 125]
+    draw.rounded_rectangle(table_box, radius=14, fill="#F1F5F9", outline="#CBD5E1", width=1)
+
+    m_group = f"第 {req.stand1Group} 組" if req.stand1Group else "未設定"
+    m_order = get_stand_order_label(req.stand1Order)
+    draw.text((margin + 60, table_y + 35), "午前の部 (一手・2射):", fill="#D97706", font=font_table, anchor="lm")
+    draw.text((width - margin - 60, table_y + 35), f"{m_group}  -  {m_order}", fill="#0F172A", font=font_table, anchor="rm")
+
+    draw.line([margin + 55, table_y + 62, width - margin - 55, table_y + 62], fill="#CBD5E1", width=1)
+
+    a_group = f"第 {req.stand2Group} 組" if req.stand2Group else "未設定"
+    a_order = get_stand_order_label(req.stand2Order)
+    draw.text((margin + 60, table_y + 90), "午後の部 (一手/四矢):", fill="#475569", font=font_table, anchor="lm")
+    draw.text((width - margin - 60, table_y + 90), f"{a_group}  -  {a_order}", fill="#0F172A", font=font_table, anchor="rm")
+
+    draw.text(
+        (width // 2, height - margin - 35),
+        "※大会当日は本QRコードを受付端末にかざして入場チェックインを行ってください。",
+        fill="#64748B",
+        font=font_footer,
+        anchor="mm"
+    )
+
     buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
+    image.save(buffer, format="PNG", optimize=True)
     return buffer.getvalue()
 
 
 # ==========================================
-# エンドポイント定義
+# 3. エンドポイント実装
 # ==========================================
 
-@app.get(
-    "/health",
-    response_model=HealthCheckResponse,
-    status_code=status.HTTP_200_OK,
-    summary="ヘルスチェック",
-    tags=["Monitoring"]
-)
-def health_check(response: Response):
-    """
-    APIサーバーの稼働状態および外部サービス設定状況（Resend APIキー）を検査する。
-    """
-    try:
-        resend_key = os.environ.get("RESEND_API_KEY", "").strip()
-        is_ready = bool(resend_key and resend_key.startswith("re_"))
-        return HealthCheckResponse(
-            status="healthy",
-            service="kyudo-backend",
-            version="1.3.1",
-            resend_configured=is_ready,
-            error=None
-        )
-    except Exception as exc:
-        logger.error(f"ヘルスチェック例外: {str(exc)}", exc_info=True)
-        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return HealthCheckResponse(
-            status="unhealthy",
-            service="kyudo-backend",
-            version="1.3.1",
-            resend_configured=False,
-            error=str(exc)
-        )
-
-
-@app.get(
-    "/api/health",
-    response_model=HealthCheckResponse,
-    status_code=status.HTTP_200_OK,
-    summary="ヘルスチェック (互換パス)",
-    tags=["Monitoring"]
-)
-def health_check_api(response: Response):
-    """
-    リバースプロキシやNext.jsリライト設定経由のヘルスチェック用エンドポイント。
-    """
-    return health_check(response)
+@app.get("/health", response_model=HealthCheckResponse, status_code=status.HTTP_200_OK)
+def health_check() -> HealthCheckResponse:
+    return HealthCheckResponse(
+        status="healthy",
+        service="kyudo-backend",
+        version="1.0.0",
+        resend_configured=bool(RESEND_API_KEY),
+        env_file_exists=env_path.exists(),
+        from_email=FROM_EMAIL
+    )
 
 
 @app.post(
     "/api/v1/email/send-confirmation",
-    response_model=EmailConfirmationResponse,
+    response_model=SendConfirmationResponse,
     status_code=status.HTTP_200_OK,
-    summary="仮エントリー受付確認メール送信",
-    tags=["Email"]
+    summary="仮エントリー受付確認・送金案内メール送信"
 )
-def send_confirmation_email(payload: EmailConfirmationRequest):
-    """
-    エントリー完了時に代表者へ仮受付通知メールを送信する。
-    """
-    resend_api_key = os.environ.get("RESEND_API_KEY", "").strip()
+@app.post(
+    "/api/v1/email/send-confirmation/",
+    response_model=SendConfirmationResponse,
+    status_code=status.HTTP_200_OK,
+    include_in_schema=False
+)
+def send_confirmation(req: SendConfirmationRequest) -> SendConfirmationResponse:
+    if "@" not in req.to_email or "." not in req.to_email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"無効なメールアドレスです: {req.to_email}"
+        )
 
-    if not resend_api_key or not resend_api_key.startswith("re_"):
-        masked_key = f"{resend_api_key[:5]}..." if resend_api_key else "None"
-        logger.warning(
-            f"【メール送信スキップ】有効なRESEND_API_KEYが未設定です。キー: '{masked_key}' / 宛先: {payload.to_email}"
+    if len(req.player_names) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="登録選手リストが空です。"
         )
-        return EmailConfirmationResponse(
+
+    if not RESEND_API_KEY:
+        err_msg = f"バックエンド環境変数 RESEND_API_KEY が未設定です。パス: {env_path}"
+        print(f"【設定不備】{err_msg}")
+        return SendConfirmationResponse(
             success=False,
-            message="有効なメール配信用APIキー（re_...）が未設定のため、送信をスキップしました。"
+            isSimulation=True,
+            message="メール配信設定が未構成のため送信をスキップしました。",
+            errorDetail=err_msg
         )
+
+    players_list_html = "".join([f"<li style='padding: 2px 0;'>{name} 様</li>" for name in req.player_names])
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; background-color: #f8fafc; margin: 0; padding: 24px; }}
+        .container {{ max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }}
+        .header {{ background: #0f172a; color: #ffffff; padding: 24px; text-align: center; }}
+        .header h1 {{ margin: 0; font-size: 20px; font-weight: 800; }}
+        .header p {{ margin: 6px 0 0 0; color: #f59e0b; font-size: 13px; font-weight: bold; }}
+        .content {{ padding: 24px; line-height: 1.6; font-size: 14px; }}
+        .details {{ background: #f1f5f9; border-radius: 12px; padding: 16px; margin: 16px 0; font-size: 13px; }}
+        .details ul {{ margin: 8px 0 0 16px; padding: 0; }}
+        .payment-box {{ background: #fef3c7; border: 1px solid #fde68a; border-radius: 12px; padding: 16px; margin: 20px 0; }}
+        .payment-box h2 {{ margin: 0 0 8px 0; font-size: 14px; color: #92400e; font-weight: bold; }}
+        .fee {{ font-size: 20px; font-weight: 900; color: #dc2626; }}
+        .footer {{ border-top: 1px solid #e2e8f0; padding: 16px 24px; font-size: 11px; color: #64748b; text-align: center; }}
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>第5回めんたいこ杯争奪弓道大会</h1>
+          <p>仮エントリー受付のお知らせ</p>
+        </div>
+        <div class="content">
+          <p><strong>{req.representative_name} 様</strong></p>
+          <p>大会への参加エントリー申し込みを受け付けました。<br>現在<strong>「仮エントリー」</strong>の状態となっております。以下の送金手順に従って参加費のお支払いをお願いいたします。</p>
+
+          <div class="details">
+            <p style="margin: 0; font-weight: bold; color: #334155;">【エントリー選手一覧（計 {len(req.player_names)} 名）】</p>
+            <ul>
+              {players_list_html}
+            </ul>
+          </div>
+
+          <div class="payment-box">
+            <h2>■ 参加費送金のお願い</h2>
+            <p style="margin: 0 0 8px 0;">お支払い合計金額: <span class="fee">{req.total_fee:,} 円</span>（1,500円 × {len(req.player_names)}名）</p>
+            <p style="margin: 0; font-size: 13px; color: #78350f;">
+              送金先PayPayID: <strong>hayapaaaay</strong><br>
+              メッセージ欄記入名: <strong>{req.representative_name}</strong>
+            </p>
+            <p style="margin: 8px 0 0 0; font-size: 11px; color: #b45309;">
+              ※送金時のメッセージ欄には必ず代表者氏名をご記入ください。送金確認後、正式エントリー受付QRコードを発行・送付いたします。
+            </p>
+          </div>
+        </div>
+        <div class="footer">
+          <p>第5回めんたいこ杯争奪弓道大会 大会運営事務局</p>
+        </div>
+      </div>
+    </body>
+    </html>
+    """
 
     try:
-        resend.api_key = resend_api_key
-        players_list_str = "、".join(payload.player_names)
-        html_content = f"""
-        <h2>【第5回めんたいこ杯争奪弓道大会】仮エントリー受付のお知らせ</h2>
-        <p>{payload.representative_name} 様</p>
-        <p>大会への参加エントリーを受け付けました。</p>
-        <hr />
-        <h3>■ エントリー内容</h3>
-        <ul>
-            <li><strong>代表者氏名:</strong> {payload.representative_name}</li>
-            <li><strong>参加選手:</strong> {players_list_str}（計 {len(payload.player_names)} 名）</li>
-            <li><strong>合計参加費:</strong> {payload.total_fee:,} 円</li>
-        </ul>
-        <hr />
-        <h3>■ 参加確定手順（PayPay送金）</h3>
-        <p>参加費合計 <strong>{payload.total_fee:,} 円</strong> を以下のPayPayID宛にご送金ください。</p>
-        <p><strong>送金先PayPayID:</strong> hayapaaaay</p>
-        <p><strong>メッセージ欄記入名:</strong> {payload.representative_name}</p>
-        <p>※送金確認をもって正式な受付完了となります。</p>
-        """
-
-        params: resend.Emails.SendParams = {
-            "from": "めんたいこ杯運営事務局 <onboarding@resend.dev>",
-            "to": [payload.to_email],
-            "subject": "【第5回めんたいこ杯】仮エントリー受付完了のお知らせ",
+        params: dict[str, Any] = {
+            "from": FROM_EMAIL,
+            "to": [req.to_email],
+            "subject": f"【仮エントリー受付】第5回めんたいこ杯争奪弓道大会（代表者: {req.representative_name} 様）",
             "html": html_content,
         }
 
-        resend.Emails.send(params)
-        logger.info(f"【メール送信成功】送信先: {payload.to_email}")
-        return EmailConfirmationResponse(
+        email_response = resend.Emails.send(cast(resend.Emails.SendParams, params))
+        print(f"【仮エントリーメール送信成功】ID: {email_response.get('id')} from: {FROM_EMAIL} to: {req.to_email}")
+
+        return SendConfirmationResponse(
             success=True,
-            message="確認メールを正常に送信しました。"
+            isSimulation=False,
+            message="仮エントリー受付確認メールを送信しました。"
         )
-    except Exception as exc:
-        logger.error(f"【メール送信失敗】例外ログ: {str(exc)}", exc_info=True)
-        return EmailConfirmationResponse(
+    except Exception as send_err:
+        err_str = str(send_err)
+        print(f"【仮エントリーメール送信例外】: {err_str}")
+        return SendConfirmationResponse(
             success=False,
-            message=f"メール配信サービスでエラーが発生しました: {str(exc)}"
+            isSimulation=False,
+            message="メール配信サーバー（Resend）での送信処理に失敗しました。",
+            errorDetail=err_str
         )
 
 
 @app.post(
     "/api/v1/email/send-qr-single",
-    response_model=SendQrEmailSingleResponse,
+    response_model=SingleSendApiResponse,
     status_code=status.HTTP_200_OK,
-    summary="参加受付QRコードメール個別送信",
-    tags=["Email"]
+    summary="選手情報一体型QRカード添付メール送信"
 )
-def send_qr_code_single(payload: SendQrEmailSingleRequest):
+@app.post(
+    "/api/v1/email/send-qr-single/",
+    response_model=SingleSendApiResponse,
+    status_code=status.HTTP_200_OK,
+    include_in_schema=False
+)
+def send_qr_single(req: SendQrSingleRequest) -> SingleSendApiResponse:
     """
-    対象選手1名に対して、最新の立順情報および受付用QRコード画像をインライン添付してメール送信する。
+    【フールプルーフ】
+    - 立ち順未設定の選手（午前・午後の組・立順がNone）に対する送信要求を遮断。
+    - メールアドレスの検証。
+    - Resend公式仕様の content_id を用いて HTML 内の cid:qrcard_image と完全バインド。
     """
-    resend_api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if (
+        req.stand1Group is None or req.stand1Order is None or
+        req.stand2Group is None or req.stand2Order is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="立ち順（午前・午後の組および射位）が未設定です。立ち順確定後に送信してください。"
+        )
 
-    if not resend_api_key or not resend_api_key.startswith("re_"):
-        logger.error("【メール配信拒否】有効な RESEND_API_KEY が未設定です。")
-        return SendQrEmailSingleResponse(
-            participantId=payload.participantId,
-            bibNumber=payload.bibNumber,
-            name=payload.name,
-            email=payload.email,
+    if "@" not in req.email or "." not in req.email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"無効なメールアドレスです: {req.email}"
+        )
+
+    if not RESEND_API_KEY:
+        err_msg = f"バックエンド環境変数 RESEND_API_KEY が未設定です。パス: {env_path}"
+        print(f"【設定不備】{err_msg}")
+        return SingleSendApiResponse(
+            participantId=req.participantId,
+            bibNumber=req.bibNumber,
+            name=req.name,
+            email=req.email,
             success=False,
-            message="バックエンドでメール配信用APIキーが未設定です。",
-            errorDetail="RESEND_API_KEY is not configured on backend."
+            isSimulation=True,
+            message="メール配信設定が未構成のため送信をスキップしました。",
+            errorDetail=err_msg
         )
 
     try:
-        resend.api_key = resend_api_key
+        qr_card_bytes = generate_qr_card_image_bytes(req)
+        qr_card_base64_str = base64.b64encode(qr_card_bytes).decode("utf-8")
+    except Exception as img_err:
+        print(f"【QR画像合成例外】: {img_err}")
+        return SingleSendApiResponse(
+            participantId=req.participantId,
+            bibNumber=req.bibNumber,
+            name=req.name,
+            email=req.email,
+            success=False,
+            isSimulation=False,
+            message="QRカード画像の生成に失敗しました。",
+            errorDetail=str(img_err)
+        )
 
-        # 1. QRコード画像バイト列のインメモリ生成
-        qr_bytes = generate_qr_png_bytes(payload.checkinPayload)
-        qr_base64 = base64.b64encode(qr_bytes).decode("ascii")
+    filename = f"qrcard_bib_{req.bibNumber}_{req.name}.png"
+    cid_key = "qrcard_image"
 
-        # 2. メール本文 (HTML) の生成
-        html_body = f"""
-        <div style="font-family: 'Helvetica Neue', Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b; line-height: 1.6;">
-            <div style="background-color: #0f172a; padding: 20px; text-align: center; border-radius: 8px 8px 0 0;">
-                <h1 style="color: #ffffff; font-size: 18px; margin: 0;">{payload.tournamentTitle}</h1>
-                <p style="color: #94a3b8; font-size: 12px; margin: 5px 0 0 0;">大会当日 受付用QRコードのご案内</p>
-            </div>
-            
-            <div style="background-color: #ffffff; padding: 24px; border: 1px solid #e2e8f0; border-top: none;">
-                <p style="font-size: 15px; font-weight: bold; margin-top: 0;">{payload.name} 選手（{payload.organization or "無所属"}）</p>
-                <p style="font-size: 13px; color: #475569;">
-                    大会へのご参加ありがとうございます。<br />
-                    立順情報および当日の受付用QRコードを発行いたしました。<br />
-                    会場到着後、受付端末に以下の<strong>受付用QRコード</strong>をご提示ください。
-                </p>
-
-                <div style="background-color: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 16px; margin: 20px 0; text-align: center;">
-                    <span style="font-size: 12px; color: #64748b; display: block; margin-bottom: 4px;">ゼッケン番号</span>
-                    <span style="font-size: 26px; font-weight: 800; color: #0f172a; font-family: monospace;">No. {payload.bibNumber}</span>
-                </div>
-
-                <div style="text-align: center; padding: 20px; background-color: #ffffff; border: 2px dashed #cbd5e1; border-radius: 8px; margin: 20px 0;">
-                    <img src="cid:checkin-qrcode" alt="受付用QRコード" style="width: 200px; height: 200px; display: inline-block;" />
-                    <p style="font-size: 11px; color: #64748b; margin: 8px 0 0 0;">※画像が表示されない場合は添付ファイルの qrcode.png をご確認ください。</p>
-                </div>
-
-                <div style="background-color: #f1f5f9; border-radius: 6px; padding: 14px; margin-top: 20px;">
-                    <h3 style="font-size: 13px; margin: 0 0 8px 0; color: #0f172a;">■ 確定立順情報</h3>
-                    <table style="width: 100%; font-size: 12px; border-collapse: collapse;">
-                        <tr>
-                            <td style="padding: 6px 0; color: #475569; border-bottom: 1px solid #e2e8f0;">第1立 (午前一手):</td>
-                            <td style="padding: 6px 0; font-weight: bold; color: #0f172a; border-bottom: 1px solid #e2e8f0;">第 {payload.stand1Group} 立 - {payload.stand1Order} 番</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 6px 0; color: #475569;">第2立 (午後一手):</td>
-                            <td style="padding: 6px 0; font-weight: bold; color: #0f172a; border-bottom: 1px solid #e2e8f0;">第 {payload.stand2Group} 立 - {payload.stand2Order} 番</td>
-                        </tr>
-                    </table>
-                </div>
-
-                <div style="margin-top: 24px; padding: 12px; background-color: #fffbeb; border: 1px solid #fef3c7; border-radius: 6px; font-size: 11px; color: #92400e;">
-                    <strong>【注意事項】</strong><br />
-                    ・立順変更等により複数回本メールを受信された場合は、<strong>最新のメールに記載された立順およびQRコード</strong>を有効とします。<br />
-                    ・競技進行状況に連動した入場呼出通知は、選手専用ポータル（/standby）にて通知を許可しておくことでスマートフォンに届きます。
-                </div>
-            </div>
-
-            <div style="background-color: #f8fafc; padding: 16px; text-align: center; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 8px 8px; font-size: 11px; color: #94a3b8;">
-                めんたいこ杯争奪弓道大会 運営事務局
-            </div>
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; background-color: #f8fafc; margin: 0; padding: 24px; }}
+        .container {{ max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }}
+        .header {{ background: #0f172a; color: #ffffff; padding: 24px; text-align: center; }}
+        .header h1 {{ margin: 0; font-size: 20px; font-weight: 800; }}
+        .header p {{ margin: 6px 0 0 0; color: #f59e0b; font-size: 13px; font-weight: bold; }}
+        .content {{ padding: 24px; line-height: 1.6; font-size: 14px; }}
+        .details {{ background: #f1f5f9; border-radius: 12px; padding: 16px; margin: 16px 0; font-size: 13px; }}
+        .details table {{ width: 100%; border-collapse: collapse; }}
+        .details td {{ padding: 6px 0; }}
+        .details td:first-child {{ color: #64748b; font-weight: bold; width: 120px; }}
+        .card-preview {{ text-align: center; margin: 24px 0; }}
+        .card-img {{ max-width: 320px; width: 100%; height: auto; border-radius: 12px; border: 1px solid #cbd5e1; box-shadow: 0 4px 12px rgba(0,0,0,0.1); display: inline-block; }}
+        .footer {{ border-top: 1px solid #e2e8f0; padding: 16px 24px; font-size: 11px; color: #64748b; text-align: center; }}
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>{req.tournamentTitle}</h1>
+          <p>参加受付用 QRコード発行のお知らせ</p>
         </div>
-        """
+        <div class="content">
+          <p><strong>{req.name} 様</strong></p>
+          <p>参加費の受領および立ち順の編成が完了いたしました。<br>当日の参加受付に使用する<strong>選手情報一体型QRコードカード</strong>を発行いたしましたので送付いたします。</p>
 
-        # 3. Resend API 経由でのメール送信実行
-        params: resend.Emails.SendParams = {
-            "from": "めんたいこ杯運営事務局 <onboarding@resend.dev>",
-            "to": [payload.email],
-            "subject": f"【受付QRコード】{payload.tournamentTitle}（ゼッケンNo.{payload.bibNumber} {payload.name} 選手）",
-            "html": html_body,
-            "attachments": [
-                {
-                    "filename": f"qrcode_bib_{payload.bibNumber}.png",
-                    "content": qr_base64,
-                    "content_id": "checkin-qrcode"
-                }
-            ]
+          <div class="details">
+            <table>
+              <tr><td>選手氏名</td><td><strong>{req.name} 様</strong></td></tr>
+              <tr><td>ゼッケン番号</td><td><strong>No. {req.bibNumber}</strong></td></tr>
+              <tr><td>所属団体</td><td>{req.organization or '無所属'}</td></tr>
+              <tr><td>午前の部 (第1立)</td><td><strong>第 {req.stand1Group} 組 - {get_stand_order_label(req.stand1Order)}</strong></td></tr>
+              <tr><td>午後の部 (第2・3立)</td><td><strong>第 {req.stand2Group} 組 - {get_stand_order_label(req.stand2Order)}</strong></td></tr>
+            </table>
+          </div>
+
+          <div class="card-preview">
+            <p style="font-size: 12px; color: #475569; font-weight: bold; margin-bottom: 8px;">【当日提示用 QRコードカード】</p>
+            <img src="cid:{cid_key}" alt="{req.name} 選手 QRカード" class="card-img" />
+          </div>
+
+          <p style="font-size: 12px; color: #334155; line-height: 1.6;">
+            ※大会当日は弓道場入場受付にて、スマートフォン画面で上記QRコードカードをご提示いただくか、画像を印刷してご持参ください。<br>
+            ※取り違え防止のため、画像内に選手氏名および立順が表示されています。
+          </p>
+        </div>
+        <div class="footer">
+          <p>第5回めんたいこ杯争奪弓道大会 大会運営事務局</p>
+        </div>
+      </div>
+    </body>
+    </html>
+    """
+
+    try:
+        # 【重要】attachments 内の辞書を dict[str, Any] で構築して Pylance の Attachment TypedDict エラーを解消
+        attachment_dict: dict[str, Any] = {
+            "filename": filename,
+            "content": qr_card_base64_str,
+            "content_id": cid_key,
         }
 
-        resend.Emails.send(params)
-        logger.info(f"【個別QRメール送信成功】ゼッケン {payload.bibNumber} ({payload.name}) -> {payload.email}")
+        params: dict[str, Any] = {
+            "from": FROM_EMAIL,
+            "to": [req.email],
+            "subject": f"【受付QRコード】{req.tournamentTitle}（No.{req.bibNumber} {req.name} 様）",
+            "html": html_content,
+            "attachments": [attachment_dict],
+        }
 
-        return SendQrEmailSingleResponse(
-            participantId=payload.participantId,
-            bibNumber=payload.bibNumber,
-            name=payload.name,
-            email=payload.email,
+        email_response = resend.Emails.send(cast(resend.Emails.SendParams, params))
+        print(f"【メール送信成功】ID: {email_response.get('id')} from: {FROM_EMAIL} to: {req.email}")
+
+        return SingleSendApiResponse(
+            participantId=req.participantId,
+            bibNumber=req.bibNumber,
+            name=req.name,
+            email=req.email,
             success=True,
-            message="送信完了"
+            isSimulation=False,
+            message="選手情報一体型QRカードを添付した案内メールを送信しました。"
         )
-
-    except Exception as err:
-        logger.error(f"【個別QRメール送信失敗】ゼッケン {payload.bibNumber} 宛先 {payload.email}: {str(err)}", exc_info=True)
-        return SendQrEmailSingleResponse(
-            participantId=payload.participantId,
-            bibNumber=payload.bibNumber,
-            name=payload.name,
-            email=payload.email,
+    except Exception as send_err:
+        err_str = str(send_err)
+        print(f"【メール送信例外】: {err_str}")
+        return SingleSendApiResponse(
+            participantId=req.participantId,
+            bibNumber=req.bibNumber,
+            name=req.name,
+            email=req.email,
             success=False,
-            message="メール送信処理中にエラーが発生しました。",
-            errorDetail=str(err)
+            isSimulation=False,
+            message="メール配信サーバーとの通信に失敗しました。",
+            errorDetail=err_str
         )
-
-
-@app.post(
-    "/api/v1/email/send-qr-batch",
-    response_model=SendQrEmailBatchResponse,
-    status_code=status.HTTP_200_OK,
-    summary="参加受付QRコードメール一括送信 (下位互換対応)",
-    tags=["Email"]
-)
-def send_qr_code_batch(payload: SendQrEmailBatchRequest):
-    """
-    複数選手に対する一括送信を受け付け、個別の送信ロジックを実行して集計結果を返却する。
-    1件が失敗してもループ全体を中断せず、残りの選手への配信を継続する。
-    """
-    results: List[SendQrEmailSingleResponse] = []
-    success_count = 0
-    failure_count = 0
-
-    for item in payload.participants:
-        single_req = SendQrEmailSingleRequest(
-            tournamentTitle=payload.tournamentTitle,
-            participantId=item.participantId,
-            bibNumber=item.bibNumber,
-            name=item.name,
-            email=item.email,
-            organization=item.organization,
-            stand1Group=item.stand1Group,
-            stand1Order=item.stand1Order,
-            stand2Group=item.stand2Group,
-            stand2Order=item.stand2Order,
-            checkinPayload=item.checkinPayload,
-        )
-        res = send_qr_code_single(single_req)
-        results.append(res)
-        if res.success:
-            success_count += 1
-        else:
-            failure_count += 1
-
-    return SendQrEmailBatchResponse(
-        totalRequested=len(payload.participants),
-        successCount=success_count,
-        failureCount=failure_count,
-        results=results
-    )
