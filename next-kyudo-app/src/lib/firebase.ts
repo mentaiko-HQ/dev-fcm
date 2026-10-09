@@ -1,149 +1,103 @@
 /**
- * 【Firebase Client SDK 初期化モジュール】
+ * 【Firebase SDK 初期化およびクライアント接続モジュール】
  *
  * 役割:
- * - Firebase App, Firestore, Auth, Messaging (FCM) の初期化およびシングルトン管理。
- * - 環境変数の静的検証と利用可否ステータスの提供。
+ * - Next.js クライアント環境において Firebase App、Firestore、Auth、Storage、Messaging を初期化。
+ * - 多重初期化の防止（getApps 照合）。
+ * - FCM Messaging インスタンス取得関数（getMessagingInstance）のエクスポート。
  *
- * フールプルーフ設計（操作ミス・環境差異の入口遮断）:
- * - Next.jsの仕様に準拠し、すべての環境変数を動的参照（process.env[key]）ではなく
- *   静的参照（process.env.NEXT_PUBLIC_*）で明示的に抽出し、ブラウザでの置換漏れを完全に排除。
- * - プレースホルダー文字列（your-project-id, AIzaSyXXX 等）が残存している場合は
- *   本番通信を行わず警告を出力。
- * - `isFirestoreAvailable` で `Firestore | null | undefined` を受け入れ、安全に型を絞り込む。
+ * フールプルーフ設計（未然のクラッシュ遮断）:
+ * - サーバーサイドレンダリング（SSR / SSG）実行時に window オブジェクトが存在しないため、
+ *   ブラウザ環境でのみ Messaging 初期化を実行。
+ * - 環境変数欠落時の安全な検知フラグ（isFirebaseConfigured）。
  *
  * フェイルセーフ設計（障害時の安全縮退）:
- * - 必須キーが欠落している場合でも、初期化例外（Invalid API key）で画面全体をクラッシュさせず、
- *   ダミー初期化を実行して `isFirebaseConfigured = false` を維持。
- * - SSR環境およびブラウザ環境を厳密に判定し、サーバーサイドでの Messaging 実行例外を防止。
- * - 重複初期化防止（getApps によるシングルトン再利用）。
+ * - Firebase Messaging の isSupported() によるブラウザ機能判定を実施し、
+ *   非対応ブラウザ（プライベートブラウズ、古い環境等）で例外を投げずに null を返却して安全縮退。
+ * - インスタンス生成エラー発生時はスタックトレースをログ出力し、null を返却。
  */
 
 import { initializeApp, getApps, getApp, FirebaseApp } from 'firebase/app';
 import { getFirestore, Firestore } from 'firebase/firestore';
 import { getAuth, Auth } from 'firebase/auth';
-import { getMessaging, Messaging, isSupported } from 'firebase/messaging';
-
-// 【フールプルーフ】静的参照による環境変数の個別抽出（Next.jsのインライン置換を保証）
-const rawApiKey = process.env.NEXT_PUBLIC_FIREBASE_API_KEY;
-const rawAuthDomain = process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN;
-const rawProjectId = process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID;
-const rawStorageBucket = process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET;
-const rawMessagingSenderId =
-  process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID;
-const rawAppId = process.env.NEXT_PUBLIC_FIREBASE_APP_ID;
-
-// 値の妥当性判定ヘルパー（空文字、未定義、プレースホルダーを排除）
-function isValidEnvValue(val: string | undefined): boolean {
-  if (!val) return false;
-  const trimmed = val.trim();
-  if (trimmed === '') return false;
-  if (
-    trimmed.includes('your-project-id') ||
-    trimmed.includes('AIzaSyXXX') ||
-    trimmed.includes('XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX') ||
-    trimmed.includes('your-app-id') ||
-    trimmed.includes('ここにFirebaseコンソールの')
-  ) {
-    return false;
-  }
-  return true;
-}
-
-// 各環境変数の検証
-export const envStatus = {
-  apiKey: isValidEnvValue(rawApiKey),
-  projectId: isValidEnvValue(rawProjectId),
-  messagingSenderId: isValidEnvValue(rawMessagingSenderId),
-  appId: isValidEnvValue(rawAppId),
-};
-
-export const isFirebaseConfigured: boolean =
-  envStatus.apiKey &&
-  envStatus.projectId &&
-  envStatus.messagingSenderId &&
-  envStatus.appId;
-
-// 不備がある場合のみコンソールへ警告を出力
-if (!isFirebaseConfigured && typeof window !== 'undefined') {
-  const missingList: string[] = [];
-  if (!envStatus.apiKey) missingList.push('NEXT_PUBLIC_FIREBASE_API_KEY');
-  if (!envStatus.projectId) missingList.push('NEXT_PUBLIC_FIREBASE_PROJECT_ID');
-  if (!envStatus.messagingSenderId)
-    missingList.push('NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID');
-  if (!envStatus.appId) missingList.push('NEXT_PUBLIC_FIREBASE_APP_ID');
-
-  console.warn(
-    `【Firebase設定警告】以下の環境変数が未設定または無効です (.env.local を確認してください):\n` +
-      missingList.map((k) => ` - ${k}`).join('\n') +
-      `\n※ .env.local 修正後は Next.js サーバー (npm run dev) の再起動が必要です。`,
-  );
-}
+import { getStorage, FirebaseStorage } from 'firebase/storage';
+import { getMessaging, isSupported, Messaging } from 'firebase/messaging';
 
 const firebaseConfig = {
-  apiKey: rawApiKey || '',
-  authDomain: rawAuthDomain || '',
-  projectId: rawProjectId || '',
-  storageBucket: rawStorageBucket || '',
-  messagingSenderId: rawMessagingSenderId || '',
-  appId: rawAppId || '',
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-// 【フェイルセーフ】初期化の重複防止と安全なインスタンス生成
-let appInstance: FirebaseApp;
+export const isFirebaseConfigured = Boolean(
+  process.env.NEXT_PUBLIC_FIREBASE_API_KEY &&
+  process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID &&
+  process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+);
 
-if (getApps().length > 0) {
-  appInstance = getApp();
-} else if (isFirebaseConfigured) {
-  appInstance = initializeApp(firebaseConfig);
+let app: FirebaseApp | undefined;
+let db: Firestore;
+let auth: Auth;
+let storage: FirebaseStorage;
+
+if (typeof window !== 'undefined' || getApps().length > 0) {
+  app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+  db = getFirestore(app);
+  auth = getAuth(app);
+  storage = getStorage(app);
 } else {
-  // 環境変数未設定時のフォールバック用ダミー初期化（即時クラッシュを防止）
-  appInstance = initializeApp(
-    {
-      apiKey: 'dummy-api-key-for-initialization-safety',
-      projectId: 'dummy-project-id',
-    },
-    'SAFE_FALLBACK_APP',
-  );
+  app = undefined;
+  db = null as unknown as Firestore;
+  auth = null as unknown as Auth;
+  storage = null as unknown as FirebaseStorage;
 }
 
-export const app: FirebaseApp = appInstance;
-export const db: Firestore = getFirestore(app);
-export const auth: Auth = getAuth(app);
-
-/**
- * 【フールプルーフ ＆ フェイルセーフ】
- * Firestore が正常に利用可能か判定するユーザー定義型ガード
- */
 export function isFirestoreAvailable(
   instance: Firestore | null | undefined,
-): instance is Firestore {
-  return isFirebaseConfigured && Boolean(instance);
+): boolean {
+  return Boolean(instance && isFirebaseConfigured);
 }
 
 /**
- * 【フェイルセーフ】
- * ブラウザかつFCM対応環境でのみMessagingインスタンスを解決する非同期プロバイダ
+ * 【FCM Messaging インスタンス安全取得関数】
+ *
+ * 判断基準:
+ * 1. SSR環境（window未定義）の場合は即座に null を返却。
+ * 2. Firebase App 未初期化時は null を返却。
+ * 3. ブラウザが FCM / ServiceWorker に対応しているか (isSupported) を非同期検証。
+ * 4. 非対応または初期化失敗時は例外を外へ漏らさず null を返却。
  */
-export const getMessagingInstance = async (): Promise<Messaging | null> => {
-  if (typeof window === 'undefined' || !isFirebaseConfigured) {
+export async function getMessagingInstance(): Promise<Messaging | null> {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  if (!app) {
+    console.warn(
+      '【FCM】Firebase App が初期化されていないため、Messagingを取得できません。',
+    );
     return null;
   }
 
   try {
     const supported = await isSupported();
-    if (supported) {
-      return getMessaging(app);
+    if (!supported) {
+      console.warn(
+        '【FCM】このブラウザ環境は Firebase Cloud Messaging (Web Push) に対応していません。',
+      );
+      return null;
     }
-    console.warn(
-      '【FCM非対応】ご利用のブラウザはFirebase Cloud Messagingをサポートしていません。',
-    );
-    return null;
+    return getMessaging(app);
   } catch (error: unknown) {
     console.error(
-      '【FCM初期化エラー】Messagingインスタンスの取得に失敗しました:',
+      '【FCM初期化エラー】Messaging インスタンスの生成に失敗しました:',
       error,
     );
     return null;
   }
-};
+}
+
+export { app, db, auth, storage };

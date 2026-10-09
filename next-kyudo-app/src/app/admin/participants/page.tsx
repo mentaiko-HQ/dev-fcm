@@ -1,995 +1,1070 @@
 /**
- * 【管理者向け参加者管理ページ】
+ * 【エントリー選手データ修正専用コンソールページ】
  * /admin/participants パスに対応するページコンポーネント。
- * 
+ *
  * 役割:
- * - 「エントリ・入金管理」「立順設定・選手修正」「受付QRコード送信」の3画面をタブ形式で統合提供。
- * - 第1立（午前一手）と第2立（午後一手）の立配置を独立して管理し、各列でのソートおよびモーダル編集を実行。
- * - 入金確認済みの選手に対して、受付用QRコードと最新立順情報を記載した案内メールを個別送信・再送信（QrSendTab連携）。
- * 
- * フールプルーフ設計（操作ミス・不正操作の入口遮断）:
- * - 型制約（SortKey, SortOrder, TabType）により未定義プロパティへのアクセスをコンパイル時および実行時で遮断。
- * - 選手氏名が空白のまま保存されることを防止するバリデーションチェック。
- * - 更新処理（handleSaveChanges, handleTogglePayment）の直前に auth.currentUser を検証し、セッションが存在しない場合は自動認証を実行。
- * - 保存処理中の二重送信防止（isSaving フラグによるボタン非活性化とスピナー表示）。
- * 
- * フェイルセーフ設計（障害時の安全縮退・耐障害性）:
- * - Firestore未接続時や通信障害時でも画面クラッシュを防止する安全ガードと詳細エラーログ出力。
- * - 旧データ形式（standAssignments未定義）に対してもデフォルト値（第1立1組1番）へ自動フォールバック。
+ * - PC・タブレット端末での高効率操作に特化し、画面横幅100%（全幅展開）で表示。
+ * - 参加選手属性（ゼッケン番号、氏名、ふりがな、所属団体、所作区分、称号・段位、配慮サポート希望、役員役割、役員シフト、備考）の確認・個別修正。
+ * - 各選手データのFirestore個別削除機能（確認モーダル・ローディング付き）。
+ * - 申込担当者（代表者氏名、メールアドレス）の表示。
+ * - 組番号・立順（射位）の編集UIを排除し、誤操作による編成事故を防止（立順編成は /admin/check で実施）。
+ *
+ * フールプルーフ設計（操作ミス・二重実行・誤削除の入口遮断）:
+ * - 削除ボタン押下時に即座に削除せず、専用の確認モーダルを表示して選手名・ゼッケン番号を明示再確認。
+ * - ゼッケン番号の重複をリアルタイムに検知し、重複時は警告表示とともに保存処理をブロック。
+ * - 各選手の保存処理・削除処理中はボタンを非活性化（disabled）およびスピナー表示し、多重送信を防止。
+ *
+ * フェイルセーフ設計（障害時の安全縮退）:
+ * - 更新・削除処理の例外を捕捉し、通信切断時でもクラッシュせずインラインエラー通知を表示。
+ * - 更新時に既存の立順配置データ（standAssignments）を破壊せず完全に維持。
+ * - standGroup, standOrder が null の既存データも安全に保持。
  */
 
-"use client";
+'use client';
 
-import React, { useState, useEffect, useMemo } from "react";
-import { useRouter } from "next/navigation";
-import { collection, onSnapshot, query, orderBy, doc, updateDoc } from "firebase/firestore";
-import { signInAnonymously } from "firebase/auth";
-import { db, auth, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
-import { Participant } from "@/types/participant";
-import { StandRoundIndex, ShosaType, RankTitleType, StaffRoleType } from "@/types";
-import { QrSendTab } from "@/components/admin/QrSendTab";
-import { Button } from "@/components/ui/button";
+import React, { useState, useEffect, useMemo } from 'react';
+import { useRouter } from 'next/navigation';
+import {
+  collection,
+  doc,
+  onSnapshot,
+  query,
+  updateDoc,
+  deleteDoc,
+  serverTimestamp,
+  orderBy,
+} from 'firebase/firestore';
+import { db, isFirebaseConfigured, isFirestoreAvailable } from '@/lib/firebase';
+import {
+  Participant,
+  StandRoundIndex,
+  StaffRoleType,
+  StaffDutyShiftType,
+  ShosaType,
+  RankTitleType,
+  StandOrderIndex,
+  sanitizeStandOrder,
+  sanitizeStandGroup,
+} from '@/types';
+import { Button } from '@/components/ui/button';
 import {
   ArrowLeft,
-  Users,
-  ShieldCheck,
-  CheckCircle2,
-  XCircle,
+  UserCog,
+  Save,
+  Trash2,
   Loader2,
-  SlidersHorizontal,
-  Edit2,
-  X,
-  Check,
+  CheckCircle2,
+  AlertCircle,
+  Users,
   ArrowUpDown,
   ArrowUp,
   ArrowDown,
-  QrCode
-} from "lucide-react";
+  Hash,
+  AlertTriangle,
+  Search,
+  Award,
+  Sparkles,
+  Mail,
+  X,
+} from 'lucide-react';
 
-type SortKey = "bibNumber" | "stand1" | "stand2" | "name" | "organization" | "isPaid";
-type SortOrder = "asc" | "desc";
-type TabType = "entry" | "schedule" | "qr_send";
+type SortKey =
+  | 'bibNumber'
+  | 'name'
+  | 'organization'
+  | 'shosa'
+  | 'rankTitle'
+  | 'staffRole'
+  | 'staffDutyShift';
 
-export default function AdminParticipantsPage() {
+type SortDirection = 'asc' | 'desc';
+
+const ROLE_PRIORITY: Record<StaffRoleType, number> = {
+  進行: 1,
+  的前: 2,
+  招集: 3,
+  記録: 4,
+  カメラマン: 5,
+  運営: 6,
+  無し: 7,
+};
+
+const SHIFT_PRIORITY: Record<StaffDutyShiftType, number> = {
+  AM: 1,
+  PM: 2,
+  終日: 3,
+  無し: 4,
+};
+
+export default function ParticipantsManagementPage() {
   const router = useRouter();
+
+  const isDbReady = isFirebaseConfigured && isFirestoreAvailable(db);
+
   const [participants, setParticipants] = useState<Participant[]>([]);
-  const [activeTab, setActiveTab] = useState<TabType>("entry");
-  const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState<boolean>(() => isDbReady);
+  const [savingId, setSavingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Participant | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string>('');
+  const [errorMessage, setErrorMessage] = useState<string>(() =>
+    !isDbReady
+      ? 'Firebaseデータベースに接続されていません。設定を確認してください。'
+      : '',
+  );
 
-  // ソート用状態管理
-  const [sortKey, setSortKey] = useState<SortKey>("bibNumber");
-  const [sortOrder, setSortOrder] = useState<SortOrder>("asc");
+  const [searchTerm, setSearchTerm] = useState<string>('');
+  const [sortKey, setSortKey] = useState<SortKey>('bibNumber');
+  const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
 
-  // モーダル編集用状態管理
-  const [selectedParticipant, setSelectedParticipant] = useState<Participant | null>(null);
-  const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
-  const [isSaving, setIsSaving] = useState<boolean>(false);
-  const [editForm, setEditForm] = useState<{
-    bibNumber: number;
-    standAssignments: Record<StandRoundIndex, { standGroup: number; standOrder: 1 | 2 | 3 | 4 | 5 }>;
-    name: string;
-    nameKana: string;
-    organization: string;
-    shosa: ShosaType;
-    rankTitle: RankTitleType;
-    representativeName: string;
-    representativePhone: string;
-    representativeEmail: string;
-    staffRole: StaffRoleType;
-    staffDutyShift: string;
-    notes: string;
-  }>({
-    bibNumber: 1,
-    standAssignments: {
-      1: { standGroup: 1, standOrder: 1 },
-      2: { standGroup: 1, standOrder: 1 },
-      3: { standGroup: 1, standOrder: 1 },
-    },
-    name: "",
-    nameKana: "",
-    organization: "",
-    shosa: "肌脱ぎ",
-    rankTitle: "段位は三段以下",
-    representativeName: "",
-    representativePhone: "",
-    representativeEmail: "",
-    staffRole: "無し",
-    staffDutyShift: "無し",
-    notes: "",
-  });
-
-  /**
-   * 【フールプルーフ】認証セッションの存在保証ヘルパー
-   * 未認証状態でのFirestore書き込みによる Missing or insufficient permissions を防止する。
-   */
-  const ensureAuthenticated = async (): Promise<void> => {
-    if (!auth) return;
-    if (!auth.currentUser) {
-      try {
-        await signInAnonymously(auth);
-      } catch (authErr) {
-        console.warn("【管理者認証警告】匿名認証の自動確立に失敗しました:", authErr);
-      }
-    }
-  };
-
-  /**
-   * 【Firestore entries コレクションのリアルタイム購読】
-   * 参加選手データをゼッケン番号順に取得し、立順情報を安全に正規化してセット。
-   */
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
-      console.warn("【Firebase未構成】Firestore接続が利用できないため購読をスキップします。");
       return;
     }
 
-    const firestoreInstance = db;
-    if (!firestoreInstance) return;
-
-    const q = query(collection(firestoreInstance, "entries"), orderBy("bibNumber", "asc"));
+    const q = query(collection(db, 'entries'), orderBy('bibNumber', 'asc'));
     const unsubscribe = onSnapshot(
       q,
       (snapshot) => {
         const loaded: Participant[] = [];
         snapshot.forEach((docSnap) => {
           const raw = docSnap.data();
-          
-          // 【フェイルセーフ】古いデータ形式や未設定値に対する安全フォールバック
           const rawAssignments = raw.standAssignments || {};
-          const safeAssignments: Record<StandRoundIndex, { standGroup: number; standOrder: 1 | 2 | 3 | 4 | 5 }> = {
+
+          const afternoonGroup = sanitizeStandGroup(
+            rawAssignments[2]?.standGroup ??
+              rawAssignments[3]?.standGroup ??
+              null,
+          );
+          const afternoonOrder = sanitizeStandOrder(
+            rawAssignments[2]?.standOrder ??
+              rawAssignments[3]?.standOrder ??
+              null,
+          );
+
+          const safeAssignments: Record<
+            StandRoundIndex,
+            { standGroup: number | null; standOrder: StandOrderIndex | null }
+          > = {
             1: {
-              standGroup: Number(rawAssignments[1]?.standGroup || raw.standGroup || 1),
-              standOrder: (Number(rawAssignments[1]?.standOrder || raw.standOrder || 1) as 1 | 2 | 3 | 4 | 5),
+              standGroup: sanitizeStandGroup(
+                rawAssignments[1]?.standGroup ?? null,
+              ),
+              standOrder: sanitizeStandOrder(
+                rawAssignments[1]?.standOrder ?? null,
+              ),
             },
             2: {
-              standGroup: Number(rawAssignments[2]?.standGroup || raw.standGroup || 1),
-              standOrder: (Number(rawAssignments[2]?.standOrder || raw.standOrder || 1) as 1 | 2 | 3 | 4 | 5),
+              standGroup: afternoonGroup,
+              standOrder: afternoonOrder,
             },
             3: {
-              standGroup: Number(rawAssignments[3]?.standGroup || 1),
-              standOrder: (Number(rawAssignments[3]?.standOrder || 1) as 1 | 2 | 3 | 4 | 5),
+              standGroup: afternoonGroup,
+              standOrder: afternoonOrder,
             },
           };
 
           loaded.push({
             id: docSnap.id,
-            bibNumber: typeof raw.bibNumber === "number" ? raw.bibNumber : Number(raw.bibNumber) || 1,
-            name: typeof raw.name === "string" ? raw.name : "選手名未設定",
-            nameKana: typeof raw.nameKana === "string" ? raw.nameKana : "",
-            organization: typeof raw.organization === "string" ? raw.organization : "",
-            shosa: raw.shosa || "肌脱ぎ",
-            rankTitle: raw.rankTitle || "段位は三段以下",
-            staffRole: raw.staffRole || "無し",
-            staffDutyShift: raw.staffDutyShift || "無し",
-            checkInStatus: raw.checkInStatus || "UNCHECKED",
-            checkInAt: raw.checkInAt || null,
+            bibNumber:
+              typeof raw.bibNumber === 'number'
+                ? raw.bibNumber
+                : Number(raw.bibNumber) || 1,
+            name: typeof raw.name === 'string' ? raw.name : '選手名未設定',
+            nameKana: typeof raw.nameKana === 'string' ? raw.nameKana : '',
+            organization:
+              typeof raw.organization === 'string' ? raw.organization : '',
+            shosa: raw.shosa === '襷掛け' ? '襷掛け' : '肌脱ぎ',
+            rankTitle:
+              raw.rankTitle === '称号を取得している' ||
+              raw.rankTitle === '段位は四段以上' ||
+              raw.rankTitle === '段位は三段以下'
+                ? raw.rankTitle
+                : '段位は三段以下',
+            staffRole: raw.staffRole || '無し',
+            staffDutyShift: raw.staffDutyShift || '無し',
+            checkInStatus: raw.checkInStatus || 'UNCHECKED',
+            checkInAt: typeof raw.checkInAt === 'number' ? raw.checkInAt : null,
             isStaffVolunteer: Boolean(raw.isStaffVolunteer),
             needsSupport: Boolean(raw.needsSupport),
             standAssignments: safeAssignments,
-            progressStatus: raw.progressStatus || "WAITING",
-            qualificationStatus: raw.qualificationStatus || "ACTIVE",
-            stand1_arrows: raw.stand1_arrows || [],
-            stand2_arrows: raw.stand2_arrows || [],
-            stand3_arrows: raw.stand3_arrows || [],
-            totalHits: raw.totalHits || 0,
-            totalShots: raw.totalShots || 8,
+            progressStatus: raw.progressStatus || 'WAITING',
+            qualificationStatus: raw.qualificationStatus || 'ACTIVE',
+            stand1_arrows: Array.isArray(raw.stand1_arrows)
+              ? raw.stand1_arrows
+              : [],
+            stand2_arrows: Array.isArray(raw.stand2_arrows)
+              ? raw.stand2_arrows
+              : [],
+            stand3_arrows: Array.isArray(raw.stand3_arrows)
+              ? raw.stand3_arrows
+              : [],
+            isHayaHit: Boolean(raw.isHayaHit),
+            totalHits:
+              typeof raw.totalHits === 'number'
+                ? raw.totalHits
+                : Number(raw.totalHits) || 0,
+            totalShots:
+              typeof raw.totalShots === 'number'
+                ? raw.totalShots
+                : Number(raw.totalShots) || 8,
             isPerfect: Boolean(raw.isPerfect),
-            enkinRank: raw.enkinRank || null,
-            finalRank: raw.finalRank || null,
-            representativeName: raw.representativeName || "",
-            representativeEmail: raw.representativeEmail || "",
-            representativePhone: raw.representativePhone || "",
-            representativeOrganization: raw.representativeOrganization || "",
+            enkinRank: typeof raw.enkinRank === 'number' ? raw.enkinRank : null,
+            finalRank: typeof raw.finalRank === 'number' ? raw.finalRank : null,
+            representativeName:
+              typeof raw.representativeName === 'string'
+                ? raw.representativeName
+                : '',
+            representativeEmail:
+              typeof raw.representativeEmail === 'string'
+                ? raw.representativeEmail
+                : '',
+            representativePhone:
+              typeof raw.representativePhone === 'string'
+                ? raw.representativePhone
+                : '',
+            representativeOrganization:
+              typeof raw.representativeOrganization === 'string'
+                ? raw.representativeOrganization
+                : '',
             isPaid: Boolean(raw.isPaid),
-            paidAt: raw.paidAt || null,
-            notes: raw.notes || "",
-            qrSentAt: raw.qrSentAt || null,
-            qrSentStatus: raw.qrSentStatus || "UNSENT",
+            paidAt: typeof raw.paidAt === 'number' ? raw.paidAt : null,
+            notes: typeof raw.notes === 'string' ? raw.notes : '',
+            qrSentAt: typeof raw.qrSentAt === 'number' ? raw.qrSentAt : null,
+            qrSentStatus: raw.qrSentStatus || 'UNSENT',
             qrSentError: raw.qrSentError || null,
-            updatedAt: raw.updatedAt || undefined,
+            agreedAt:
+              typeof raw.agreedAt === 'number' ? raw.agreedAt : undefined,
+            updatedAt:
+              typeof raw.updatedAt === 'number' ? raw.updatedAt : undefined,
+            userId: typeof raw.userId === 'string' ? raw.userId : undefined,
           });
         });
+
         setParticipants(loaded);
+        setIsLoading(false);
       },
-      (error) => {
-        console.error("【Firestore購読例外】entries取得に失敗しました:", error);
-      }
+      (err) => {
+        console.error('【Firestore購読エラー】:', err);
+        setErrorMessage('参加者データの読み込みに失敗しました。');
+        setIsLoading(false);
+      },
     );
 
     return () => unsubscribe();
   }, []);
 
-  /**
-   * 【入金ステータス切替ハンドラー】
-   */
-  const handleTogglePayment = async (participant: Participant) => {
-    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
-      alert("データベースが利用可能な状態ではありません。");
-      return;
-    }
-
-    const firestoreInstance = db;
-    if (!firestoreInstance) return;
-
-    await ensureAuthenticated();
-
-    const nextIsPaid = !participant.isPaid;
-    const now = Date.now();
-    setUpdatingId(participant.id);
-
-    try {
-      const docRef = doc(firestoreInstance, "entries", participant.id);
-      await updateDoc(docRef, {
-        isPaid: nextIsPaid,
-        paidAt: nextIsPaid ? now : null,
-        updatedAt: now,
-      });
-    } catch (err) {
-      console.error("【入金ステータス更新例外】:", err);
-      alert("入金ステータスの更新に失敗しました。権限設定および通信環境を確認してください。");
-    } finally {
-      setUpdatingId(null);
-    }
-  };
-
-  /**
-   * 【ソート切り替えハンドラー】
-   */
-  const handleSort = (key: SortKey) => {
-    if (sortKey === key) {
-      setSortOrder((prev) => (prev === "asc" ? "desc" : "asc"));
-    } else {
-      setSortKey(key);
-      setSortOrder("asc");
-    }
-  };
-
-  /**
-   * 【ソートアイコン描画ヘルパー】
-   */
-  const renderSortIcon = (key: SortKey) => {
-    if (sortKey !== key) {
-      return <ArrowUpDown className="w-3.5 h-3.5 text-slate-300" />;
-    }
-    return sortOrder === "asc" ? (
-      <ArrowUp className="w-3.5 h-3.5 text-slate-900" />
-    ) : (
-      <ArrowDown className="w-3.5 h-3.5 text-slate-900" />
-    );
-  };
-
-  /**
-   * 【モーダルオープン処理】
-   */
-  const handleOpenEditModal = (p: Participant) => {
-    setSelectedParticipant(p);
-    setEditForm({
-      bibNumber: p.bibNumber,
-      standAssignments: JSON.parse(JSON.stringify(p.standAssignments)),
-      name: p.name,
-      nameKana: p.nameKana || "",
-      organization: p.organization,
-      shosa: p.shosa,
-      rankTitle: (p.rankTitle as RankTitleType) || "段位は三段以下",
-      representativeName: p.representativeName || "",
-      representativePhone: p.representativePhone || "",
-      representativeEmail: p.representativeEmail || "",
-      staffRole: p.staffRole,
-      staffDutyShift: p.staffDutyShift || "無し",
-      notes: p.notes || "",
+  const duplicateBibNumbers = useMemo(() => {
+    const counts = new Map<number, number>();
+    participants.forEach((p) => {
+      counts.set(p.bibNumber, (counts.get(p.bibNumber) || 0) + 1);
     });
-    setIsModalOpen(true);
-  };
+    const duplicates = new Set<number>();
+    counts.forEach((count, bib) => {
+      if (count > 1) {
+        duplicates.add(bib);
+      }
+    });
+    return duplicates;
+  }, [participants]);
 
-  const handleCloseModal = () => {
-    setIsModalOpen(false);
-    setSelectedParticipant(null);
-  };
+  const filteredAndSortedParticipants = useMemo(() => {
+    const filtered = participants.filter((p) => {
+      if (!searchTerm.trim()) return true;
+      const term = searchTerm.trim().toLowerCase();
+      return (
+        p.name.toLowerCase().includes(term) ||
+        p.nameKana.toLowerCase().includes(term) ||
+        p.organization.toLowerCase().includes(term) ||
+        p.bibNumber.toString().includes(term) ||
+        p.representativeName.toLowerCase().includes(term) ||
+        p.representativeEmail.toLowerCase().includes(term) ||
+        p.notes.toLowerCase().includes(term)
+      );
+    });
 
-  /**
-   * 【データ保存処理】
-   */
-  const handleSaveChanges = async () => {
-    if (!selectedParticipant) return;
-    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
-      alert("Firestoreデータベースが利用可能な状態ではありません。");
-      return;
-    }
-
-    const firestoreInstance = db;
-    if (!firestoreInstance) return;
-
-    // 【フールプルーフ】必須入力バリデーション
-    if (!editForm.name.trim()) {
-      alert("選手氏名は必須です。");
-      return;
-    }
-
-    // 【フールプルーフ】認証セッションの事前確立
-    await ensureAuthenticated();
-
-    setIsSaving(true);
-    const now = Date.now();
-
-    try {
-      const docRef = doc(firestoreInstance, "entries", selectedParticipant.id);
-      await updateDoc(docRef, {
-        bibNumber: Number(editForm.bibNumber) || 1,
-        standAssignments: editForm.standAssignments,
-        name: editForm.name.trim(),
-        nameKana: editForm.nameKana.trim(),
-        organization: editForm.organization.trim(),
-        shosa: editForm.shosa,
-        rankTitle: editForm.rankTitle,
-        representativeName: editForm.representativeName.trim(),
-        representativePhone: editForm.representativePhone.trim(),
-        representativeEmail: editForm.representativeEmail.trim(),
-        staffRole: editForm.staffRole,
-        staffDutyShift: editForm.staffDutyShift,
-        notes: editForm.notes.trim(),
-        updatedAt: now,
-      });
-
-      handleCloseModal();
-    } catch (err) {
-      console.error("【選手データ更新例外】詳細ログ:", err);
-      alert("選手データの更新に失敗しました。Firestoreのセキュリティルールまたは権限設定をご確認ください。");
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  const entryParticipants = participants.filter((p) => !p.isPaid);
-  const scheduleParticipants = participants.filter((p) => p.isPaid);
-
-  /**
-   * 【立順設定タブ用のソート済み参加者配列】
-   */
-  const sortedScheduleParticipants = useMemo(() => {
-    const list = [...scheduleParticipants];
-    return list.sort((a, b) => {
+    filtered.sort((a, b) => {
       let comparison = 0;
 
       switch (sortKey) {
-        case "bibNumber":
+        case 'bibNumber':
           comparison = a.bibNumber - b.bibNumber;
           break;
-        case "stand1": {
-          const a1 = a.standAssignments?.[1] || { standGroup: 999, standOrder: 999 };
-          const b1 = b.standAssignments?.[1] || { standGroup: 999, standOrder: 999 };
-          if (a1.standGroup !== b1.standGroup) {
-            comparison = a1.standGroup - b1.standGroup;
-          } else {
-            comparison = a1.standOrder - b1.standOrder;
-          }
+        case 'name':
+          comparison = a.nameKana.localeCompare(b.nameKana, 'ja');
+          break;
+        case 'organization':
+          comparison = a.organization.localeCompare(b.organization, 'ja');
+          break;
+        case 'shosa':
+          comparison = a.shosa.localeCompare(b.shosa, 'ja');
+          break;
+        case 'rankTitle':
+          comparison = a.rankTitle.localeCompare(b.rankTitle, 'ja');
+          break;
+        case 'staffRole': {
+          const pA = ROLE_PRIORITY[a.staffRole] ?? 99;
+          const pB = ROLE_PRIORITY[b.staffRole] ?? 99;
+          comparison = pA - pB;
           break;
         }
-        case "stand2": {
-          const a2 = a.standAssignments?.[2] || { standGroup: 999, standOrder: 999 };
-          const b2 = b.standAssignments?.[2] || { standGroup: 999, standOrder: 999 };
-          if (a2.standGroup !== b2.standGroup) {
-            comparison = a2.standGroup - b2.standGroup;
-          } else {
-            comparison = a2.standOrder - b2.standOrder;
-          }
-          break;
-        }
-        case "name": {
-          const nameA = a.nameKana || a.name;
-          const nameB = b.nameKana || b.name;
-          comparison = nameA.localeCompare(nameB, "ja");
-          break;
-        }
-        case "organization": {
-          const orgA = a.organization || "";
-          const orgB = b.organization || "";
-          comparison = orgA.localeCompare(orgB, "ja");
-          break;
-        }
-        case "isPaid": {
-          const paidA = a.isPaid ? 1 : 0;
-          const paidB = b.isPaid ? 1 : 0;
-          comparison = paidA - paidB;
+        case 'staffDutyShift': {
+          const pA = SHIFT_PRIORITY[a.staffDutyShift] ?? 99;
+          const pB = SHIFT_PRIORITY[b.staffDutyShift] ?? 99;
+          comparison = pA - pB;
           break;
         }
         default:
-          comparison = 0;
+          comparison = a.bibNumber - b.bibNumber;
+          break;
       }
 
-      return sortOrder === "asc" ? comparison : comparison * -1;
+      if (comparison === 0) {
+        comparison = a.bibNumber - b.bibNumber;
+      }
+
+      return sortDirection === 'asc' ? comparison : -comparison;
     });
-  }, [scheduleParticipants, sortKey, sortOrder]);
+
+    return filtered;
+  }, [participants, searchTerm, sortKey, sortDirection]);
+
+  const handleToggleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortKey(key);
+      setSortDirection('asc');
+    }
+  };
+
+  const handleChangeBibNumber = (id: string, rawVal: string) => {
+    const num = parseInt(rawVal, 10);
+    const validBib = isNaN(num) || num < 1 ? 1 : num;
+
+    setParticipants((prev) =>
+      prev.map((p) => (p.id === id ? { ...p, bibNumber: validBib } : p)),
+    );
+  };
+
+  const handleChangeField = (
+    id: string,
+    field: 'name' | 'nameKana' | 'organization' | 'notes',
+    value: string,
+  ) => {
+    setParticipants((prev) =>
+      prev.map((p) => (p.id === id ? { ...p, [field]: value } : p)),
+    );
+  };
+
+  const handleChangeSelectField = (
+    id: string,
+    field:
+      | 'shosa'
+      | 'rankTitle'
+      | 'staffRole'
+      | 'staffDutyShift'
+      | 'needsSupport',
+    value: unknown,
+  ) => {
+    setParticipants((prev) =>
+      prev.map((p) => (p.id === id ? { ...p, [field]: value } : p)),
+    );
+  };
+
+  const handleUpdateParticipant = async (participant: Participant) => {
+    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
+
+    if (duplicateBibNumbers.has(participant.bibNumber)) {
+      setErrorMessage(
+        `ゼッケンNo.${participant.bibNumber} が他の選手と重複しています。一意の番号に修正してください。`,
+      );
+      return;
+    }
+
+    if (!participant.name.trim()) {
+      setErrorMessage(
+        `ゼッケンNo.${participant.bibNumber} の選手氏名が入力されていません。`,
+      );
+      return;
+    }
+
+    setSavingId(participant.id);
+    setErrorMessage('');
+
+    try {
+      const docRef = doc(db, 'entries', participant.id);
+      await updateDoc(docRef, {
+        bibNumber: participant.bibNumber,
+        name: participant.name.trim(),
+        nameKana: participant.nameKana.trim(),
+        organization: participant.organization.trim(),
+        shosa: participant.shosa,
+        rankTitle: participant.rankTitle,
+        needsSupport: participant.needsSupport,
+        staffRole: participant.staffRole,
+        staffDutyShift: participant.staffDutyShift,
+        notes: participant.notes.trim(),
+        updatedAt: serverTimestamp(),
+      });
+
+      setSuccessMessage(
+        `ゼッケンNo.${participant.bibNumber} ${participant.name} 選手の登録情報を更新しました。`,
+      );
+      setTimeout(() => setSuccessMessage(''), 2500);
+    } catch (err: unknown) {
+      console.error('【選手情報更新エラー】:', err);
+      setErrorMessage('更新に失敗しました。通信環境を確認してください。');
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  /**
+   * 【選手削除実行ハンドラー】
+   */
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget || !isFirebaseConfigured || !isFirestoreAvailable(db))
+      return;
+
+    setDeletingId(deleteTarget.id);
+    setErrorMessage('');
+
+    try {
+      const docRef = doc(db, 'entries', deleteTarget.id);
+      await deleteDoc(docRef);
+
+      setSuccessMessage(
+        `ゼッケンNo.${deleteTarget.bibNumber} ${deleteTarget.name} 選手のデータを削除しました。`,
+      );
+      setTimeout(() => setSuccessMessage(''), 2500);
+      setDeleteTarget(null);
+    } catch (err: unknown) {
+      console.error('【選手削除エラー】:', err);
+      setErrorMessage('削除処理に失敗しました。通信環境を確認してください。');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="min-h-[60vh] flex flex-col items-center justify-center p-8 text-slate-500 w-full">
+        <Loader2 className="w-8 h-8 animate-spin mb-2 text-slate-900" />
+        <span className="text-xs font-mono font-bold">
+          参加選手データを取得中...
+        </span>
+      </div>
+    );
+  }
 
   return (
-    <main className="min-h-screen bg-[#F8FAFC] text-slate-900 p-4 md:p-8 space-y-6">
-      <div className="max-w-7xl mx-auto space-y-6">
-        
-        {/* ヘッダーセクション */}
-        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between bg-white border border-slate-200/80 rounded-2xl p-6 shadow-sm gap-4">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-bold bg-slate-900 text-white px-3 py-1 rounded-full flex items-center gap-1 shadow-2xs">
-                <ShieldCheck className="w-3.5 h-3.5 text-amber-400" /> 管理者専用
-              </span>
-              <span className="text-xs font-semibold text-slate-600 bg-slate-100 px-2.5 py-0.5 rounded-md">
-                第5回めんたいこ杯
-              </span>
-            </div>
-            <h1 className="text-xl md:text-2xl font-black tracking-tight text-slate-900 flex items-center gap-2 pt-1">
-              <Users className="w-6 h-6 text-slate-700" />
-              参加選手一覧 ＆ 入金管理・立順設定ダッシュボード
-            </h1>
-            <p className="text-xs text-slate-500 font-medium">
-              午前一手（第1立・2射）と午後一手（第2立・2射）の立配置、および個別QRコード受付案内メールの配信を管理します。
-            </p>
+    <main className="p-4 sm:p-6 lg:p-8 space-y-6 w-full text-slate-900">
+      <div className="w-full flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white border border-slate-200/80 p-6 rounded-2xl shadow-sm">
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-bold bg-slate-900 text-white px-3 py-1 rounded-full flex items-center gap-1 shadow-2xs">
+              <UserCog className="w-3.5 h-3.5 text-amber-400" /> 参加者名簿管理
+            </span>
+            <span className="text-xs font-semibold text-slate-600 bg-slate-100 px-2.5 py-0.5 rounded-md">
+              エントリー属性修正・データ管理
+            </span>
           </div>
-
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => router.push("/")}
-            className="text-xs font-bold border-slate-200 bg-white hover:bg-slate-50 text-slate-800 shadow-2xs"
-          >
-            <ArrowLeft className="w-3.5 h-3.5 mr-1 text-slate-500" /> ポータルトップへ戻る
-          </Button>
+          <h1 className="text-xl md:text-2xl font-black text-slate-900 flex items-center gap-2 pt-1">
+            <Users className="w-6 h-6 text-slate-700" />
+            エントリー参加選手データ修正コンソール
+          </h1>
+          <p className="text-xs text-slate-500 font-medium">
+            選手名、ふりがな、所属団体、所作区分、称号・段位、配慮事項、役員シフト、ゼッケン番号の修正および登録削除を行えます。（※立ち順・組編成の変更は「/admin/check」で行います）
+          </p>
         </div>
 
-        {/* タブ切り替えUIボタン群 */}
-        <div className="flex border-b border-slate-200 gap-2">
-          {/* タブ1: エントリ・入金管理 */}
-          <button
-            type="button"
-            onClick={() => setActiveTab("entry")}
-            className={`px-6 py-3 text-xs md:text-sm font-bold border-b-2 transition-all flex items-center gap-2 ${
-              activeTab === "entry"
-                ? "border-slate-900 text-slate-900 bg-white rounded-t-xl shadow-xs"
-                : "border-transparent text-slate-400 hover:text-slate-700"
-            }`}
-          >
-            <Users className="w-4 h-4" />
-            エントリ・入金管理
-            <span className="ml-2 px-2 py-0.5 text-[10px] bg-slate-100 text-slate-800 rounded-full font-mono font-bold">
-              {entryParticipants.length}名
-            </span>
-          </button>
-
-          {/* タブ2: 立順設定・選手修正 */}
-          <button
-            type="button"
-            onClick={() => setActiveTab("schedule")}
-            className={`px-6 py-3 text-xs md:text-sm font-bold border-b-2 transition-all flex items-center gap-2 ${
-              activeTab === "schedule"
-                ? "border-slate-900 text-slate-900 bg-white rounded-t-xl shadow-xs"
-                : "border-transparent text-slate-400 hover:text-slate-700"
-            }`}
-          >
-            <SlidersHorizontal className="w-4 h-4" />
-            立順設定・選手修正
-            <span className="ml-2 px-2 py-0.5 text-[10px] bg-slate-100 text-slate-800 rounded-full font-mono font-bold">
-              {scheduleParticipants.length}名
-            </span>
-          </button>
-
-          {/* タブ3: 受付QRコード個別送信 */}
-          <button
-            type="button"
-            onClick={() => setActiveTab("qr_send")}
-            className={`px-6 py-3 text-xs md:text-sm font-bold border-b-2 transition-all flex items-center gap-2 ${
-              activeTab === "qr_send"
-                ? "border-slate-900 text-slate-900 bg-white rounded-t-xl shadow-xs"
-                : "border-transparent text-slate-400 hover:text-slate-700"
-            }`}
-          >
-            <QrCode className="w-4 h-4" />
-            受付QRコード送信
-            <span className="ml-2 px-2 py-0.5 text-[10px] bg-slate-100 text-slate-800 rounded-full font-mono font-bold">
-              {scheduleParticipants.length}名
-            </span>
-          </button>
-        </div>
-
-        {/* タブコンテンツ1: エントリ・入金管理 */}
-        {activeTab === "entry" && (
-          <div className="bg-white border border-slate-200/80 rounded-2xl p-6 space-y-4 shadow-sm">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <h3 className="font-bold text-slate-900 text-sm">未入金・エントリ確認一覧</h3>
-              <p className="text-xs text-slate-500 font-medium">「未入金 (入金済みにする)」を押下すると、立順設定・QRコード送信対象へ移動します。</p>
-            </div>
-
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs text-left">
-                <thead className="bg-slate-50/80 text-slate-700 font-bold border-b border-slate-200">
-                  <tr>
-                    <th className="p-3.5">ゼッケン</th>
-                    <th className="p-3.5">選手氏名</th>
-                    <th className="p-3.5">所属団体名</th>
-                    <th className="p-3.5">所作 / 段位</th>
-                    <th className="p-3.5 text-center">入金ステータス変更</th>
-                    <th className="p-3.5 text-center">操作</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {entryParticipants.length > 0 ? (
-                    entryParticipants.map((p) => {
-                      const isUpdating = updatingId === p.id;
-                      return (
-                        <tr key={p.id} className="hover:bg-slate-50/60 transition-colors">
-                          <td className="p-3.5 font-mono font-bold text-slate-900">No.{p.bibNumber}</td>
-                          <td className="p-3.5 font-bold text-slate-900">
-                            <div>{p.name}</div>
-                            <div className="text-[10px] text-slate-400 font-normal">{p.nameKana}</div>
-                          </td>
-                          <td className="p-3.5 text-slate-700 font-medium">{p.organization || "-"}</td>
-                          <td className="p-3.5 text-slate-600 font-medium">
-                            <div>{p.shosa}</div>
-                            <div className="text-[10px] text-slate-400 font-normal">{p.rankTitle}</div>
-                          </td>
-                          <td className="p-3.5 text-center">
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              disabled={isUpdating}
-                              onClick={() => handleTogglePayment(p)}
-                              className="h-7 px-3 text-[11px] font-bold bg-amber-50/80 border-amber-300 text-amber-900 hover:bg-amber-100 shadow-2xs"
-                            >
-                              {isUpdating ? <Loader2 className="w-3.5 h-3.5 animate-spin mr-1" /> : <XCircle className="w-3.5 h-3.5 text-amber-600 mr-1" />}
-                              未入金 (入金済みにする)
-                            </Button>
-                          </td>
-                          <td className="p-3.5 text-center">
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              onClick={() => handleOpenEditModal(p)}
-                              className="h-7 px-2.5 text-[11px] font-bold border-slate-200 bg-white hover:bg-slate-50 text-slate-800 shadow-2xs"
-                            >
-                              <Edit2 className="w-3 h-3 mr-1 text-slate-500" /> 修正
-                            </Button>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  ) : (
-                    <tr>
-                      <td colSpan={6} className="py-16 text-center text-slate-400 font-medium">
-                        未入金の選手は現在いません。
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {/* タブコンテンツ2: 立順設定・選手修正 */}
-        {activeTab === "schedule" && (
-          <div className="bg-white border border-slate-200/80 rounded-2xl p-6 space-y-4 shadow-sm">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div>
-                <h3 className="font-bold text-slate-900 text-sm">入金済みの選手一覧（第1・第2立の立順設定対象）</h3>
-                <p className="text-xs text-slate-500 font-medium mt-0.5">
-                  各列のヘッダーをクリックして並び替えを行い、「修正」ボタンから立順・選手情報を変更できます。
-                </p>
-              </div>
-              <Button
-                type="button"
-                size="sm"
-                onClick={() => setActiveTab("qr_send")}
-                className="bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs shadow-2xs"
-              >
-                <QrCode className="w-3.5 h-3.5 mr-1 text-amber-400" />
-                QRコード送信画面へ進む
-              </Button>
-            </div>
-
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs text-left">
-                <thead className="bg-slate-50/80 text-slate-700 font-bold border-b border-slate-200">
-                  <tr>
-                    {/* ゼッケンソートヘッダー */}
-                    <th
-                      className="p-3.5 cursor-pointer select-none hover:bg-slate-100/80 transition-colors"
-                      onClick={() => handleSort("bibNumber")}
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span>ゼッケン</span>
-                        {renderSortIcon("bibNumber")}
-                      </div>
-                    </th>
-
-                    {/* 立配置第1立ソートヘッダー */}
-                    <th
-                      className="p-3.5 cursor-pointer select-none hover:bg-slate-100/80 transition-colors"
-                      onClick={() => handleSort("stand1")}
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span>立配置第1立 (午前一手)</span>
-                        {renderSortIcon("stand1")}
-                      </div>
-                    </th>
-
-                    {/* 立配置第2立ソートヘッダー */}
-                    <th
-                      className="p-3.5 cursor-pointer select-none hover:bg-slate-100/80 transition-colors"
-                      onClick={() => handleSort("stand2")}
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span>立配置第2立 (午後一手)</span>
-                        {renderSortIcon("stand2")}
-                      </div>
-                    </th>
-
-                    {/* 選手氏名ソートヘッダー */}
-                    <th
-                      className="p-3.5 cursor-pointer select-none hover:bg-slate-100/80 transition-colors"
-                      onClick={() => handleSort("name")}
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span>選手氏名</span>
-                        {renderSortIcon("name")}
-                      </div>
-                    </th>
-
-                    {/* 所属団体名ソートヘッダー */}
-                    <th
-                      className="p-3.5 cursor-pointer select-none hover:bg-slate-100/80 transition-colors"
-                      onClick={() => handleSort("organization")}
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span>所属団体名</span>
-                        {renderSortIcon("organization")}
-                      </div>
-                    </th>
-
-                    {/* 入金状態ソートヘッダー */}
-                    <th
-                      className="p-3.5 text-center cursor-pointer select-none hover:bg-slate-100/80 transition-colors"
-                      onClick={() => handleSort("isPaid")}
-                    >
-                      <div className="flex items-center justify-center gap-1.5">
-                        <span>入金状態</span>
-                        {renderSortIcon("isPaid")}
-                      </div>
-                    </th>
-
-                    <th className="p-3.5 text-center">操作</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {sortedScheduleParticipants.length > 0 ? (
-                    sortedScheduleParticipants.map((p) => {
-                      const isUpdating = updatingId === p.id;
-                      const a1 = p.standAssignments?.[1] || { standGroup: 1, standOrder: 1 };
-                      const a2 = p.standAssignments?.[2] || { standGroup: 1, standOrder: 1 };
-
-                      return (
-                        <tr key={p.id} className="hover:bg-slate-50/60 transition-colors">
-                          <td className="p-3.5 font-mono font-bold text-slate-900">No.{p.bibNumber}</td>
-                          
-                          <td className="p-3.5 font-semibold text-slate-800">
-                            第{a1.standGroup}立 - <span className="text-slate-900 font-bold">{a1.standOrder}番</span>
-                          </td>
-
-                          <td className="p-3.5 font-semibold text-slate-800">
-                            第{a2.standGroup}立 - <span className="text-slate-900 font-bold">{a2.standOrder}番</span>
-                          </td>
-
-                          <td className="p-3.5 font-bold text-slate-900">
-                            <div>{p.name}</div>
-                            <div className="text-[10px] text-slate-400 font-normal">{p.nameKana}</div>
-                          </td>
-                          <td className="p-3.5 text-slate-700 font-medium">{p.organization || "-"}</td>
-                          
-                          <td className="p-3.5 text-center">
-                            <div className="flex items-center justify-center gap-2">
-                              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-300">
-                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 mr-1" /> 入金済み
-                              </span>
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                disabled={isUpdating}
-                                onClick={() => handleTogglePayment(p)}
-                                className="h-7 px-2 text-[10px] font-bold text-slate-500 border-slate-200 hover:bg-slate-50 shadow-2xs"
-                              >
-                                未に戻す
-                              </Button>
-                            </div>
-                          </td>
-
-                          <td className="p-3.5 text-center">
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              onClick={() => handleOpenEditModal(p)}
-                              className="h-7 px-2.5 text-[11px] font-bold border-slate-200 bg-white hover:bg-slate-50 text-slate-800 shadow-2xs"
-                            >
-                              <Edit2 className="w-3 h-3 mr-1 text-slate-500" /> 修正
-                            </Button>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  ) : (
-                    <tr>
-                      <td colSpan={7} className="py-16 text-center text-slate-400 font-medium">
-                        入金済みの選手がまだいません。「エントリ・入金管理」タブから入金状態を切り替えてください。
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {/* タブコンテンツ3: 受付QRコード個別送信 */}
-        {activeTab === "qr_send" && (
-          <QrSendTab
-            participants={scheduleParticipants}
-            onRefresh={() => {
-              // Firestore の onSnapshot により自動更新されるため空ハンドラーを渡す
-            }}
-          />
-        )}
-
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => router.push('/admin')}
+          className="text-xs bg-white border-slate-200 text-slate-700 hover:bg-slate-50 font-bold self-start md:self-auto h-9"
+        >
+          <ArrowLeft className="w-3.5 h-3.5 mr-1" />
+          本部ダッシュボードへ戻る
+        </Button>
       </div>
 
-      {/* 選手データ編集用モーダルウィンドウ */}
-      {isModalOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-white rounded-2xl p-6 max-w-2xl w-full shadow-2xl border border-slate-200/80 space-y-4 my-8">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <h3 className="font-black text-slate-900 text-base flex items-center gap-2">
-                <Edit2 className="w-4 h-4 text-slate-700" /> 選手詳細・立順設定修正
-              </h3>
+      {successMessage && (
+        <div className="w-full p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 text-xs font-bold flex items-center gap-2">
+          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+          <span>{successMessage}</span>
+        </div>
+      )}
+
+      {errorMessage && (
+        <div className="w-full p-3.5 bg-red-50 border border-red-200 rounded-xl text-red-700 text-xs font-bold flex items-center gap-2">
+          <AlertCircle className="w-4 h-4 shrink-0 text-red-600" />
+          <span>{errorMessage}</span>
+        </div>
+      )}
+
+      {duplicateBibNumbers.size > 0 && (
+        <div className="w-full p-4 bg-red-50 border border-red-200 rounded-xl text-red-900 text-xs flex items-start gap-2.5">
+          <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+          <div className="space-y-0.5">
+            <p className="font-bold text-red-800">
+              ゼッケン番号の重複を検知しました（重複番号:{' '}
+              {Array.from(duplicateBibNumbers).join(', ')}）
+            </p>
+            <p className="text-[11px] text-red-700">
+              ※同一のゼッケン番号を持つ選手は保存できません。それぞれ一意の番号に修正してください。
+            </p>
+          </div>
+        </div>
+      )}
+
+      <div className="w-full bg-white border border-slate-200/80 p-5 rounded-2xl shadow-sm space-y-4">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-100 pb-3">
+          <div className="relative flex-1 max-w-lg">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              placeholder="選手名・ふりがな・所属・担当者名・メール・ゼッケン・備考で検索..."
+              className="w-full pl-9 pr-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-900 placeholder:text-slate-400 outline-none focus:bg-white focus:border-slate-900 font-medium transition-colors"
+            />
+          </div>
+          <span className="text-[11px] font-mono text-slate-500 shrink-0">
+            表示件数:{' '}
+            <strong className="text-slate-900 font-bold">
+              {filteredAndSortedParticipants.length}
+            </strong>{' '}
+            / {participants.length} 名
+          </span>
+        </div>
+
+        <div className="space-y-2">
+          <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+            <ArrowUpDown className="w-4 h-4 text-slate-700" />
+            項目ソート切り替え（クリックで昇順/降順を切り替え）
+          </span>
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => handleToggleSort('bibNumber')}
+              className={`text-xs h-8 px-3 font-bold transition-all rounded-lg ${
+                sortKey === 'bibNumber'
+                  ? 'bg-slate-900 text-white border-slate-900 shadow-2xs'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <Hash className="w-3.5 h-3.5 mr-1" />
+              ゼッケン
+              {sortKey === 'bibNumber' &&
+                (sortDirection === 'asc' ? (
+                  <ArrowUp className="w-3.5 h-3.5 ml-1" />
+                ) : (
+                  <ArrowDown className="w-3.5 h-3.5 ml-1" />
+                ))}
+            </Button>
+
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => handleToggleSort('name')}
+              className={`text-xs h-8 px-3 font-bold transition-all rounded-lg ${
+                sortKey === 'name'
+                  ? 'bg-slate-900 text-white border-slate-900 shadow-2xs'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              選手名 (50音)
+              {sortKey === 'name' &&
+                (sortDirection === 'asc' ? (
+                  <ArrowUp className="w-3.5 h-3.5 ml-1" />
+                ) : (
+                  <ArrowDown className="w-3.5 h-3.5 ml-1" />
+                ))}
+            </Button>
+
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => handleToggleSort('organization')}
+              className={`text-xs h-8 px-3 font-bold transition-all rounded-lg ${
+                sortKey === 'organization'
+                  ? 'bg-slate-900 text-white border-slate-900 shadow-2xs'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              所属団体
+              {sortKey === 'organization' &&
+                (sortDirection === 'asc' ? (
+                  <ArrowUp className="w-3.5 h-3.5 ml-1" />
+                ) : (
+                  <ArrowDown className="w-3.5 h-3.5 ml-1" />
+                ))}
+            </Button>
+
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => handleToggleSort('shosa')}
+              className={`text-xs h-8 px-3 font-bold transition-all rounded-lg ${
+                sortKey === 'shosa'
+                  ? 'bg-slate-900 text-white border-slate-900 shadow-2xs'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              所作 (肌脱ぎ/襷)
+              {sortKey === 'shosa' &&
+                (sortDirection === 'asc' ? (
+                  <ArrowUp className="w-3.5 h-3.5 ml-1" />
+                ) : (
+                  <ArrowDown className="w-3.5 h-3.5 ml-1" />
+                ))}
+            </Button>
+
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => handleToggleSort('rankTitle')}
+              className={`text-xs h-8 px-3 font-bold transition-all rounded-lg ${
+                sortKey === 'rankTitle'
+                  ? 'bg-slate-900 text-white border-slate-900 shadow-2xs'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <Award className="w-3.5 h-3.5 mr-1 text-amber-500" />
+              称号・段位
+              {sortKey === 'rankTitle' &&
+                (sortDirection === 'asc' ? (
+                  <ArrowUp className="w-3.5 h-3.5 ml-1" />
+                ) : (
+                  <ArrowDown className="w-3.5 h-3.5 ml-1" />
+                ))}
+            </Button>
+
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => handleToggleSort('staffRole')}
+              className={`text-xs h-8 px-3 font-bold transition-all rounded-lg ${
+                sortKey === 'staffRole'
+                  ? 'bg-slate-900 text-white border-slate-900 shadow-2xs'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              役員役割
+              {sortKey === 'staffRole' &&
+                (sortDirection === 'asc' ? (
+                  <ArrowUp className="w-3.5 h-3.5 ml-1" />
+                ) : (
+                  <ArrowDown className="w-3.5 h-3.5 ml-1" />
+                ))}
+            </Button>
+
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => handleToggleSort('staffDutyShift')}
+              className={`text-xs h-8 px-3 font-bold transition-all rounded-lg ${
+                sortKey === 'staffDutyShift'
+                  ? 'bg-slate-900 text-white border-slate-900 shadow-2xs'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              シフト (AM/PM)
+              {sortKey === 'staffDutyShift' &&
+                (sortDirection === 'asc' ? (
+                  <ArrowUp className="w-3.5 h-3.5 ml-1" />
+                ) : (
+                  <ArrowDown className="w-3.5 h-3.5 ml-1" />
+                ))}
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      <div className="w-full space-y-3">
+        {filteredAndSortedParticipants.length === 0 ? (
+          <div className="w-full p-16 text-center bg-white rounded-2xl border border-slate-200 text-slate-400 text-xs">
+            検索条件に一致する選手は見つかりませんでした。
+          </div>
+        ) : (
+          filteredAndSortedParticipants.map((p) => {
+            const isSaving = savingId === p.id;
+            const isDeleting = deletingId === p.id;
+            const isDuplicate = duplicateBibNumbers.has(p.bibNumber);
+
+            return (
+              <div
+                key={p.id}
+                className={`w-full bg-white border rounded-2xl p-5 flex flex-col xl:flex-row xl:items-start justify-between gap-4 text-xs transition-shadow shadow-xs hover:shadow-sm ${
+                  isDuplicate
+                    ? 'border-red-400 bg-red-50/20'
+                    : 'border-slate-200/80'
+                }`}
+              >
+                <div className="flex flex-col items-center justify-start shrink-0 pt-1 min-w-[130px] border-b xl:border-b-0 xl:border-r border-slate-100 pb-3 xl:pb-0 xl:pr-4">
+                  <span className="text-[10px] font-mono text-slate-400 font-bold mb-1">
+                    ゼッケンNo.
+                  </span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={p.bibNumber}
+                    onChange={(e) =>
+                      handleChangeBibNumber(p.id, e.target.value)
+                    }
+                    className={`w-20 p-2 text-center font-mono font-black text-base rounded-xl border outline-none transition-colors ${
+                      isDuplicate
+                        ? 'bg-red-50 border-red-400 text-red-900 focus:ring-1 focus:ring-red-400'
+                        : 'bg-slate-50 border-slate-300 text-slate-900 focus:bg-white focus:border-slate-900'
+                    }`}
+                    title="ゼッケン番号を変更"
+                  />
+                  {isDuplicate && (
+                    <span className="text-[9px] font-bold text-red-600 mt-1 flex items-center gap-0.5">
+                      <AlertTriangle className="w-2.5 h-2.5" /> 重複警告
+                    </span>
+                  )}
+
+                  <div className="w-full mt-3 pt-2 border-t border-slate-100 text-center">
+                    <span className="text-[9px] text-slate-400 font-bold block">
+                      申込担当者
+                    </span>
+                    <span
+                      className="text-[11px] font-bold text-slate-800 block truncate"
+                      title={p.representativeName}
+                    >
+                      {p.representativeName || '未登録'} 様
+                    </span>
+                    <span
+                      className="text-[10px] font-mono text-slate-500 flex items-center justify-center gap-1 mt-0.5"
+                      title={p.representativeEmail}
+                    >
+                      <Mail className="w-3 h-3 text-slate-400 shrink-0" />
+                      <span className="truncate max-w-[110px]">
+                        {p.representativeEmail || '未登録'}
+                      </span>
+                    </span>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-4 gap-3 flex-1">
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-slate-500 font-bold block">
+                      選手氏名 <span className="text-red-500">*</span>
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={p.name}
+                      onChange={(e) =>
+                        handleChangeField(p.id, 'name', e.target.value)
+                      }
+                      placeholder="例: 明太花子"
+                      className="w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-slate-900 font-bold text-xs outline-none focus:bg-white focus:border-slate-900"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-slate-500 font-bold block">
+                      ふりがな
+                    </label>
+                    <input
+                      type="text"
+                      value={p.nameKana}
+                      onChange={(e) =>
+                        handleChangeField(p.id, 'nameKana', e.target.value)
+                      }
+                      placeholder="例: めんたいはなこ"
+                      className="w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-slate-900 font-medium text-xs outline-none focus:bg-white focus:border-slate-900"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-slate-500 font-bold block">
+                      所属道場・団体名
+                    </label>
+                    <input
+                      type="text"
+                      value={p.organization}
+                      onChange={(e) =>
+                        handleChangeField(p.id, 'organization', e.target.value)
+                      }
+                      placeholder="例: 福岡弓道倶楽部"
+                      className="w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-slate-900 font-medium text-xs outline-none focus:bg-white focus:border-slate-900"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-slate-500 font-bold block">
+                      所作区分
+                    </label>
+                    <select
+                      value={p.shosa}
+                      onChange={(e) =>
+                        handleChangeSelectField(
+                          p.id,
+                          'shosa',
+                          e.target.value as ShosaType,
+                        )
+                      }
+                      className="w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-slate-900 font-bold text-xs outline-none focus:bg-white focus:border-slate-900"
+                    >
+                      <option value="肌脱ぎ">肌脱ぎ</option>
+                      <option value="襷掛け">襷掛け</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-slate-500 font-bold block">
+                      称号・段位
+                    </label>
+                    <select
+                      value={p.rankTitle}
+                      onChange={(e) =>
+                        handleChangeSelectField(
+                          p.id,
+                          'rankTitle',
+                          e.target.value as RankTitleType,
+                        )
+                      }
+                      className="w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-slate-900 font-bold text-xs outline-none focus:bg-white focus:border-slate-900"
+                    >
+                      <option value="段位は三段以下">段位は三段以下</option>
+                      <option value="段位は四段以上">段位は四段以上</option>
+                      <option value="称号を取得している">
+                        称号を取得している
+                      </option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-slate-500 font-bold block">
+                      役員役割 / シフト
+                    </label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <select
+                        value={p.staffRole}
+                        onChange={(e) =>
+                          handleChangeSelectField(
+                            p.id,
+                            'staffRole',
+                            e.target.value as StaffRoleType,
+                          )
+                        }
+                        className="w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-slate-900 font-bold text-xs outline-none focus:bg-white focus:border-slate-900"
+                      >
+                        <option value="無し">役割: 無し</option>
+                        <option value="進行">進行</option>
+                        <option value="的前">的前</option>
+                        <option value="招集">招集</option>
+                        <option value="記録">記録</option>
+                        <option value="カメラマン">カメラマン</option>
+                        <option value="運営">運営</option>
+                      </select>
+
+                      <select
+                        value={p.staffDutyShift}
+                        onChange={(e) =>
+                          handleChangeSelectField(
+                            p.id,
+                            'staffDutyShift',
+                            e.target.value as StaffDutyShiftType,
+                          )
+                        }
+                        className="w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-slate-900 font-bold text-xs outline-none focus:bg-white focus:border-slate-900"
+                      >
+                        <option value="無し">シフト無</option>
+                        <option value="AM">午前 (AM)</option>
+                        <option value="PM">午後 (PM)</option>
+                        <option value="終日">終日</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="md:col-span-2 space-y-1">
+                    <label className="text-[10px] text-slate-500 font-bold block">
+                      備考（連絡・配慮事項）
+                    </label>
+                    <input
+                      type="text"
+                      value={p.notes}
+                      onChange={(e) =>
+                        handleChangeField(p.id, 'notes', e.target.value)
+                      }
+                      placeholder="配慮事項や連絡メモなど"
+                      className="w-full p-2 bg-slate-50 border border-slate-300 rounded-lg text-slate-900 font-medium text-xs outline-none focus:bg-white focus:border-slate-900"
+                    />
+                  </div>
+
+                  <div className="flex items-center pt-2">
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={p.needsSupport}
+                        onChange={(e) =>
+                          handleChangeSelectField(
+                            p.id,
+                            'needsSupport',
+                            e.target.checked,
+                          )
+                        }
+                        className="rounded text-slate-900 focus:ring-slate-900 w-4 h-4"
+                      />
+                      <span className="text-[11px] font-bold text-amber-900 flex items-center gap-1">
+                        <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+                        本座所作サポート希望
+                      </span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* 操作ボタングループ: 保存ボタン & 削除ボタン */}
+                <div className="flex flex-row xl:flex-col items-center justify-end shrink-0 gap-2 pt-2 xl:pt-0 self-end xl:self-center">
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={
+                      isSaving || isDeleting || isDuplicate || !p.name.trim()
+                    }
+                    onClick={() => handleUpdateParticipant(p)}
+                    className={`font-black text-xs h-9 px-4 transition-transform active:scale-95 rounded-xl ${
+                      isDuplicate || !p.name.trim()
+                        ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
+                        : 'bg-slate-900 hover:bg-slate-800 text-white shadow-xs'
+                    }`}
+                    title={
+                      isDuplicate
+                        ? 'ゼッケン番号が重複しているため保存できません'
+                        : !p.name.trim()
+                          ? '選手氏名を入力してください'
+                          : '選手情報を保存'
+                    }
+                  >
+                    {isSaving ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <>
+                        <Save className="w-3.5 h-3.5 mr-1 text-amber-400" />
+                        保存
+                      </>
+                    )}
+                  </Button>
+
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={isSaving || isDeleting}
+                    onClick={() => setDeleteTarget(p)}
+                    className="font-bold text-xs h-9 px-3 border-red-200 bg-red-50/40 text-red-700 hover:bg-red-100/80 hover:text-red-800 hover:border-red-300 transition-all rounded-xl"
+                    title="この選手データを削除"
+                  >
+                    <Trash2 className="w-3.5 h-3.5 mr-1 text-red-600" />
+                    削除
+                  </Button>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {/* フールプルーフ: 選手データ削除確認モーダル */}
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
+          <div className="relative w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 p-6 space-y-4 animate-in fade-in zoom-in-95">
+            <div className="flex items-start justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2 text-red-600">
+                <div className="p-2 bg-red-50 rounded-xl">
+                  <AlertTriangle className="w-5 h-5 text-red-600" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black text-slate-900">
+                    選手登録の削除確認
+                  </h3>
+                  <span className="text-[11px] text-slate-500 font-medium">
+                    この操作は取り消せません
+                  </span>
+                </div>
+              </div>
               <button
                 type="button"
-                onClick={handleCloseModal}
-                className="text-slate-400 hover:text-slate-600 p-1.5 rounded-lg hover:bg-slate-100 transition-colors"
+                onClick={() => setDeleteTarget(null)}
+                className="w-8 h-8 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors"
               >
-                <X className="w-5 h-5" />
+                <X className="w-4 h-4" />
               </button>
             </div>
 
-            <div className="space-y-4 text-xs max-h-[70vh] overflow-y-auto pr-2">
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">ゼッケン番号</label>
-                  <input
-                    type="number"
-                    value={editForm.bibNumber}
-                    onChange={(e) => setEditForm((prev) => ({ ...prev, bibNumber: Number(e.target.value) }))}
-                    className="w-full p-2.5 border border-slate-200 rounded-xl bg-slate-50/50 text-slate-900 font-mono font-bold focus:bg-white focus:ring-2 focus:ring-slate-900 outline-none transition-all"
-                  />
-                </div>
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">所作</label>
-                  <select
-                    value={editForm.shosa}
-                    onChange={(e) => setEditForm((prev) => ({ ...prev, shosa: e.target.value as ShosaType }))}
-                    className="w-full p-2.5 border border-slate-200 rounded-xl bg-slate-50/50 text-slate-900 font-bold focus:bg-white focus:ring-2 focus:ring-slate-900 outline-none transition-all"
-                  >
-                    <option value="肌脱ぎ">肌脱ぎ</option>
-                    <option value="襷掛け">襷掛け</option>
-                  </select>
-                </div>
+            <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-2 text-xs">
+              <div className="flex justify-between items-center text-slate-700 pb-1.5 border-b border-slate-200">
+                <span className="text-slate-500 font-bold">ゼッケン番号:</span>
+                <span className="font-mono font-black text-sm text-slate-900">
+                  No.{deleteTarget.bibNumber}
+                </span>
               </div>
-
-              {/* 第1立・第2立の個別設定セクション */}
-              <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
-                <h4 className="font-bold text-slate-900 text-xs">各立の立グループ・立順設定（第1立・第2立）</h4>
-                
-                {([1, 2] as const).map((roundIdx: 1 | 2) => {
-                  const titles: Record<1 | 2, string> = {
-                    1: "第1立 (午前・一手 2射)",
-                    2: "第2立 (午後・一手 2射)",
-                  };
-                  return (
-                    <div key={roundIdx} className="grid grid-cols-3 gap-2 items-center bg-white p-2.5 rounded-lg border border-slate-200">
-                      <span className="font-bold text-slate-800 text-[11px]">{titles[roundIdx]}</span>
-                      <div>
-                        <label className="block text-[10px] text-slate-500 mb-0.5">立ちグループ</label>
-                        <input
-                          type="number"
-                          min={1}
-                          value={editForm.standAssignments[roundIdx]?.standGroup || 1}
-                          onChange={(e) => {
-                            const val = Number(e.target.value);
-                            setEditForm((prev) => ({
-                              ...prev,
-                              standAssignments: {
-                                ...prev.standAssignments,
-                                [roundIdx]: {
-                                  ...prev.standAssignments[roundIdx],
-                                  standGroup: val,
-                                },
-                              },
-                            }));
-                          }}
-                          className="w-full p-1.5 border border-slate-200 rounded text-xs font-mono font-bold"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] text-slate-500 mb-0.5">立順 (1〜5)</label>
-                        <select
-                          value={editForm.standAssignments[roundIdx]?.standOrder || 1}
-                          onChange={(e) => {
-                            const val = Number(e.target.value) as 1 | 2 | 3 | 4 | 5;
-                            setEditForm((prev) => ({
-                              ...prev,
-                              standAssignments: {
-                                ...prev.standAssignments,
-                                [roundIdx]: {
-                                  ...prev.standAssignments[roundIdx],
-                                  standOrder: val,
-                                },
-                              },
-                            }));
-                          }}
-                          className="w-full p-1.5 border border-slate-200 rounded text-xs font-bold"
-                        >
-                          <option value={1}>1番(大前)</option>
-                          <option value={2}>2番</option>
-                          <option value={3}>3番(中)</option>
-                          <option value={4}>4番(三番)</option>
-                          <option value={5}>5番(落ち)</option>
-                        </select>
-                      </div>
-                    </div>
-                  );
-                })}
+              <div className="flex justify-between items-center text-slate-700 pb-1.5 border-b border-slate-200">
+                <span className="text-slate-500 font-bold">選手氏名:</span>
+                <span className="font-black text-slate-900 text-sm">
+                  {deleteTarget.name} 様
+                </span>
               </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">選手氏名 <span className="text-red-500">*</span></label>
-                  <input
-                    type="text"
-                    value={editForm.name}
-                    onChange={(e) => setEditForm((prev) => ({ ...prev, name: e.target.value }))}
-                    className="w-full p-2.5 border border-slate-200 rounded-xl bg-slate-50/50 text-slate-900 font-bold focus:bg-white focus:ring-2 focus:ring-slate-900 outline-none transition-all"
-                  />
-                </div>
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">ふりがな</label>
-                  <input
-                    type="text"
-                    value={editForm.nameKana}
-                    onChange={(e) => setEditForm((prev) => ({ ...prev, nameKana: e.target.value }))}
-                    className="w-full p-2.5 border border-slate-200 rounded-xl bg-slate-50/50 text-slate-900 focus:bg-white focus:ring-2 focus:ring-slate-900 outline-none transition-all"
-                  />
-                </div>
+              <div className="flex justify-between items-center text-slate-700 pb-1.5 border-b border-slate-200">
+                <span className="text-slate-500 font-bold">所属団体:</span>
+                <span className="font-bold text-slate-800">
+                  {deleteTarget.organization || '無所属'}
+                </span>
               </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">所属団体名</label>
-                  <input
-                    type="text"
-                    value={editForm.organization}
-                    onChange={(e) => setEditForm((prev) => ({ ...prev, organization: e.target.value }))}
-                    className="w-full p-2.5 border border-slate-200 rounded-xl bg-slate-50/50 text-slate-900 focus:bg-white focus:ring-2 focus:ring-slate-900 outline-none transition-all"
-                  />
-                </div>
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">称号・段位</label>
-                  <select
-                    value={editForm.rankTitle}
-                    onChange={(e) => setEditForm((prev) => ({ ...prev, rankTitle: e.target.value as RankTitleType }))}
-                    className="w-full p-2.5 border border-slate-200 rounded-xl bg-slate-50/50 text-slate-900 font-bold focus:bg-white focus:ring-2 focus:ring-slate-900 outline-none transition-all"
-                  >
-                    <option value="段位は三段以下">段位は三段以下</option>
-                    <option value="段位は四段以上">段位は四段以上</option>
-                    <option value="称号を取得している">称号を取得している</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-3 gap-3">
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">申込代表者名</label>
-                  <input
-                    type="text"
-                    value={editForm.representativeName}
-                    onChange={(e) => setEditForm((prev) => ({ ...prev, representativeName: e.target.value }))}
-                    className="w-full p-2.5 border border-slate-200 rounded-xl bg-slate-50/50 text-slate-900 focus:bg-white focus:ring-2 focus:ring-slate-900 outline-none transition-all"
-                  />
-                </div>
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">代表者電話番号</label>
-                  <input
-                    type="text"
-                    value={editForm.representativePhone}
-                    onChange={(e) => setEditForm((prev) => ({ ...prev, representativePhone: e.target.value }))}
-                    className="w-full p-2.5 border border-slate-200 rounded-xl bg-slate-50/50 text-slate-900 font-mono focus:bg-white focus:ring-2 focus:ring-slate-900 outline-none transition-all"
-                  />
-                </div>
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">代表者メール</label>
-                  <input
-                    type="email"
-                    value={editForm.representativeEmail}
-                    onChange={(e) => setEditForm((prev) => ({ ...prev, representativeEmail: e.target.value }))}
-                    className="w-full p-2.5 border border-slate-200 rounded-xl bg-slate-50/50 text-slate-900 font-mono focus:bg-white focus:ring-2 focus:ring-slate-900 outline-none transition-all"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">役員役割</label>
-                  <select
-                    value={editForm.staffRole}
-                    onChange={(e) => setEditForm((prev) => ({ ...prev, staffRole: e.target.value as StaffRoleType }))}
-                    className="w-full p-2.5 border border-slate-200 rounded-xl bg-slate-50/50 text-slate-900 font-bold focus:bg-white focus:ring-2 focus:ring-slate-900 outline-none transition-all"
-                  >
-                    <option value="進行">進行</option>
-                    <option value="的前">的前</option>
-                    <option value="招集">招集</option>
-                    <option value="記録">記録</option>
-                    <option value="カメラマン">カメラマン</option>
-                    <option value="運営">運営</option>
-                    <option value="無し">無し</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block font-bold text-slate-700 mb-1">役員担当時間帯</label>
-                  <select
-                    value={editForm.staffDutyShift}
-                    onChange={(e) => setEditForm((prev) => ({ ...prev, staffDutyShift: e.target.value }))}
-                    className="w-full p-2.5 border border-slate-200 rounded-xl bg-slate-50/50 text-slate-900 font-bold focus:bg-white focus:ring-2 focus:ring-slate-900 outline-none transition-all"
-                  >
-                    <option value="AM">AM</option>
-                    <option value="PM">PM</option>
-                    <option value="終日">終日</option>
-                    <option value="無し">無し</option>
-                  </select>
-                </div>
-              </div>
-
-              <div>
-                <label className="block font-bold text-slate-700 mb-1">備考</label>
-                <textarea
-                  rows={2}
-                  value={editForm.notes}
-                  onChange={(e) => setEditForm((prev) => ({ ...prev, notes: e.target.value }))}
-                  className="w-full p-2.5 border border-slate-200 rounded-xl bg-slate-50/50 text-slate-900 focus:bg-white focus:ring-2 focus:ring-slate-900 outline-none transition-all"
-                />
+              <div className="flex justify-between items-center text-slate-700">
+                <span className="text-slate-500 font-bold">申込担当者:</span>
+                <span className="font-medium text-slate-800">
+                  {deleteTarget.representativeName || '未登録'} 様
+                </span>
               </div>
             </div>
 
-            <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
+            <p className="text-xs text-red-600 leading-relaxed font-medium">
+              ※削除すると、該当選手のスコア記録や立ち順割り当て情報も完全に消失します。本当に削除してよろしいですか？
+            </p>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={handleCloseModal}
-                disabled={isSaving}
-                className="text-xs font-bold border-slate-200 bg-white hover:bg-slate-50 text-slate-700 shadow-2xs"
+                disabled={deletingId !== null}
+                onClick={() => setDeleteTarget(null)}
+                className="text-xs border-slate-300 text-slate-700 h-9 px-4 rounded-xl"
               >
                 キャンセル
               </Button>
               <Button
                 type="button"
                 size="sm"
-                onClick={handleSaveChanges}
-                disabled={isSaving}
-                className="bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs shadow-xs"
+                disabled={deletingId !== null}
+                onClick={handleConfirmDelete}
+                className="bg-red-600 hover:bg-red-700 text-white font-bold text-xs h-9 px-4 rounded-xl shadow-xs transition-transform active:scale-95"
               >
-                {isSaving ? (
+                {deletingId !== null ? (
                   <>
-                    <Loader2 className="w-3.5 h-3.5 animate-spin mr-1" /> 保存中...
+                    <Loader2 className="w-3.5 h-3.5 animate-spin mr-1" />
+                    削除実行中...
                   </>
                 ) : (
                   <>
-                    <Check className="w-3.5 h-3.5 mr-1 text-amber-400" /> 変更を保存する
+                    <Trash2 className="w-3.5 h-3.5 mr-1" />
+                    削除を実行する
                   </>
                 )}
               </Button>

@@ -1,58 +1,118 @@
-@import "tailwindcss";
+@import 'tailwindcss';
+@config "../../tailwind.config.ts";
 
+/*
+ * デザイントークン管理 (CSS変数)
+ * 弓道競技の規律と視認性を重視し、コントラスト比（WCAG AA規格以上）を担保した
+ * 漆黒（しっこく）、生成り（きなり）、朱（しゅ）をベースとするモダン和風カラーパレット。
+ */
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+    /* 背景色: 清潔感のある極めて淡いグレー/生成り */
+    --background: 0 0% 98%;
+    /* 前景色（基本テキスト）: 視認性の高い漆黒 */
+    --foreground: 220 15% 10%;
+
+    /* カード・モーダルコンポーネント背景 */
     --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
+    --card-foreground: 220 15% 10%;
+
+    /* ポップオーバー背景 */
     --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 222.2 47.4% 11.2%;
-    --primary-foreground: 210 40% 98%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 4.9%;
+    --popover-foreground: 220 15% 10%;
+
+    /* プライマリカラー: 弓道の格式を表す濃紺・深緑系のシックな黒 */
+    --primary: 222 47% 11%;
+    --primary-foreground: 0 0% 98%;
+
+    /* セカンダリカラー: 補助要素・中立ボタン */
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 222 47% 11%;
+
+    /* ミュート要素: 無効化テキスト、補助テキスト */
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%;
+
+    /* アクセントカラー: ホバー時・選択ハイライト */
+    --accent: 220 14% 94%;
+    --accent-foreground: 222 47% 11%;
+
+    /* デストラクティブ/エラー: 「✕」外れ判定・削除・警告 */
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 98%;
+
+    /* 成功/的中アクセント: 「〇」的中判定・完了通知 */
+    --success: 142 71% 45%;
+    --success-foreground: 0 0% 98%;
+
+    /* 境界線・入力枠 */
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 222 47% 11%;
+
+    /* 角丸半径（スマホでの誤タップを防ぐ適度なラウンド） */
     --radius: 0.5rem;
   }
 
+  /*
+   * ダークモード設定 (体育館・道場内での防眩・夜間利用対応)
+   */
   .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
+    --background: 224 71% 4%;
+    --foreground: 213 31% 91%;
+
+    --card: 224 71% 6%;
+    --card-foreground: 213 31% 91%;
+
+    --popover: 224 71% 6%;
+    --popover-foreground: 213 31% 91%;
+
     --primary: 210 40% 98%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-    --secondary: 217.2 32.6% 17.5%;
+    --primary-foreground: 222 47% 11%;
+
+    --secondary: 215 28% 17%;
     --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 217.2 32.6% 17.5%;
+
+    --muted: 215 28% 17%;
+    --muted-foreground: 217 11% 65%;
+
+    --accent: 215 28% 17%;
     --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
+
+    --destructive: 0 63% 31%;
     --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 212.8 76.3% 48%;
+
+    --success: 142 76% 36%;
+    --success-foreground: 210 40% 98%;
+
+    --border: 215 28% 17%;
+    --input: 215 28% 17%;
+    --ring: 216 12% 84%;
   }
 }
 
+/*
+ * 基本DOMスタイルの適用
+ * フールプルーフ設計: 未定義の @apply クラス展開に依存せず、
+ * 標準CSSプロパティ（border-color, background-color, color）で記述しビルドエラーを入口で遮断
+ */
 @layer base {
   * {
     border-color: hsl(var(--border));
   }
+  html {
+    /* スマホブラウザでのテキスト拡大防止 */
+    -webkit-text-size-adjust: 100%;
+    /* タップ時の青色ハイライトを無効化 */
+    -webkit-tap-highlight-color: transparent;
+  }
   body {
     background-color: hsl(var(--background));
     color: hsl(var(--foreground));
+    overflow-x: hidden;
+    min-height: 100vh;
+    font-feature-settings: 'palt' 1;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 }

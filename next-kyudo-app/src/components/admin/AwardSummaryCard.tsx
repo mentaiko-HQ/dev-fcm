@@ -1,208 +1,255 @@
-"use client";
+/**
+ * 【大会表彰・成績サマリー表示コンポーネント】
+ *
+ * 役割:
+ * - 全8射的中制における上位入賞候補（最高的中者）、皆中達成者、第1立甲矢賞対象者の自動集計および可視化。
+ * - 競技全体の総射数・総的中数・全体的中率のリアルタイムサマリー。
+ *
+ * フールプルーフ設計（操作ミス・型不一致の入口遮断）:
+ * - 型インポートを `@/types` に統一し、standAssignments の null 許容型（StandAssignment）と完全適合。
+ * - 選手一覧が空配列、またはスコアが未入力の場合でもゼロ除算（NaN%）を防止し安全な数値を算出。
+ *
+ * フェイルセーフ設計（障害時の安全縮退）:
+ * - 立順が未設定（standGroup / standOrder が null）の選手が含まれていても、
+ *   各立の矢数配列および的中フラグ（isHayaHit）の集計処理がクラッシュせず安全にフォールバック表示。
+ */
 
-import React, { useMemo } from "react";
-import { Participant } from "@/types/participant";
-import { HitResult } from "@/types";
-import { Trophy, Medal, Award, Flame, Target } from "lucide-react";
+'use client';
 
-interface AwardSummaryCardProps {
+import React, { useMemo } from 'react';
+import { Participant, TOTAL_TOURNAMENT_SHOTS } from '@/types';
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+} from '@/components/ui/card';
+import { Trophy, Award, Target, Users, Flame, Star } from 'lucide-react';
+
+export interface AwardSummaryCardProps {
   participants: Participant[];
 }
 
 export function AwardSummaryCard({ participants }: AwardSummaryCardProps) {
-  // フールプルーフ & フェイルセーフ: 欠席者を除外し、確定順位(finalRank)または的中数降順でソート
-  const rankedIndividuals = useMemo(() => {
-    return [...participants]
-      .filter((p) => p.qualificationStatus !== "ABSENT")
-      .sort((a, b) => {
-        if (a.finalRank && b.finalRank) return a.finalRank - b.finalRank;
-        if (a.enkinRank && b.enkinRank) return a.enkinRank - b.enkinRank;
-        return (b.totalHits || 0) - (a.totalHits || 0);
-      });
-  }, [participants]);
+  // 表彰対象および統計のリアルタイム集計
+  const summary = useMemo(() => {
+    const totalCount = participants.length;
+    if (totalCount === 0) {
+      return {
+        topHitCount: 0,
+        topShooters: [],
+        perfectShooters: [],
+        hayaShooters: [],
+        totalShots: 0,
+        totalHits: 0,
+        hitRate: 0,
+      };
+    }
 
-  const firstPlace = rankedIndividuals[0];
-  const secondPlace = rankedIndividuals[1];
-  const thirdPlace = rankedIndividuals[2];
+    // 1. 最高的中数（全8射中）の算出
+    const maxHits = Math.max(...participants.map((p) => p.totalHits || 0), 0);
+    const topShooters =
+      maxHits > 0 ? participants.filter((p) => p.totalHits === maxHits) : [];
 
-  // 一手束中賞（第1立または第2立で2射2中）の達成者（TS2769 / TS2367 解消）
-  const ishuSokuchuShooters = useMemo(() => {
-    return participants.filter((p) => {
-      if (p.qualificationStatus === "ABSENT") return false;
-      const s1Hits: number = (p.stand1_arrows || []).reduce<number>((acc, v: HitResult) => acc + v, 0);
-      const s2Hits: number = (p.stand2_arrows || []).reduce<number>((acc, v: HitResult) => acc + v, 0);
-      return s1Hits === 2 || s2Hits === 2;
-    });
-  }, [participants]);
-
-  // 四矢皆中賞（第3立で4射4中）の達成者（TS2769 / TS2367 解消）
-  const yotsuyaKaichuShooters = useMemo(() => {
-    return participants.filter((p) => {
-      if (p.qualificationStatus === "ABSENT") return false;
-      const s3Hits: number = (p.stand3_arrows || []).reduce<number>((acc, v: HitResult) => acc + v, 0);
-      return s3Hits === 4;
-    });
-  }, [participants]);
-
-  // 8射全皆中者リスト
-  const perfectShooters = useMemo(() => {
-    return participants.filter(
-      (p) => p.qualificationStatus === "ACTIVE" && (p.isPerfect || p.totalHits === 8)
+    // 2. 皆中達成者（全8射中8的中）
+    const perfectShooters = participants.filter(
+      (p) => p.totalHits === TOTAL_TOURNAMENT_SHOTS || p.isPerfect,
     );
+
+    // 3. 第1立 甲矢賞対象者（isHayaHit === true）
+    const hayaShooters = participants.filter((p) => p.isHayaHit);
+
+    // 4. 大会全体スタッツ
+    let cumulativeShots = 0;
+    let cumulativeHits = 0;
+
+    participants.forEach((p) => {
+      const s1Shots = Array.isArray(p.stand1_arrows)
+        ? p.stand1_arrows.length
+        : 0;
+      const s2Shots = Array.isArray(p.stand2_arrows)
+        ? p.stand2_arrows.length
+        : 0;
+      const s3Shots = Array.isArray(p.stand3_arrows)
+        ? p.stand3_arrows.length
+        : 0;
+      cumulativeShots += s1Shots + s2Shots + s3Shots;
+      cumulativeHits += p.totalHits || 0;
+    });
+
+    const hitRate =
+      cumulativeShots > 0
+        ? Math.round((cumulativeHits / cumulativeShots) * 1000) / 10
+        : 0;
+
+    return {
+      topHitCount: maxHits,
+      topShooters,
+      perfectShooters,
+      hayaShooters,
+      totalShots: cumulativeShots,
+      totalHits: cumulativeHits,
+      hitRate,
+    };
   }, [participants]);
 
   return (
-    <div className="w-full bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 border border-slate-700 rounded-lg p-5 text-white shadow-md space-y-4">
-      <div className="flex justify-between items-center border-b border-slate-700 pb-3">
-        <h3 className="font-bold text-base flex items-center gap-2">
-          <Trophy className="w-5 h-5 text-amber-400" />
-          第5回めんたいこ杯争奪弓道大会 表彰サマリー (個人10名表彰)
-        </h3>
-        <span className="text-xs bg-amber-500/20 text-amber-300 px-2.5 py-0.5 rounded-full border border-amber-500/30 font-semibold">
-          全8射的中制（優勝:射詰 / 2位以降:遠近）
-        </span>
-      </div>
-
-      {/* 上位3名ポディウム */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-        {/* 優勝 (第1位 - 射詰め決定) */}
-        <div className="bg-slate-800/80 border border-amber-500/40 rounded-lg p-3.5 flex flex-col justify-between">
-          <div className="flex justify-between items-center mb-1">
-            <span className="text-xs font-bold text-amber-400 flex items-center gap-1">
-              <Trophy className="w-4 h-4 text-amber-400" /> 優勝 (第1位・射詰決定)
-            </span>
-            {firstPlace?.enkinRank && (
-              <span className="text-[10px] bg-blue-500/30 text-blue-300 px-1.5 py-0.5 rounded">
-                判定 {firstPlace.enkinRank}位
+    <Card className="w-full bg-white border-slate-200/80 shadow-sm text-slate-900 rounded-2xl">
+      <CardHeader className="pb-3 border-b border-slate-100">
+        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-[10px] font-bold bg-slate-900 text-white px-2.5 py-0.5 rounded-full flex items-center gap-1">
+                <Trophy className="w-3 h-3 text-amber-400" /> 成績サマリー
               </span>
-            )}
-          </div>
-          {firstPlace ? (
-            <div>
-              <div className="flex items-baseline gap-1.5">
-                <span className="text-xs font-bold text-slate-400">No.{firstPlace.bibNumber}</span>
-                <p className="text-lg font-black text-white">{firstPlace.name}</p>
-                <span className="text-xs text-slate-400">({firstPlace.nameKana})</span>
-              </div>
-              <p className="text-xs text-slate-400 mt-0.5">{firstPlace.organization || "無所属"}</p>
-              <p className="text-sm font-bold text-amber-400 mt-2">{firstPlace.totalHits || 0} / 8 中</p>
-            </div>
-          ) : (
-            <p className="text-xs text-slate-500 italic">未確定</p>
-          )}
-        </div>
-
-        {/* 準優勝 (第2位 - 遠近法決定) */}
-        <div className="bg-slate-800/80 border border-slate-600 rounded-lg p-3.5 flex flex-col justify-between">
-          <div className="flex justify-between items-center mb-1">
-            <span className="text-xs font-bold text-slate-300 flex items-center gap-1">
-              <Medal className="w-4 h-4 text-slate-300" /> 準優勝 (第2位・遠近決定)
-            </span>
-            {secondPlace?.enkinRank && (
-              <span className="text-[10px] bg-blue-500/30 text-blue-300 px-1.5 py-0.5 rounded">
-                遠近 {secondPlace.enkinRank}位
+              <span className="text-[10px] font-semibold text-slate-600 bg-slate-100 px-2 py-0.5 rounded-md">
+                全8射的中制
               </span>
-            )}
-          </div>
-          {secondPlace ? (
-            <div>
-              <div className="flex items-baseline gap-1.5">
-                <span className="text-xs font-bold text-slate-400">No.{secondPlace.bibNumber}</span>
-                <p className="text-lg font-black text-white">{secondPlace.name}</p>
-                <span className="text-xs text-slate-400">({secondPlace.nameKana})</span>
-              </div>
-              <p className="text-xs text-slate-400 mt-0.5">{secondPlace.organization || "無所属"}</p>
-              <p className="text-sm font-bold text-slate-300 mt-2">{secondPlace.totalHits || 0} / 8 中</p>
             </div>
-          ) : (
-            <p className="text-xs text-slate-500 italic">未確定</p>
-          )}
-        </div>
+            <CardTitle className="text-base sm:text-lg font-black text-slate-900 flex items-center gap-2">
+              表彰・的中集計ステータス
+            </CardTitle>
+            <CardDescription className="text-xs text-slate-500 font-medium">
+              最高的中者、皆中賞、第1立甲矢賞の対象選手および大会全体の的中率を表示します。
+            </CardDescription>
+          </div>
 
-        {/* 第3位 */}
-        <div className="bg-slate-800/80 border border-amber-700/40 rounded-lg p-3.5 flex flex-col justify-between">
-          <div className="flex justify-between items-center mb-1">
-            <span className="text-xs font-bold text-amber-600 flex items-center gap-1">
-              <Award className="w-4 h-4 text-amber-600" /> 第3位 (遠近決定)
+          <div className="flex items-center gap-2 text-xs font-mono bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-xl">
+            <span className="text-slate-500">全体的中率:</span>
+            <span className="font-black text-slate-900 text-sm">
+              {summary.hitRate}%
             </span>
-            {thirdPlace?.enkinRank && (
-              <span className="text-[10px] bg-blue-500/30 text-blue-300 px-1.5 py-0.5 rounded">
-                遠近 {thirdPlace.enkinRank}位
+            <span className="text-slate-400">
+              ({summary.totalHits}/{summary.totalShots}射)
+            </span>
+          </div>
+        </div>
+      </CardHeader>
+
+      <CardContent className="pt-4">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {/* 1. 最高的中（暫定首位・優勝候補） */}
+          <div className="p-4 rounded-xl border border-amber-200 bg-amber-50/40 space-y-2">
+            <div className="flex items-center justify-between border-b border-amber-200/60 pb-1.5">
+              <span className="text-xs font-black text-amber-950 flex items-center gap-1.5">
+                <Flame className="w-4 h-4 text-amber-600" />
+                最高的中（暫定首位）
               </span>
-            )}
-          </div>
-          {thirdPlace ? (
-            <div>
-              <div className="flex items-baseline gap-1.5">
-                <span className="text-xs font-bold text-slate-400">No.{thirdPlace.bibNumber}</span>
-                <p className="text-lg font-black text-white">{thirdPlace.name}</p>
-                <span className="text-xs text-slate-400">({thirdPlace.nameKana})</span>
-              </div>
-              <p className="text-xs text-slate-400 mt-0.5">{thirdPlace.organization || "無所属"}</p>
-              <p className="text-sm font-bold text-amber-500 mt-2">{thirdPlace.totalHits || 0} / 8 中</p>
+              <span className="text-xs font-mono font-black text-amber-900 bg-amber-100 px-2 py-0.5 rounded-md border border-amber-200">
+                {summary.topHitCount} / {TOTAL_TOURNAMENT_SHOTS} 中
+              </span>
             </div>
-          ) : (
-            <p className="text-xs text-slate-500 italic">未確定</p>
-          )}
-        </div>
-      </div>
 
-      {/* 一手束中賞 ＆ 四矢皆中賞 ＆ 8射皆中サマリー */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
-        {/* 一手束中賞 */}
-        <div className="bg-slate-800/50 border border-blue-500/30 rounded-lg p-3 space-y-1.5">
-          <span className="font-bold text-blue-300 flex items-center gap-1">
-            <Target className="w-3.5 h-3.5 text-blue-400" /> 一手束中賞（午前の部 2射2中）
-          </span>
-          <div className="flex flex-wrap gap-1.5 max-h-20 overflow-y-auto">
-            {ishuSokuchuShooters.length > 0 ? (
-              ishuSokuchuShooters.map((p) => (
-                <span key={p.id} className="bg-blue-500/20 text-blue-200 px-1.5 py-0.5 rounded font-mono text-[11px]">
-                  No.{p.bibNumber} {p.name}
-                </span>
-              ))
-            ) : (
-              <span className="text-slate-500 italic">該当者なし</span>
-            )}
+            <div className="space-y-1">
+              <span className="text-[11px] text-amber-900 font-bold block">
+                該当選手: {summary.topShooters.length} 名
+              </span>
+              <div className="max-h-24 overflow-y-auto space-y-1 pr-1">
+                {summary.topShooters.length > 0 ? (
+                  summary.topShooters.map((p) => (
+                    <div
+                      key={p.id}
+                      className="flex items-center justify-between text-xs bg-white/90 p-1.5 px-2 rounded-lg border border-amber-200/70"
+                    >
+                      <span className="font-bold text-slate-900 truncate max-w-[140px]">
+                        {p.name}
+                      </span>
+                      <span className="text-[10px] font-mono font-bold text-slate-600">
+                        No.{p.bibNumber} ({p.organization || '無所属'})
+                      </span>
+                    </div>
+                  ))
+                ) : (
+                  <span className="text-[11px] text-slate-400 block py-1">
+                    的中記録がまだありません
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* 2. 皆中賞（全8射皆中） */}
+          <div className="p-4 rounded-xl border border-emerald-200 bg-emerald-50/40 space-y-2">
+            <div className="flex items-center justify-between border-b border-emerald-200/60 pb-1.5">
+              <span className="text-xs font-black text-emerald-950 flex items-center gap-1.5">
+                <Star className="w-4 h-4 text-emerald-600" />
+                皆中賞（全8射皆中）
+              </span>
+              <span className="text-xs font-mono font-black text-emerald-900 bg-emerald-100 px-2 py-0.5 rounded-md border border-emerald-200">
+                {summary.perfectShooters.length} 名達成
+              </span>
+            </div>
+
+            <div className="space-y-1">
+              <span className="text-[11px] text-emerald-900 font-bold block">
+                達成者一覧
+              </span>
+              <div className="max-h-24 overflow-y-auto space-y-1 pr-1">
+                {summary.perfectShooters.length > 0 ? (
+                  summary.perfectShooters.map((p) => (
+                    <div
+                      key={p.id}
+                      className="flex items-center justify-between text-xs bg-white/90 p-1.5 px-2 rounded-lg border border-emerald-200/70"
+                    >
+                      <span className="font-bold text-slate-900 truncate max-w-[140px]">
+                        {p.name}
+                      </span>
+                      <span className="text-[10px] font-mono font-bold text-emerald-700">
+                        No.{p.bibNumber} (8中)
+                      </span>
+                    </div>
+                  ))
+                ) : (
+                  <span className="text-[11px] text-slate-400 block py-1">
+                    現在皆中達成者はいません
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* 3. 第1立 甲矢賞（特別賞） */}
+          <div className="p-4 rounded-xl border border-red-200 bg-red-50/40 space-y-2">
+            <div className="flex items-center justify-between border-b border-red-200/60 pb-1.5">
+              <span className="text-xs font-black text-red-950 flex items-center gap-1.5">
+                <Award className="w-4 h-4 text-red-600" />
+                第1立 甲矢賞（特別賞）
+              </span>
+              <span className="text-xs font-mono font-black text-red-900 bg-red-100 px-2 py-0.5 rounded-md border border-red-200">
+                {summary.hayaShooters.length} 名的中
+              </span>
+            </div>
+
+            <div className="space-y-1">
+              <span className="text-[11px] text-red-900 font-bold block">
+                甲矢的中者一覧
+              </span>
+              <div className="max-h-24 overflow-y-auto space-y-1 pr-1">
+                {summary.hayaShooters.length > 0 ? (
+                  summary.hayaShooters.map((p) => (
+                    <div
+                      key={p.id}
+                      className="flex items-center justify-between text-xs bg-white/90 p-1.5 px-2 rounded-lg border border-red-200/70"
+                    >
+                      <span className="font-bold text-slate-900 truncate max-w-[140px]">
+                        {p.name}
+                      </span>
+                      <span className="text-[10px] font-mono font-bold text-red-700">
+                        No.{p.bibNumber}
+                      </span>
+                    </div>
+                  ))
+                ) : (
+                  <span className="text-[11px] text-slate-400 block py-1">
+                    甲矢的中記録はありません
+                  </span>
+                )}
+              </div>
+            </div>
           </div>
         </div>
-
-        {/* 四矢皆中賞 */}
-        <div className="bg-slate-800/50 border border-emerald-500/30 rounded-lg p-3 space-y-1.5">
-          <span className="font-bold text-emerald-300 flex items-center gap-1">
-            <Flame className="w-3.5 h-3.5 text-emerald-400" /> 四矢皆中賞（午後の部 4射4中）
-          </span>
-          <div className="flex flex-wrap gap-1.5 max-h-20 overflow-y-auto">
-            {yotsuyaKaichuShooters.length > 0 ? (
-              yotsuyaKaichuShooters.map((p) => (
-                <span key={p.id} className="bg-emerald-500/20 text-emerald-200 px-1.5 py-0.5 rounded font-mono text-[11px]">
-                  No.{p.bibNumber} {p.name}
-                </span>
-              ))
-            ) : (
-              <span className="text-slate-500 italic">該当者なし</span>
-            )}
-          </div>
-        </div>
-
-        {/* 8射全皆中 */}
-        <div className="bg-slate-800/50 border border-red-500/30 rounded-lg p-3 space-y-1.5">
-          <span className="font-bold text-red-300 flex items-center gap-1">
-            <Trophy className="w-3.5 h-3.5 text-red-400" /> 8射皆中特別賞（8中）
-          </span>
-          <div className="flex flex-wrap gap-1.5 max-h-20 overflow-y-auto">
-            {perfectShooters.length > 0 ? (
-              perfectShooters.map((p) => (
-                <span key={p.id} className="bg-red-500/20 text-red-200 px-1.5 py-0.5 rounded font-mono text-[11px]">
-                  No.{p.bibNumber} {p.name}
-                </span>
-              ))
-            ) : (
-              <span className="text-slate-500 italic">該当者なし</span>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
+      </CardContent>
+    </Card>
   );
 }
