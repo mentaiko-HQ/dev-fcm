@@ -1,61 +1,35 @@
 /**
- * 【弓道大会運営システム 共通ドメイン型定義モジュール】
+ * 【弓道大会運営システム ドメイン型・定数・サニタイズ関数定義】
  *
  * 役割:
- * - 競技形式（個人戦・全8射: 午前一手2射 / 午後一手2射 / 午後四矢4射）の統合定義。
- * - 立構造・矢数マスター（STAND_CONFIGS, TOTAL_TOURNAMENT_SHOTS）の定数提供。
- * - 選手・チーム・スコア・大会設定・通知・QR発行に跨る全データモデルの型安全性の保証。
- * - 組番号・立順（射位）の未設定（null）許容仕様に対応。
- * - 入力データの整合性を保つ型ガードおよびサニタイズ関数の提供。
+ * - 個人戦・団体戦、一手（2射）・四矢（4射）、計8射的中制の競技ルールを型安全に定義。
+ * - 射詰（サドンデス競射）、遠近競射（的中位置判定）の状態管理。
+ * - ParticipantDataTable、StandScoreContainer、立ち順編成、FCM通知、当日受付で要求される
+ *   全データモデル、競技ルール定数、およびサニタイズ関数を一元管理。
  *
- * フールプルーフ設計（操作ミス・不正データの入口遮断）:
- * - 的中結果（HitResult: 1 | 0）、立番号（StandRoundIndex: 1 | 2 | 3）、立順（StandOrderIndex: 1〜5）の厳格リテラル型化。
- * - 型ガード関数群により、外部入力値や破損データを早期に検知・補正。
+ * フールプルーフ設計（事故前・対人間）:
+ * - 的中結果（HitResult）、射位インデックス（1〜5）、立インデックス（1〜3）をUnion型で制約。
+ * - 不正な文字列・null・undefinedが渡された場合でも安全な規定値へ強制変換するサニタイズ関数群
+ *   （sanitizeCheckInStatus, sanitizeProgressStatus, sanitizeQualificationStatus 等）を完備。
  *
- * フェイルセーフ設計（障害時の安全縮退）:
- * - 不正な立番号や矢数、ステータス値が渡された場合でも、サニタイズ関数により安全なデフォルト値へ自動フォールバック。
+ * フェイルセーフ設計（事故後・対故障）:
+ * - 各立の設定（STAND_CONFIGS）および大会総射数（TOTAL_TOURNAMENT_SHOTS）を不変定数としてエクスポート。
+ * - standGroup, standOrder が null（未設定）の場合でもUIコンポーネントがクラッシュしない null 許容構造。
  */
 
-// ==========================================
-// 1. 弓道ドメイン 基礎プリミティブ型
-// ==========================================
+// 的中結果区分（O: 的中 〇, X: はずれ ✕）
+export type HitResult = 'O' | 'X';
 
-// 的中結果（1: 的中〇, 0: 外れ✕）
-export type HitResult = 1 | 0;
-
-// 立インデックス（1: 第1立・午前一手2射, 2: 第2立・午後一手2射, 3: 第3立・午後四矢4射）
-export type StandRoundIndex = 1 | 2 | 3;
-
-// 立順（射位番号: 1番大前 〜 5番落）
-export type StandOrderIndex = 1 | 2 | 3 | 4 | 5;
-
-// 下位互換エイリアス（null許容）
-export type StandOrderType = StandOrderIndex | null;
-
-// 矢数種別（2: 一手, 4: 四矢）
-export type ArrowCountType = 2 | 4;
-
-// 競技種別（個人戦 / 団体戦）
-export type CompetitionCategory = 'INDIVIDUAL' | 'TEAM';
-export type MatchType = 'INDIVIDUAL' | 'TEAM';
-
-// 矢数ルール（一手: 2射, 四矢: 4射）
-export type ArrowRule = 'HITOTE' | 'YOTSUYA';
-
-// 順位決定戦方式（IZUME: 射詰サドンデス, ENKIN: 遠近中心距離判定）
-export type TieBreakerMethod = 'IZUME' | 'ENKIN';
-export type TieBreakerRule = 'IZUME' | 'ENKIN';
-
-// 所作区分
+// 所作区分（肌脱ぎ・襷掛け）
 export type ShosaType = '肌脱ぎ' | '襷掛け';
 
 // 称号・段位区分
 export type RankTitleType =
-  | '段位は三段以下'
+  | '称号を取得している'
   | '段位は四段以上'
-  | '称号を取得している';
+  | '段位は三段以下';
 
-// 役員役割区分
+// 当日役員役割区分
 export type StaffRoleType =
   | '進行'
   | '的前'
@@ -65,175 +39,131 @@ export type StaffRoleType =
   | '運営'
   | '無し';
 
-// 役員担当時間帯区分
-export type StaffDutyShiftType = 'AM' | 'PM' | '終日' | '無し';
+// 当日役員シフト区分
+export type StaffDutyShiftType = '午前のみ' | '午後のみ' | '終日' | '無し';
 
-// 受付ステータス
+// 立ち順・射位（1: 大前, 2: 二的, 3: 中, 4: 落前, 5: 落）
+export type StandOrderIndex = 1 | 2 | 3 | 4 | 5;
+
+// ラウンド番号（1: 午前一手, 2: 午後一手, 3: 午後四矢）
+export type StandRoundIndex = 1 | 2 | 3;
+
+// 進行ステータス
+export type ProgressStatus =
+  | 'WAITING' // 待機中
+  | 'CALLED' // 招集済（2立前呼出通知送信済）
+  | 'IN_STAND' // 入場・射場待機
+  | 'SHOOTING' // 行射中
+  | 'FINISHED' // 立終了
+  | 'COMPLETED'; // 全競技終了
+
+// 当日入場チェックインステータス
 export type CheckInStatus = 'UNCHECKED' | 'CHECKED_IN' | 'ABSENT';
 
-// 競技進行ステータス
-export type ProgressStatus =
-  | 'WAITING'
-  | 'CALLED'
-  | 'IN_STAND'
-  | 'SHOOTING'
-  | 'FINISHED'
-  | 'COMPLETED';
-
 // 参加資格ステータス
-export type QualificationStatus = 'ACTIVE' | 'DISQUALIFIED' | 'WITHDRAWN';
+export type QualificationStatus = 'ACTIVE' | 'WITHDRAWN' | 'DISQUALIFIED';
 
-// 大会進行ステータス
-export type MatchStatus = 'READY' | 'IN_PROGRESS' | 'TIE_BREAKER' | 'FINISHED';
-
-// QRコード送信ステータス
+// 正式案内・QRカード送信ステータス
 export type QrDeliveryStatus = 'UNSENT' | 'SENT' | 'FAILED';
 
-// ==========================================
-// 2. 立構造・大会設定モデル & 定数マスター
-// ==========================================
+// 矢の的中判定（true: 的中 〇, false: はずれ ✕）
+export type ArrowHit = boolean;
 
-export interface StandConfig {
-  roundIndex: StandRoundIndex;
-  name: string;
-  periodName: '午前の部' | '午後の部';
-  formatDescription: string;
-  arrowCount: ArrowCountType;
+// 立順割当情報
+export interface StandAssignment {
+  standGroup: number | null; // 組番号
+  standOrder: StandOrderIndex | null; // 射位
 }
 
-/**
- * 競技構成マスター設定
- * - 第1立: 午前 一手（2射）※甲矢的中特別賞対象
- * - 第2立: 午後 一手（2射）
- * - 第3立: 午後 四矢（4射）
- * 合計: 8射
- */
+// 立別競技設定定義
+export interface StandConfig {
+  round: StandRoundIndex;
+  name: string;
+  arrowsCount: number;
+  format: '一手' | '四矢';
+  timeSlot: '午前' | '午後';
+}
+
+// ==========================================
+// 競技ルール定数定義
+// ==========================================
+
+// 大会総射数（午前の部: 一手2射 + 午後の部: 一手2射 + 四矢4射 = 計8射）
+export const TOTAL_TOURNAMENT_SHOTS = 8;
+
+// 各立の構成設定マップ
 export const STAND_CONFIGS: Record<StandRoundIndex, StandConfig> = {
   1: {
-    roundIndex: 1,
+    round: 1,
     name: '第1立 (午前・一手)',
-    periodName: '午前の部',
-    formatDescription: '一次審査要領・一手（2射）/ 甲矢的中特別賞対象',
-    arrowCount: 2,
+    arrowsCount: 2,
+    format: '一手',
+    timeSlot: '午前',
   },
   2: {
-    roundIndex: 2,
+    round: 2,
     name: '第2立 (午後・一手)',
-    periodName: '午後の部',
-    formatDescription: '一次審査要領・一手（2射）',
-    arrowCount: 2,
+    arrowsCount: 2,
+    format: '一手',
+    timeSlot: '午後',
   },
   3: {
-    roundIndex: 3,
+    round: 3,
     name: '第3立 (午後・四矢)',
-    periodName: '午後の部',
-    formatDescription: '立射・四矢（4射）',
-    arrowCount: 4,
+    arrowsCount: 4,
+    format: '四矢',
+    timeSlot: '午後',
   },
 };
 
-// 大会規定総射数（2 + 2 + 4 = 8射）
-export const TOTAL_TOURNAMENT_SHOTS = 8;
-
-export interface TournamentConfig {
-  matchId: string;
-  title: string;
-  date?: string;
-  venue?: string;
-  totalStandGroups?: number;
-  totalStands?: number;
-  totalArrows?: number;
-  tieBreakerFormat?: string;
-  status?: MatchStatus;
-  currentStandGroup?: number;
-  maxStandGroup?: number;
-  entryStartDate?: string;
-  entryEndDate?: string;
-  isEntryEnabled?: boolean;
-}
-
-export interface Match {
-  id: string;
-  title: string;
-  matchType: MatchType;
-  arrowRule: ArrowRule;
-  tieBreakerRule: TieBreakerRule;
-  currentStandOrder: number;
-  totalStands: number;
-  isCompleted: boolean;
-  createdAt: number;
-  updatedAt: number;
-}
-
 // ==========================================
-// 3. 立配置・スコア・競射モデル
+// 主要データモデル定義
 // ==========================================
 
-export interface StandAssignment {
-  standGroup: number | null;
-  standOrder: StandOrderIndex | null;
+// 参加選手データモデル
+export interface Participant {
+  id: string; // Firestore ドキュメントID
+  bibNumber: number; // ゼッケン番号
+  name: string; // 選手氏名
+  nameKana: string; // ふりがな
+  organization: string; // 所属支部・団体
+  shosa: ShosaType; // 所作
+  rankTitle: RankTitleType; // 称号・段位
+  staffRole: StaffRoleType; // 役員役割
+  staffDutyShift: StaffDutyShiftType; // 役員シフト
+  checkInStatus: CheckInStatus; // 当日受付状態
+  checkInAt: number | null; // 受付日時（UNIXミリ秒）
+  checkInMethod?: 'QR_SCAN' | 'MANUAL' | null; // 受付手段
+  isStaffVolunteer: boolean; // 役員協力可否
+  needsSupport: boolean; // 所作サポート希望
+  standAssignments: Record<StandRoundIndex, StandAssignment>; // 各ラウンドの立ち順
+  progressStatus: ProgressStatus; // 進行状況
+  qualificationStatus: QualificationStatus; // 参加資格
+  stand1_arrows: ArrowHit[]; // 第1立（一手2射）的中記録
+  stand2_arrows: ArrowHit[]; // 第2立（一手2射）的中記録
+  stand3_arrows: ArrowHit[]; // 第3立（四矢4射）的中記録
+  isHayaHit: boolean; // 甲矢（第1射）的中フラグ
+  totalHits: number; // 合計的中数（最大8）
+  totalShots: number; // 合計行射数（通常8）
+  isPerfect: boolean; // 皆中（8射8中）フラグ
+  enkinRank: number | null; // 遠近競射確定順位
+  finalRank: number | null; // 最終確定順位
+  representativeName: string; // 申込代表者氏名
+  representativeEmail: string; // 申込代表者メールアドレス
+  representativePhone: string; // 申込代表者電話番号
+  representativeOrganization: string; // 申込代表者所属
+  isPaid: boolean; // 参加費納付済フラグ
+  paidAt: number | null; // 納付承認日時（UNIXミリ秒）
+  notes: string; // 備考
+  qrSentStatus: QrDeliveryStatus; // 正式QRカード配信状態
+  qrSentAt: number | null; // QR送信日時
+  qrSentError: string | null; // QR送信エラー詳細
+  agreedAt?: number; // 規約同意日時
+  updatedAt?: number; // 最終更新日時
+  userId?: string; // 紐付け端末UID
 }
 
-export interface ScoreHistoryItem {
-  arrowIndex: number;
-  result: HitResult;
-  timestamp: number;
-}
-
-export interface ScoreRecord {
-  id: string;
-  matchId: string;
-  teamId: string;
-  playerId: string;
-  playerName: string;
-  standOrder: number;
-  arrows: HitResult[];
-  history: ScoreHistoryItem[];
-  totalHits: number;
-  updatedAt: number;
-}
-
-export interface TieBreakerRecord {
-  method: TieBreakerMethod;
-  arrows: HitResult[];
-  distanceMm?: number;
-  rank?: number;
-}
-
-export interface PlayerScore {
-  playerId: string;
-  playerName: string;
-  bibNumber: number;
-  name: string;
-  nameKana: string;
-  organization: string;
-  shosa: ShosaType;
-  staffRole: StaffRoleType;
-  qualificationStatus: QualificationStatus;
-  standAssignments: Record<StandRoundIndex, StandAssignment>;
-  stand1_arrows: HitResult[];
-  stand2_arrows: HitResult[];
-  stand3_arrows: HitResult[];
-  isHayaHit?: boolean;
-  tieBreaker?: TieBreakerRecord;
-  totalHits: number;
-  isCompleted: boolean;
-  isPerfect: boolean;
-}
-
-export interface StandMatchScore {
-  matchId: string;
-  standGroup: number;
-  roundIndex: StandRoundIndex;
-  playerScores: Record<string, PlayerScore>;
-  isLocked: boolean;
-  updatedAt: number;
-}
-
-// ==========================================
-// 4. チーム・ユーザー・進行通知モデル
-// ==========================================
-
+// チーム情報データモデル（団体戦・進行管理用）
 export interface Team {
   id: string;
   name: string;
@@ -244,232 +174,158 @@ export interface Team {
   updatedAt?: number;
 }
 
+// ユーザー端末・FCM通知管理データモデル
 export interface AppUser {
-  userId: string;
-  teamId: string;
-  teamName: string;
-  participantId?: string;
-  playerName?: string;
-  bibNumber?: number;
-  standGroup?: number;
-  fcmToken: string | null;
-  updatedAt: number;
-  tokenCleanedAt?: number;
+  userId: string; // Firebase Auth UID または 端末固有ID
+  participantId?: string; // 紐付け選手ID
+  bibNumber?: number; // ゼッケン番号
+  playerName?: string; // 選手氏名
+  teamId?: string; // 所属チームID
+  teamName?: string; // 所属チーム名
+  standGroup?: number; // 所属組
+  fcmToken: string | null; // FCMプッシュ通知デバイストークン
+  updatedAt: number; // 更新日時
 }
 
-export interface MatchProgress {
-  matchId: string;
-  title: string;
-  currentRound: StandRoundIndex;
-  currentStandGroup: number;
-  totalStandGroups: number;
-  status: MatchStatus;
-  updatedAt: number;
+// 大会設定データモデル
+export interface TournamentConfig {
+  matchId: string; // 大会識別子
+  title: string; // 大会名称
+  date: string; // 開催日 (YYYY-MM-DD)
+  venue: string; // 競技会場
+  totalStandGroups: number; // 総立数・組数
+  currentStandGroup?: number; // 現在進行中の組
+  currentRound?: StandRoundIndex; // 現在進行中の立 (1:午前一手, 2:午後一手, 3:午後四矢)
+  isEntryOpen?: boolean; // エントリー受付中フラグ
 }
 
-// ==========================================
-// 5. 参加選手統合モデル & エントリーフォーム型
-// ==========================================
-
-export interface EntryPlayerItem {
-  name: string;
-  nameKana: string;
-  shosa: ShosaType;
-  rankTitle: RankTitleType;
-  needsSupport: boolean;
-  isStaffVolunteer: boolean;
-}
-
-export interface RepresentativeEntryFormData {
-  representativeName: string;
-  representativeEmail: string;
-  representativePhone: string;
-  representativeOrganization: string;
-  players: EntryPlayerItem[];
-  notes: string;
-}
-
-export interface Participant {
-  id: string;
-  bibNumber: number;
-  name: string;
-  nameKana: string;
-  organization: string;
-  shosa: ShosaType;
-  rankTitle: RankTitleType;
-  staffRole: StaffRoleType;
-  staffDutyShift: StaffDutyShiftType;
-  checkInStatus: CheckInStatus;
-  checkInAt: number | null;
-  isStaffVolunteer: boolean;
-  needsSupport: boolean;
-  standAssignments: Record<StandRoundIndex, StandAssignment>;
-  progressStatus: ProgressStatus;
-  qualificationStatus: QualificationStatus;
-  stand1_arrows: HitResult[];
-  stand2_arrows: HitResult[];
-  stand3_arrows: HitResult[];
-  isHayaHit: boolean;
-  totalHits: number;
-  totalShots: number;
-  isPerfect: boolean;
-  enkinRank: number | null;
-  finalRank: number | null;
-  representativeName: string;
-  representativeEmail: string;
-  representativePhone: string;
-  representativeOrganization: string;
-  isPaid: boolean;
-  paidAt: number | null;
-  notes: string;
-  qrSentAt?: number | null;
-  qrSentStatus?: QrDeliveryStatus;
-  qrSentError?: string | null;
-  agreedAt?: number | null;
-  updatedAt?: number;
-  userId?: string;
+// 競射（タイブレーク）データモデル
+export interface TieBreakerState {
+  type: 'IZUME' | 'ENKIN'; // 射詰（優勝決定）または 遠近（順位決定）
+  targetRank: number; // 対象順位（例: 1位決定, 2位決定）
+  candidateParticipantIds: string[]; // 対象選手IDリスト
+  roundHistory: Record<string, boolean[]>; // 射詰時の選手別的中推移
+  enkinDistanceOrder?: string[]; // 遠近競射時の的中位置順リスト（中心に近い順）
+  isResolved: boolean; // 決着フラグ
 }
 
 // ==========================================
-// 6. フールプルーフ / フェイルセーフ ヘルパー関数群
+// 型ガード・サニタイズ関数群（フールプルーフ）
 // ==========================================
 
-export function isHitResult(value: unknown): value is HitResult {
-  return value === 1 || value === 0;
-}
-
-export function isStandRoundIndex(value: unknown): value is StandRoundIndex {
-  return value === 1 || value === 2 || value === 3;
-}
-
-export function sanitizeStandRoundIndex(value: unknown): StandRoundIndex {
-  const num = Number(value);
-  if (num === 1 || num === 2 || num === 3) {
-    return num;
-  }
-  console.warn(
-    '【フェイルセーフ】不正な立インデックスを検出。第1立にフォールバック:',
-    value,
-  );
-  return 1;
-}
-
-export function isShosaType(value: unknown): value is ShosaType {
-  return value === '肌脱ぎ' || value === '襷掛け';
-}
-
-export function sanitizeShosaType(value: unknown): ShosaType {
-  if (isShosaType(value)) {
-    return value;
-  }
-  console.warn(
-    '【フェイルセーフ】不正な所作区分を検出。肌脱ぎにフォールバック:',
-    value,
-  );
-  return '肌脱ぎ';
-}
-
-export function isRankTitleType(value: unknown): value is RankTitleType {
-  return (
-    value === '段位は三段以下' ||
-    value === '段位は四段以上' ||
-    value === '称号を取得している'
-  );
-}
-
-export function sanitizeRankTitleType(value: unknown): RankTitleType {
-  if (isRankTitleType(value)) {
-    return value;
-  }
-  console.warn(
-    '【フェイルセーフ】不正な段位称号区分を検出。段位は三段以下にフォールバック:',
-    value,
-  );
-  return '段位は三段以下';
+/**
+ * 的中結果型ガード（'O' または 'X' であるかを判定）
+ */
+export function isHitResult(val: unknown): val is HitResult {
+  return val === 'O' || val === 'X';
 }
 
 /**
- * 【フールプルーフ】立順（射位番号: 1〜5）の安全なサニタイズ（未設定時はnullを返却）
+ * 組番号サニタイズ（正の整数のみ許容）
  */
-export function sanitizeStandOrder(value: unknown): StandOrderIndex | null {
-  if (value === null || value === undefined || value === '') {
-    return null;
+export function sanitizeStandGroup(val: unknown): number | null {
+  if (typeof val === 'number' && !isNaN(val) && val > 0) {
+    return Math.floor(val);
   }
-  const num = Number(value);
-  if (num >= 1 && num <= 5) {
+  if (typeof val === 'string') {
+    const parsed = parseInt(val, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+/**
+ * 射位番号サニタイズ（1〜5のみ許容）
+ */
+export function sanitizeStandOrder(val: unknown): StandOrderIndex | null {
+  const num =
+    typeof val === 'number'
+      ? val
+      : typeof val === 'string'
+        ? parseInt(val, 10)
+        : null;
+  if (num === 1 || num === 2 || num === 3 || num === 4 || num === 5) {
     return num as StandOrderIndex;
   }
   return null;
 }
 
 /**
- * 【フールプルーフ】組番号（1以上の自然数）の安全なサニタイズ（未設定時はnullを返却）
+ * 所作区分サニタイズ
  */
-export function sanitizeStandGroup(value: unknown): number | null {
-  if (value === null || value === undefined || value === '') {
-    return null;
-  }
-  const num = Number(value);
-  if (!isNaN(num) && num >= 1) {
-    return Math.floor(num);
-  }
-  return null;
+export function sanitizeShosaType(val: unknown): ShosaType {
+  if (val === '襷掛け') return '襷掛け';
+  return '肌脱ぎ';
 }
 
-export function isCheckInStatus(value: unknown): value is CheckInStatus {
-  return value === 'UNCHECKED' || value === 'CHECKED_IN' || value === 'ABSENT';
+/**
+ * 称号・段位区分サニタイズ
+ */
+export function sanitizeRankTitleType(val: unknown): RankTitleType {
+  if (val === '称号を取得している' || val === '段位は四段以上') {
+    return val;
+  }
+  return '段位は三段以下';
 }
 
-export function sanitizeCheckInStatus(value: unknown): CheckInStatus {
-  if (isCheckInStatus(value)) {
-    return value;
+/**
+ * 当日役員役割サニタイズ
+ */
+export function sanitizeStaffRole(val: unknown): StaffRoleType {
+  const validRoles: StaffRoleType[] = [
+    '進行',
+    '的前',
+    '招集',
+    '記録',
+    'カメラマン',
+    '運営',
+    '無し',
+  ];
+  if (typeof val === 'string' && validRoles.includes(val as StaffRoleType)) {
+    return val as StaffRoleType;
   }
-  console.warn(
-    '【フェイルセーフ】不正な受付ステータスを検出。UNCHECKEDにフォールバック:',
-    value,
-  );
+  return '無し';
+}
+
+/**
+ * 受付ステータスサニタイズ
+ */
+export function sanitizeCheckInStatus(val: unknown): CheckInStatus {
+  if (val === 'CHECKED_IN' || val === 'ABSENT' || val === 'UNCHECKED') {
+    return val as CheckInStatus;
+  }
   return 'UNCHECKED';
 }
 
-export function isProgressStatus(value: unknown): value is ProgressStatus {
-  return (
-    value === 'WAITING' ||
-    value === 'CALLED' ||
-    value === 'IN_STAND' ||
-    value === 'SHOOTING' ||
-    value === 'FINISHED' ||
-    value === 'COMPLETED'
-  );
-}
-
-export function sanitizeProgressStatus(value: unknown): ProgressStatus {
-  if (isProgressStatus(value)) {
-    return value;
+/**
+ * 進行状況ステータスサニタイズ
+ */
+export function sanitizeProgressStatus(val: unknown): ProgressStatus {
+  const validStatuses: ProgressStatus[] = [
+    'WAITING',
+    'CALLED',
+    'IN_STAND',
+    'SHOOTING',
+    'FINISHED',
+    'COMPLETED',
+  ];
+  if (
+    typeof val === 'string' &&
+    validStatuses.includes(val as ProgressStatus)
+  ) {
+    return val as ProgressStatus;
   }
-  console.warn(
-    '【フェイルセーフ】不正な進行ステータスを検出。WAITINGにフォールバック:',
-    value,
-  );
   return 'WAITING';
 }
 
-export function isQualificationStatus(
-  value: unknown,
-): value is QualificationStatus {
-  return (
-    value === 'ACTIVE' || value === 'DISQUALIFIED' || value === 'WITHDRAWN'
-  );
-}
-
-export function sanitizeQualificationStatus(
-  value: unknown,
-): QualificationStatus {
-  if (isQualificationStatus(value)) {
-    return value;
+/**
+ * 参加資格ステータスサニタイズ
+ */
+export function sanitizeQualificationStatus(val: unknown): QualificationStatus {
+  if (val === 'ACTIVE' || val === 'WITHDRAWN' || val === 'DISQUALIFIED') {
+    return val as QualificationStatus;
   }
-  console.warn(
-    '【フェイルセーフ】不正な参加資格ステータスを検出。ACTIVEにフォールバック:',
-    value,
-  );
   return 'ACTIVE';
 }

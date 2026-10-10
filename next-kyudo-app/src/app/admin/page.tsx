@@ -12,20 +12,25 @@
  * 5. 競技記録員用 スコア入力コンソール (StandScoreContainer)
  * 6. 競射判定 / 順位確定 (TieBreakerRankPanel)
  * 7. 参加者一覧 / 進行状況管理テーブル (ParticipantDataTable)
+ *    - 参加選手全データCSVエクスポート機能（UTF-8 BOM付き・Excel文字化け防止）
  * 8. データベース初期化・データリセット管理 (DataResetPanel)
  *
- * フールプルーフ設計:
+ * フールプルーフ設計（事故前・対人間）:
+ * - 参加者データが0件（空配列）の場合はCSVエクスポートボタンを非活性化（disabled）し、空ファイルの出力を遮断。
+ * - CSV出力時にダブルクォート、カンマ、改行を含む文字列をRFC 4180準拠でエスケープ。
+ * - Excelでの直接オープン時に文字化けしないよう、UTF-8 BOM（\uFEFF）を自動付加。
  * - 各種サニタイズ関数により不正データの流入を遮断。
- * - Participant 型に要求される isHayaHit および null 許容 standAssignments を完全網羅。
  *
- * フェイルセーフ設計:
+ * フェイルセーフ設計（事故後・対故障）:
+ * - CSV生成およびダウンロード実行時の例外をtry-catchで捕捉し、ブラウザクラッシュやUI膠着を防止。
+ * - URL.createObjectURL で生成した一時リソースを即座に URL.revokeObjectURL で破棄し、メモリリークを抑止。
  * - Firestore未接続時やデータ不在時は DEFAULT_TOURNAMENT_CONFIG へ安全にフォールバック。
  * - standGroup, standOrder が null の場合でも画面クラッシュを防止。
  */
 
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   collection,
@@ -64,6 +69,8 @@ import {
   ArrowLeft,
   Database,
   QrCode,
+  Download,
+  AlertCircle,
 } from 'lucide-react';
 
 const DEFAULT_TOURNAMENT_CONFIG: TournamentConfig = {
@@ -132,12 +139,24 @@ function sanitizeCheckInStatus(val: unknown): CheckInStatus {
   return 'UNCHECKED';
 }
 
+/**
+ * CSVセルエスケープ処理（RFC 4180準拠）
+ */
+function escapeCsvField(val: unknown): string {
+  if (val === null || val === undefined) return '""';
+  const str = String(val);
+  // ダブルクォート、カンマ、改行が含まれる場合は全体をダブルクォートで囲み、内部の " を "" に変換
+  const escaped = str.replace(/"/g, '""');
+  return `"${escaped}"`;
+}
+
 export default function AdminConsolePage() {
   const router = useRouter();
   const [tournamentConfig, setTournamentConfig] = useState<TournamentConfig>(
     DEFAULT_TOURNAMENT_CONFIG,
   );
   const [participants, setParticipants] = useState<Participant[]>([]);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
@@ -302,6 +321,142 @@ export default function AdminConsolePage() {
     return () => unsubscribe();
   }, [tournamentConfig.matchId]);
 
+  /**
+   * 【CSVエクスポートハンドラー】
+   * UTF-8 BOM付きCSVファイルを生成しブラウザ経由でダウンロード。
+   */
+  const handleExportCsv = useCallback(() => {
+    setExportError(null);
+
+    if (participants.length === 0) {
+      setExportError('出力対象の参加選手データが存在しません。');
+      return;
+    }
+
+    try {
+      const headers = [
+        'ゼッケン番号',
+        '選手氏名',
+        'ふりがな',
+        '所属',
+        '所作',
+        '称号段位',
+        '役員役割',
+        '役員シフト',
+        '午前(第1立)組',
+        '午前(第1立)射位',
+        '午後(第2立)組',
+        '午後(第2立)射位',
+        '午後(第3立)組',
+        '午後(第3立)射位',
+        '受付状態',
+        '受付日時',
+        '参加資格',
+        '進行状態',
+        '合計的中数',
+        '甲矢的中',
+        '入金状態',
+        '入金確認日',
+        'QR送信状態',
+        'QR送信日時',
+        '申込代表者氏名',
+        '申込代表者メール',
+        '申込代表者電話',
+        '申込代表者所属',
+        '所作支援希望',
+        '役員協力希望',
+        '備考',
+        'エントリーID',
+      ];
+
+      const rows = participants.map((p) => {
+        const m = p.standAssignments[1];
+        const a2 = p.standAssignments[2];
+        const a3 = p.standAssignments[3];
+
+        return [
+          escapeCsvField(p.bibNumber),
+          escapeCsvField(p.name),
+          escapeCsvField(p.nameKana),
+          escapeCsvField(p.organization),
+          escapeCsvField(p.shosa),
+          escapeCsvField(p.rankTitle),
+          escapeCsvField(p.staffRole),
+          escapeCsvField(p.staffDutyShift),
+          escapeCsvField(m?.standGroup ?? ''),
+          escapeCsvField(m?.standOrder ?? ''),
+          escapeCsvField(a2?.standGroup ?? ''),
+          escapeCsvField(a2?.standOrder ?? ''),
+          escapeCsvField(a3?.standGroup ?? ''),
+          escapeCsvField(a3?.standOrder ?? ''),
+          escapeCsvField(
+            p.checkInStatus === 'CHECKED_IN'
+              ? '受付済'
+              : p.checkInStatus === 'ABSENT'
+                ? '棄権'
+                : '未受付',
+          ),
+          escapeCsvField(
+            p.checkInAt ? new Date(p.checkInAt).toLocaleString('ja-JP') : '',
+          ),
+          escapeCsvField(p.qualificationStatus),
+          escapeCsvField(p.progressStatus),
+          escapeCsvField(p.totalHits),
+          escapeCsvField(p.isHayaHit ? '的中' : '-'),
+          escapeCsvField(p.isPaid ? '入金済' : '未納'),
+          escapeCsvField(
+            p.paidAt ? new Date(p.paidAt).toLocaleDateString('ja-JP') : '',
+          ),
+          escapeCsvField(
+            p.qrSentStatus === 'SENT'
+              ? '送信済'
+              : p.qrSentStatus === 'FAILED'
+                ? '送信失敗'
+                : '未送信',
+          ),
+          escapeCsvField(
+            p.qrSentAt ? new Date(p.qrSentAt).toLocaleString('ja-JP') : '',
+          ),
+          escapeCsvField(p.representativeName),
+          escapeCsvField(p.representativeEmail),
+          escapeCsvField(p.representativePhone),
+          escapeCsvField(p.representativeOrganization),
+          escapeCsvField(p.needsSupport ? '希望する' : '無し'),
+          escapeCsvField(p.isStaffVolunteer ? '協力可能' : '無し'),
+          escapeCsvField(p.notes),
+          escapeCsvField(p.id),
+        ].join(',');
+      });
+
+      // UTF-8 BOM (\uFEFF) を付与してExcelでの文字化けを防止
+      const csvContent = '\uFEFF' + [headers.join(','), ...rows].join('\r\n');
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+
+      const now = new Date();
+      const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
+      const timeStr = now.toTimeString().slice(0, 8).replace(/:/g, '');
+      const filename = `participants_${tournamentConfig.matchId}_${dateStr}_${timeStr}.csv`;
+
+      const downloadLink = document.createElement('a');
+      downloadLink.href = url;
+      downloadLink.setAttribute('download', filename);
+      document.body.appendChild(downloadLink);
+      downloadLink.click();
+      document.body.removeChild(downloadLink);
+
+      // 一時URLの即時解放（メモリリーク防止）
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err: unknown) {
+      console.error('【CSVエクスポート例外】:', err);
+      setExportError(
+        err instanceof Error
+          ? `CSV出力に失敗しました: ${err.message}`
+          : 'CSV出力処理中に予期せぬエラーが発生しました。',
+      );
+    }
+  }, [participants, tournamentConfig.matchId]);
+
   return (
     <div className="w-full min-h-screen bg-[#F8FAFC] text-slate-900 p-4 sm:p-6 lg:p-8 space-y-6">
       <header className="w-full bg-white border border-slate-200/80 rounded-2xl p-6 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
@@ -357,6 +512,14 @@ export default function AdminConsolePage() {
         </div>
       </header>
 
+      {/* CSV出力エラー通知バナー */}
+      {exportError && (
+        <div className="w-full p-4 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs font-bold flex items-center gap-2 shadow-2xs">
+          <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+          <span>{exportError}</span>
+        </div>
+      )}
+
       <section className="w-full flex flex-col gap-2 bg-white p-6 border border-slate-200/80 rounded-2xl shadow-sm">
         <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
           1. エントリー受付期間・状態管理
@@ -400,20 +563,40 @@ export default function AdminConsolePage() {
       </section>
 
       <section className="w-full flex flex-col gap-2 bg-white p-6 border border-slate-200/80 rounded-2xl shadow-sm">
-        <div className="flex items-center justify-between pb-2">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2">
           <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
             7. 参加者一覧 / 進行状況管理テーブル
           </h2>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => router.push('/admin/check')}
-            className="text-[11px] h-7 border-emerald-300 text-emerald-800 bg-emerald-50 hover:bg-emerald-100 font-bold"
-          >
-            <QrCode className="w-3 h-3 mr-1 text-emerald-600" />
-            入金確認・立順・QR発行専用ページへ
-          </Button>
+          <div className="flex items-center gap-2">
+            {/* 参加選手全データCSV出力ボタン */}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={participants.length === 0}
+              onClick={handleExportCsv}
+              className="text-[11px] h-7 border-slate-300 text-slate-700 bg-white hover:bg-slate-50 font-bold shadow-2xs disabled:opacity-40"
+              title={
+                participants.length === 0
+                  ? '出力対象の選手データがありません'
+                  : `登録済み全選手（${participants.length}名）のデータをCSV出力`
+              }
+            >
+              <Download className="w-3 h-3 mr-1 text-slate-600" />
+              選手CSV出力 ({participants.length}件)
+            </Button>
+
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => router.push('/admin/check')}
+              className="text-[11px] h-7 border-emerald-300 text-emerald-800 bg-emerald-50 hover:bg-emerald-100 font-bold"
+            >
+              <QrCode className="w-3 h-3 mr-1 text-emerald-600" />
+              入金確認・立順・QR発行専用ページへ
+            </Button>
+          </div>
         </div>
         <ParticipantDataTable participants={participants} />
       </section>

@@ -1,173 +1,182 @@
 /**
- * 【FCM トークン発行および通知権限管理モジュール】
+ * 【Firebase Cloud Messaging (FCM) クライアントトークン取得モジュール】
  *
  * 役割:
- * - ブラウザの Web Notification 権限要求および FCM 登録トークンの発行。
- * - Service Worker (firebase-messaging-sw.js) の安全な登録と連携。
- * - 呼び出し元の仕様（トークン直接取得 / ステータスオブジェクト取得）の双方に対応する互換性提供。
+ * - ブラウザの通知パーミッション（Notification API）の要求および状態検証。
+ * - Service Worker (firebase-messaging-sw.js) の稼働確認および登録。
+ * - Firebase SDK (getToken) を経由したデバイストークンの発行・取得。
+ * - `requestNotificationPermissionAndGetToken` および後方互換用 `requestFcmToken` の両方をエクスポート。
  *
- * フールプルーフ設計（操作ミス・入力不備の入口遮断）:
- * - VAPIDキー未設定または空白値の検知とコンソールエラー出力。
- * - 環境変数読み込み時の .trim() による不要な空白・改行文字の自動除去。
- * - 既にユーザーが通知を「ブロック（denied）」している場合は無駄な権限プロンプト実行をバイパス。
- * - 既存コードの呼び出し互換性維持（requestFCMToken と requestFcmToken の両方をエクスポート）。
+ * フールプルーフ設計（事故前・対人間）:
+ * - SSR（サーバーサイドレンダリング）環境下での window / navigator 参照による例外発生を入口で遮断。
+ * - 通知権限が「denied（拒否）」状態の場合、不要なトークン要求処理を即座に中断し、明示的なエラーメッセージを返却。
+ * - VAPIDキー未設定時（環境変数不備）にわかりやすいエラーメッセージを返却し、原因特定を迅速化。
  *
- * フェイルセーフ設計（障害発生時の安全縮退）:
- * - SSR（サーバーサイドレンダリング）環境や非対応ブラウザで実行された場合でも例外を投げず安全に返却。
- * - Service Worker 登録失敗、ネットワーク切断、Firebase Messaging 起動失敗の全例外を捕捉し、
- *   システム全体の画面描画・操作を停止させない。
+ * フェイルセーフ設計（事故後・対故障）:
+ * - Service Worker の登録失敗やプッシュ通知非対応ブラウザ（iOS非PWA、特定アプリ内ブラウザ）でも
+ *   例外を上位へスローせず、構造化された戻り値 `{ token: null, error: '...' }` として安全に縮退。
+ * - ネットワーク切断時でもアプリのクラッシュを防止。
  */
 
-import { getToken, Messaging } from 'firebase/messaging';
-import { getMessagingInstance } from '@/lib/firebase';
+import { getMessaging, getToken, isSupported } from 'firebase/messaging';
+import { app, isFirebaseConfigured } from '@/lib/firebase';
 
-export interface FCMTokenResult {
+export interface FcmTokenResult {
   token: string | null;
-  status: 'granted' | 'denied' | 'unsupported' | 'error';
-  errorMessage?: string;
+  error?: string | null;
 }
 
 /**
- * ブラウザに通知権限を要求し、詳細なステータスと共に FCM トークンを取得する関数
+ * 【メイン関数】通知パーミッションの要求およびFCMトークンの取得
+ *
+ * @returns {Promise<FcmTokenResult>} 発行されたトークン文字列またはエラー詳細
  */
-export async function requestFCMToken(): Promise<FCMTokenResult> {
-  // 1. クライアント環境および Notification API の対応検証（フールプルーフ）
-  if (typeof window === 'undefined' || !('Notification' in window)) {
-    console.warn(
-      '【FCM警告】このブラウザはWebプッシュ通知に対応していません。',
-    );
+export async function requestNotificationPermissionAndGetToken(): Promise<FcmTokenResult> {
+  // 1. SSR環境およびFirebase未初期化の早期遮断（フールプルーフ）
+  if (
+    typeof window === 'undefined' ||
+    !('Notification' in window) ||
+    !('serviceWorker' in navigator)
+  ) {
     return {
       token: null,
-      status: 'unsupported',
-      errorMessage: 'ご利用のブラウザはプッシュ通知に対応していません。',
+      error: 'ご利用のブラウザはWebプッシュ通知に対応していません。',
     };
   }
 
-  // 2. VAPID公開鍵の存在および文字列検証（フールプルーフ）
-  const rawVapidKey = process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY;
-  const vapidKey = rawVapidKey ? rawVapidKey.trim() : '';
+  if (!isFirebaseConfigured || !app) {
+    return {
+      token: null,
+      error: 'Firebaseが初期化されていません。環境変数設定を確認してください。',
+    };
+  }
 
+  // 2. ブラウザがFCMをサポートしているか検証
+  try {
+    const supported = await isSupported();
+    if (!supported) {
+      return {
+        token: null,
+        error:
+          'この端末・ブラウザ環境ではFirebase Messagingがサポートされていません。',
+      };
+    }
+  } catch (supportErr) {
+    console.warn('【FCM isSupported判定例外】:', supportErr);
+    return {
+      token: null,
+      error: 'プッシュ通知の動作要件を満たしていません。',
+    };
+  }
+
+  // 3. 通知権限（Permission）の確認・要求
+  let permission: NotificationPermission = Notification.permission;
+  if (permission === 'default') {
+    try {
+      permission = await Notification.requestPermission();
+    } catch (permErr) {
+      console.warn('【Notification.requestPermission例外】:', permErr);
+      return {
+        token: null,
+        error: '通知許可ダイアログの表示に失敗しました。',
+      };
+    }
+  }
+
+  if (permission !== 'granted') {
+    return {
+      token: null,
+      error:
+        permission === 'denied'
+          ? '通知がブロックされています。ブラウザの設定から通知を許可してください。'
+          : '通知の許可がキャンセルされました。',
+    };
+  }
+
+  // 4. VAPIDキーの取得検証
+  const vapidKey = process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY;
   if (!vapidKey) {
     console.error(
-      '【FCM設定エラー】NEXT_PUBLIC_FIREBASE_VAPID_KEY が設定されていないか空です。',
+      '【FCM環境変数エラー】NEXT_PUBLIC_FIREBASE_VAPID_KEY が未定義です。',
     );
     return {
       token: null,
-      status: 'error',
-      errorMessage: 'プッシュ通知用公開鍵（VAPID KEY）が未設定です。',
+      error:
+        'プッシュ通知認証キー(VAPID)が設定されていません。大会運営本部にお問い合わせください。',
     };
   }
 
+  // 5. Service Worker の準備およびトークン発行
   try {
-    // 3. 既存の通知権限の事前検証
-    let permission: NotificationPermission = Notification.permission;
-
-    if (permission === 'denied') {
-      console.warn('【FCM通知拒否】ユーザーにより通知がブロックされています。');
-      return {
-        token: null,
-        status: 'denied',
-        errorMessage:
-          'ブラウザ設定で通知がブロックされています。設定から解除してください。',
-      };
-    }
-
-    if (permission === 'default') {
-      permission = await Notification.requestPermission();
-    }
-
-    if (permission !== 'granted') {
-      console.warn(
-        '【FCM通知未許可】通知が許可されませんでした。ステータス:',
-        permission,
+    // 既存の登録済みService Workerを確認
+    let swRegistration = await navigator.serviceWorker.getRegistration(
+      '/firebase-messaging-sw.js',
+    );
+    if (!swRegistration) {
+      swRegistration = await navigator.serviceWorker.register(
+        '/firebase-messaging-sw.js',
+        {
+          scope: '/',
+        },
       );
-      return {
-        token: null,
-        status: 'denied',
-        errorMessage: '通知の受信が許可されませんでした。',
-      };
     }
 
-    // 4. Messaging インスタンスの安全な取得（フェイルセーフ）
-    const messaging: Messaging | null = await getMessagingInstance();
-    if (!messaging) {
-      console.error(
-        '【FCMエラー】Firebase Messaging機能の初期化・起動に失敗しました。',
-      );
-      return {
-        token: null,
-        status: 'unsupported',
-        errorMessage: 'Messaging機能の起動に失敗しました。',
-      };
-    }
+    // サービスワーカーのアクティブ化を待機
+    await navigator.serviceWorker.ready;
 
-    // 5. Service Worker の登録および準備待機
-    let serviceWorkerRegistration: ServiceWorkerRegistration | undefined;
-    if ('serviceWorker' in navigator) {
-      try {
-        const projectId = (
-          process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID || ''
-        ).trim();
-        const senderId = (
-          process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID || ''
-        ).trim();
-        const apiKey = (process.env.NEXT_PUBLIC_FIREBASE_API_KEY || '').trim();
-        const appId = (process.env.NEXT_PUBLIC_FIREBASE_APP_ID || '').trim();
-
-        const swUrl = `/firebase-messaging-sw.js?projectId=${encodeURIComponent(projectId)}&messagingSenderId=${encodeURIComponent(senderId)}&apiKey=${encodeURIComponent(apiKey)}&appId=${encodeURIComponent(appId)}`;
-
-        serviceWorkerRegistration =
-          await navigator.serviceWorker.register(swUrl);
-        await navigator.serviceWorker.ready;
-      } catch (swError) {
-        console.error(
-          '【FCM警告】Service Workerの登録に失敗しました。デフォルトワーカーを試行します:',
-          swError,
-        );
-        serviceWorkerRegistration = await navigator.serviceWorker.ready;
-      }
-    }
-
-    // 6. FCM トークンの発行実行
+    const messaging = getMessaging(app);
     const currentToken = await getToken(messaging, {
       vapidKey,
-      serviceWorkerRegistration,
+      serviceWorkerRegistration: swRegistration,
     });
 
-    if (currentToken && currentToken.trim().length > 0) {
-      return {
-        token: currentToken.trim(),
-        status: 'granted',
-      };
-    } else {
-      console.warn(
-        '【FCM警告】利用可能なFCMトークンが空または生成されませんでした。',
+    if (currentToken) {
+      console.info(
+        '【FCMトークン取得成功】トークンプレビュー:',
+        currentToken.substring(0, 15) + '...',
       );
       return {
+        token: currentToken,
+        error: null,
+      };
+    } else {
+      return {
         token: null,
-        status: 'error',
-        errorMessage: '利用可能なFCMトークンが生成されませんでした。',
+        error:
+          'トークンが生成されませんでした。端末のネットワーク接続を確認してください。',
       };
     }
-  } catch (error: unknown) {
-    // 例外発生時もアプリをクラッシュさせずに安全にエラー情報を返却（フェイルセーフ）
-    console.error('【FCMトークン取得例外】詳細ログ:', error);
+  } catch (tokenError: unknown) {
+    console.error('【FCM getToken例外】:', tokenError);
+    const errorMsg =
+      tokenError instanceof Error ? tokenError.message : String(tokenError);
+
+    // 代表的なエラーのハンドリング
+    if (
+      errorMsg.includes('permission-blocked') ||
+      errorMsg.includes('Notifications are blocked')
+    ) {
+      return {
+        token: null,
+        error:
+          '通知がブロックされています。ブラウザの鍵アイコンから通知を許可してください。',
+      };
+    }
+
     return {
       token: null,
-      status: 'error',
-      errorMessage:
-        error instanceof Error
-          ? error.message
-          : 'トークン取得中に不明なエラーが発生しました。',
+      error: `通知トークン取得に失敗しました (${errorMsg})`,
     };
   }
 }
 
 /**
- * 【下位互換性ラッパー関数】
- * 呼び出し元がトークン文字列（string | null）を直接期待している既存実装を破壊しないためのエイリアス。
+ * 【後方互換用エイリアス関数】requestFcmToken
+ * 既存コンポーネントが単一のトークン文字列（または null）を期待している場合に対応。
+ *
+ * @returns {Promise<string | null>}
  */
 export async function requestFcmToken(): Promise<string | null> {
-  const result = await requestFCMToken();
+  const result = await requestNotificationPermissionAndGetToken();
   return result.token;
 }

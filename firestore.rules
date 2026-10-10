@@ -1,50 +1,81 @@
 rules_version = '2';
 service cloud.firestore {
-  // パスのタイポ（daabases -> databases）を修正
   match /databases/{database}/documents {
 
-    // 【フールプルーフ】管理者権限（Custom Claims: admin == true）の検証
-    function isAdmin() {
+    // ==========================================
+    // 認可・検証ヘルパー関数群
+    // ==========================================
+
+    // 1. 特権管理者判定（Custom Claims: admin === true）
+    function isSuperAdmin() {
       return request.auth != null && request.auth.token.admin == true;
     }
 
-    // 【フールプルーフ】リソース所有者（本人）の検証
+    // 2. 運営スタッフ判定（フェイルセーフ: Claims未設定時でもパスワード認証済み運営アカウントの操作を継続）
+    function isOperator() {
+      return request.auth != null &&
+        (
+          request.auth.token.admin == true ||
+          (request.auth.token.firebase.sign_in_provider == 'password' && request.auth.token.email_verified != false)
+        );
+    }
+
+    // 3. ユーザー自身判定（ログイン済みUIDの一致検証）
     function isOwner(userId) {
       return request.auth != null && request.auth.uid == userId;
     }
 
-    // users コレクション: 認証済みユーザーが自身のドキュメントを読み書き可能。管理者は全操作可能。
-    match /users/{userId} {
-      allow read: if request.auth != null && (isOwner(userId) || isAdmin());
-      allow create: if request.auth != null && isOwner(userId);
-      allow update: if request.auth != null && (isOwner(userId) || isAdmin());
-      allow delete: if request.auth != null && (isOwner(userId) || isAdmin());
+    // 4. エントリー更新バリデーション（フールプルーフ: 許可された運営管理キー以外の改ざんを入口で遮断）
+    function isValidEntryUpdate() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+        .hasOnly([
+          'isPaid', 'paidAt', 'bibNumber', 'standAssignments',
+          'checkInStatus', 'checkInAt', 'checkInMethod',
+          'qualificationStatus', 'progressStatus',
+          'stand1_arrows', 'stand2_arrows', 'stand3_arrows',
+          'isHayaHit', 'totalHits', 'totalShots', 'isPerfect',
+          'enkinRank', 'finalRank',
+          'qrSentStatus', 'qrSentAt', 'qrSentError', 'updatedAt'
+        ]);
     }
 
-    // teams コレクション: チーム一覧・呼出参照のため全員読み取り可能。作成・更新・削除は管理者のみ。
+    // ==========================================
+    // 各コレクション アクセス制御定義
+    // ==========================================
+
+    // users コレクション: 参加者の端末情報・FCMトークン
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && isOwner(userId);
+      allow update: if request.auth != null && (isOwner(userId) || isOperator());
+      allow delete: if isOperator();
+    }
+
+    // teams コレクション: 参加チーム・立ち順
     match /teams/{teamId} {
       allow read: if true;
-      allow create, update, delete: if isAdmin();
+      allow create, update, delete: if isOperator();
     }
 
-    // entries コレクション: 参加者一覧・立順確認のため全員読み取り可能。
-    // 参加申込・立順修正・入金確認は認証済みユーザー（運営スタッフ・本人）に許可。削除のみ管理者に制限。
+    // entries コレクション: 大会参加選手リスト
     match /entries/{entryId} {
       allow read: if true;
-      allow create, update: if request.auth != null;
-      allow delete: if isAdmin();
+      allow create: if request.auth != null;
+      allow update: if isOperator() && isValidEntryUpdate();
+      allow delete: if isSuperAdmin();
     }
 
-    // matches コレクション: 試合進行状況・現在立番号は全員閲覧可能。進行ステータスの更新は認証済みスタッフに許可。
+    // matches コレクション: 大会設定・進行状態・呼出状態
     match /matches/{matchId} {
       allow read: if true;
-      allow create, update, delete: if request.auth != null;
+      allow create, update, delete: if isOperator();
     }
 
-    // scores コレクション: 成績閲覧は全員可能。スコア入力・的中記録（〇✕）・修正は認証済みスタッフに許可。
+    // scores コレクション: 的中記録（射詰・遠近・本戦）
     match /scores/{scoreId} {
       allow read: if true;
-      allow create, update, delete: if request.auth != null;
+      allow create, update: if isOperator();
+      allow delete: if isSuperAdmin();
     }
   }
 }

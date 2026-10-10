@@ -4,13 +4,16 @@
  * 役割:
  * - Firebase Authentication によるメール・パスワード認証（signInWithEmailAndPassword）の実行。
  * - セッション状態の監視（onAuthStateChanged）およびログアウト処理（signOut）。
+ * - 運営者カスタムクレーム（admin: true）の検証による認可判定。
  *
  * フールプルーフ設計（操作ミス・不正入力の入口遮断）:
  * - メールアドレスおよびパスワードの空文字・形式バリデーション。
  * - Firebase Auth エラーコード（auth/user-not-found, auth/wrong-password等）の日本語エラーメッセージ変換。
+ * - 非匿名かつ運営者権限（カスタムクレーム admin === true または認証済み正規ユーザー）の多層検証。
  *
  * フェイルセーフ設計（障害時の安全縮退）:
  * - サーバーサイド（SSR）環境下での Auth API 呼び出しを安全に遮断。
+ * - 認証状態取得中のUIチラつきを防ぐ初期ローディング状態（isLoading: true）の先行通知。
  * - ネットワーク切断やトークン失効時でも、例外を握り潰さず構造化されたセッションステータスとして返却。
  */
 
@@ -19,11 +22,13 @@ import {
   signOut,
   onAuthStateChanged,
   User,
+  IdTokenResult,
 } from 'firebase/auth';
 import { auth, isFirebaseConfigured } from '@/lib/firebase';
 
 export interface SessionStatus {
   isAuthenticated: boolean;
+  isAdmin: boolean;
   uid: string | null;
   email: string | null;
   isLoading: boolean;
@@ -32,6 +37,12 @@ export interface SessionStatus {
 
 /**
  * 【フールプルーフ】メール・パスワードによる管理者ログイン
+ *
+ * 処理フロー:
+ * 1. 入力値のトリミングおよび空文字検証。
+ * 2. Firebase SDK 初期化状態の検証。
+ * 3. signInWithEmailAndPassword の実行。
+ * 4. 発生した例外エラーコードを日本語メッセージに変換して返却。
  */
 export async function loginWithEmailPassword(
   email: string,
@@ -48,7 +59,9 @@ export async function loginWithEmailPassword(
   }
 
   if (!isFirebaseConfigured || !auth) {
-    throw new Error('Firebase Authentication が初期化されていません。');
+    throw new Error(
+      'Firebase Authentication が初期化されていません。環境変数を確認してください。',
+    );
   }
 
   try {
@@ -77,7 +90,7 @@ export async function loginWithEmailPassword(
         throw new Error('メールアドレスまたはパスワードが間違っています。');
       case 'auth/user-disabled':
         throw new Error(
-          'このアカウントは無効化されています。管理者にご確認ください。',
+          'このアカウントは無効化されています。システム管理者にご確認ください。',
         );
       case 'auth/too-many-requests':
         throw new Error(
@@ -96,7 +109,7 @@ export async function loginWithEmailPassword(
 }
 
 /**
- * 管理者ログアウト
+ * 【管理者ログアウト】
  */
 export async function logoutAdmin(): Promise<void> {
   if (!auth) return;
@@ -111,6 +124,11 @@ export async function logoutAdmin(): Promise<void> {
 
 /**
  * 【フェイルセーフ】運営セッション状態のリアルタイム監視
+ *
+ * 判定基準:
+ * - SSR環境および未初期化時は安全に即時未認証返却。
+ * - 監視開始直後に isLoading: true を通知し、画面リダイレクトの誤作動を抑止。
+ * - トークンからカスタムクレーム admin を検証し、Firestore ルール (request.auth.token.admin == true) と整合。
  */
 export function subscribeAdminSession(
   onStatusChange: (status: SessionStatus) => void,
@@ -118,6 +136,7 @@ export function subscribeAdminSession(
   if (typeof window === 'undefined' || !isFirebaseConfigured || !auth) {
     onStatusChange({
       isAuthenticated: false,
+      isAdmin: false,
       uid: null,
       email: null,
       isLoading: false,
@@ -126,21 +145,51 @@ export function subscribeAdminSession(
     return () => {};
   }
 
+  // 初期ローディング状態を先行通知
+  onStatusChange({
+    isAuthenticated: false,
+    isAdmin: false,
+    uid: null,
+    email: null,
+    isLoading: true,
+    errorMessage: null,
+  });
+
   const unsubscribe = onAuthStateChanged(
     auth,
-    (user) => {
+    async (user) => {
       if (user && !user.isAnonymous) {
-        // メール・パスワード認証された正規ユーザーのみ認証済みと判定
-        onStatusChange({
-          isAuthenticated: true,
-          uid: user.uid,
-          email: user.email,
-          isLoading: false,
-          errorMessage: null,
-        });
+        try {
+          // カスタムクレーム (admin: true) の取得検証
+          const tokenResult: IdTokenResult = await user.getIdTokenResult();
+          const hasAdminClaim = Boolean(tokenResult.claims.admin);
+
+          onStatusChange({
+            isAuthenticated: true,
+            isAdmin: hasAdminClaim,
+            uid: user.uid,
+            email: user.email,
+            isLoading: false,
+            errorMessage: null,
+          });
+        } catch (tokenErr) {
+          console.warn(
+            '【トークンクレーム取得警告】基本認証情報で縮退動作します:',
+            tokenErr,
+          );
+          onStatusChange({
+            isAuthenticated: true,
+            isAdmin: false,
+            uid: user.uid,
+            email: user.email,
+            isLoading: false,
+            errorMessage: null,
+          });
+        }
       } else {
         onStatusChange({
           isAuthenticated: false,
+          isAdmin: false,
           uid: null,
           email: null,
           isLoading: false,
@@ -152,6 +201,7 @@ export function subscribeAdminSession(
       console.error('【セッション監視例外】:', error);
       onStatusChange({
         isAuthenticated: false,
+        isAdmin: false,
         uid: null,
         email: null,
         isLoading: false,

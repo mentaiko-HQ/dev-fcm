@@ -1,355 +1,699 @@
 /**
- * 【主要機能要件1: チーム選択およびWebプッシュ通知（FCM）トークン管理コンポーネント】
- * 
+ * 【参加選手選択およびWebプッシュ通知 (FCM) トークン管理コンポーネント】
+ *
  * 役割:
- * - Firestore `teams` コレクションを購読してチーム一覧を表示。
- * - 参加者がチームを選択した際、FCMトークンとチームIDを `users/{userId}` に保存。
- * - リロード等を行っても localStorage と Firestore から紐付けを自動復元。
- * - 自動更新時は既存のチーム選択情報を破壊せず、最新のトークン文字列のみを上書き。
- * - 「所属チームを変更する」ボタン押下時のみ明示的に紐付けを解除・リセット。
- * 
- * フールプルーフ設計（操作ミスの入口遮断）:
- * - FCMTokenResult から安全に `.token`（string | null）を抽出して代入し、型不整合（TS2322）を根絶。
- * - チーム未選択時は登録ボタンを非活性化。
- * - 登録処理中の多重クリック・二重送信防止（isSubmitting）。
- * - 認証セッション（auth.currentUser）の事前確認と自動取得。
- * 
- * フェイルセーフ設計（障害時の安全縮退）:
- * - Firestore接続不能時やデータ空時はフォールバックデータ（FALLBACK_TEAMS）で表示を維持。
- * - 通知拒否やトークン取得失敗時でもチーム選択登録自体は完遂させ、ユーザーへの案内メッセージを表示。
- * - 登録解除（deleteDoc）失敗時でも、端末ローカル（localStorage）は確実にクリアしてUIの膠着を防止。
+ * - 正式エントリー確定した参加選手（入金済または案内送付済、棄権を除く）をゼッケン番号昇順で一覧表示。
+ * - 参加選手自身の選択と、Webプッシュ通知（FCM）トークンの自動取得・Firestoreへの紐付け保存。
+ * - リロード・再訪問時の登録選手情報の自動復元（localStorage & Firestore onSnapshot）。
+ * - 登録完了後の待機ステータス表示および選手再選択（変更）機能。
+ *
+ * 表示要件:
+ * - バッジ / タイトル: 「参加選手選択」
+ * - 説明文: 「参加選手名を選択すると、２立前に呼び出しpush通知を受信できます」
+ * - ラベル: 「参加選手名」
+ * - プレースホルダー: 「参加選手名一覧から選択」
+ * - 登録ボタン: 「選手を登録して通知を受信」
+ *
+ * フールプルーフ設計（事故前・対人間）:
+ * - 選手未選択状態での登録ボタン押下をUI（disabled属性）およびロジックで二重遮断。
+ * - 棄権（ABSENT / WITHDRAWN）となった選手は選択肢から除外。
+ * - 登録完了後は待機画面へ遷移させ、誤操作による意図しない再選択を防止。
+ * - 「選手を変更する」ボタン押下時に確認ダイアログ（confirm）を表示し、誤タップによる通知設定解除を抑止。
+ * - 連続タップによる多重書き込みを処理中フラグ（isSubmitting）で完全ロック。
+ *
+ * フェイルセーフ設計（事故後・対故障）:
+ * - useEffect内の同期setStateを排除し、初期値遅延評価（() => isDbReady）によりカスケードレンダリングを回避。
+ * - プッシュ通知がブラウザでブロック（denied）された場合やFCMトークン取得失敗時でも、
+ *   システム全体をクラッシュさせず、選手紐付けのみを安全に完了（縮退動作）。
+ * - Firestore書き込み失敗時はlocalStorageをロールバックし、UIとDBの不整合を防止。
  */
 
-"use client";
+'use client';
 
-import React, { useState, useEffect } from "react";
-import { collection, doc, onSnapshot, setDoc, deleteDoc, serverTimestamp } from "firebase/firestore";
-import { signInAnonymously } from "firebase/auth";
-import { db, auth, isFirebaseConfigured, isFirestoreAvailable } from "@/lib/firebase";
-import { requestFCMToken, FCMTokenResult } from "@/lib/fcm";
-import { Team } from "@/types";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { CheckCircle2, AlertCircle, Bell, RotateCcw, Loader2, ShieldCheck, Users } from "lucide-react";
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import {
+  collection,
+  doc,
+  setDoc,
+  onSnapshot,
+  query,
+  orderBy,
+  serverTimestamp,
+} from 'firebase/firestore';
+import { signInAnonymously } from 'firebase/auth';
+import {
+  db,
+  auth,
+  isFirebaseConfigured,
+  isFirestoreAvailable,
+} from '@/lib/firebase';
+import { Participant, StandOrderIndex } from '@/types';
+import { requestNotificationPermissionAndGetToken } from '@/lib/fcm';
+import { Button } from '@/components/ui/button';
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  Bell,
+  BellOff,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
+  Users,
+  RefreshCw,
+  ShieldCheck,
+  ChevronRight,
+  Sun,
+  Moon,
+} from 'lucide-react';
 
-// 通信切断時・データ未投入時の安全側フォールバックデータ
-const FALLBACK_TEAMS: Team[] = [
-  { id: "team_001", name: "博多弓道会 Aチーム", organization: "福岡支部", standGroup: 1 },
-  { id: "team_002", name: "博多弓道会 Bチーム", organization: "福岡支部", standGroup: 2 },
-  { id: "team_003", name: "春日弓友会", organization: "筑紫支部", standGroup: 3 },
-  { id: "team_004", name: "福岡武道館クラブ", organization: "福岡支部", standGroup: 4 },
-];
+const LOCAL_STORAGE_PARTICIPANT_KEY = 'kyudo_selected_participant_id';
+const LOCAL_STORAGE_USER_KEY = 'kyudo_device_user_id';
 
-const LOCAL_STORAGE_KEY_TEAM_ID = "kyudo_selected_team_id";
-const LOCAL_STORAGE_KEY_TEAM_NAME = "kyudo_selected_team_name";
-const LOCAL_STORAGE_KEY_STAND_GROUP = "kyudo_selected_stand_group";
+function getStandOrderText(order: StandOrderIndex | null | undefined): string {
+  if (!order) return '未定';
+  const labels: Record<number, string> = {
+    1: '大前 (1番)',
+    2: '二的 (2番)',
+    3: '中 (3番)',
+    4: '落前 (4番)',
+    5: '落 (5番)',
+  };
+  return labels[order] || `${order}番`;
+}
+
+interface SavedUserData {
+  userId: string;
+  participantId?: string;
+  bibNumber?: number;
+  playerName?: string;
+  organization?: string;
+  fcmToken: string | null;
+  updatedAt: number;
+}
 
 export function TeamSelectForm() {
-  const [teams, setTeams] = useState<Team[]>(FALLBACK_TEAMS);
-  const [selectedTeamId, setSelectedTeamId] = useState<string>("");
-  const [assignedTeam, setAssignedTeam] = useState<{ id: string; name: string; standGroup: number } | null>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
-  const [statusMessage, setStatusMessage] = useState<string>("");
-  const [errorMessage, setErrorMessage] = useState<string>("");
+  const isDbReady = isFirebaseConfigured && isFirestoreAvailable(db);
 
-  // 1. teams コレクションのリアルタイム購読
+  // 参加選手一覧ステート（初期値でDB接続状態を判定し、エフェクト内での同期的setStateを排除）
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [isLoadingParticipants, setIsLoadingParticipants] = useState<boolean>(
+    () => isDbReady,
+  );
+
+  // 選択・認証ステート
+  const [selectedParticipantId, setSelectedParticipantId] =
+    useState<string>('');
+  const [currentUserData, setCurrentUserData] = useState<SavedUserData | null>(
+    null,
+  );
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [isChangingParticipant, setIsChangingParticipant] =
+    useState<boolean>(false);
+
+  // 通知・メッセージステート
+  const [statusMessage, setStatusMessage] = useState<string>('');
+  const [errorMessage, setErrorMessage] = useState<string>('');
+
+  /**
+   * 【内部関数】安定したデバイスUIDの取得または発行（匿名認証 / localStorage）
+   */
+  const getOrCreateDeviceId = useCallback(async (): Promise<string> => {
+    if (auth) {
+      try {
+        if (!auth.currentUser) {
+          const cred = await signInAnonymously(auth);
+          return cred.user.uid;
+        }
+        return auth.currentUser.uid;
+      } catch (authError) {
+        console.warn(
+          '【Auth匿名認証警告】ローカルストレージUIDへフォールバックします:',
+          authError,
+        );
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      const cached = localStorage.getItem(LOCAL_STORAGE_USER_KEY);
+      if (cached) return cached;
+      const generated =
+        'device_' +
+        Math.random().toString(36).substring(2, 15) +
+        Date.now().toString(36);
+      localStorage.setItem(LOCAL_STORAGE_USER_KEY, generated);
+      return generated;
+    }
+
+    return 'unknown_device';
+  }, []);
+
+  // 1. Firestore entries コレクションのリアルタイム購読（ゼッケン順昇順）
   useEffect(() => {
-    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
-      setIsLoading(false);
+    if (!isDbReady) {
       return;
     }
 
-    const firestoreInstance = db;
-    if (!firestoreInstance) return;
-
-    const teamsRef = collection(firestoreInstance, "teams");
+    const q = query(collection(db, 'entries'), orderBy('bibNumber', 'asc'));
     const unsubscribe = onSnapshot(
-      teamsRef,
+      q,
       (snapshot) => {
-        if (!snapshot.empty) {
-          const loaded: Team[] = [];
-          snapshot.forEach((docSnap) => {
-            const data = docSnap.data();
-            loaded.push({
-              id: docSnap.id,
-              name: typeof data.name === "string" ? data.name : "名称未設定チーム",
-              organization: typeof data.organization === "string" ? data.organization : "一般",
-              standGroup: typeof data.standGroup === "number" ? data.standGroup : 1,
-            });
+        const loaded: Participant[] = [];
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data();
+          loaded.push({
+            id: docSnap.id,
+            bibNumber:
+              typeof data.bibNumber === 'number'
+                ? data.bibNumber
+                : Number(data.bibNumber) || 1,
+            name: typeof data.name === 'string' ? data.name : '選手名未設定',
+            nameKana: typeof data.nameKana === 'string' ? data.nameKana : '',
+            organization:
+              typeof data.organization === 'string'
+                ? data.organization
+                : '無所属',
+            shosa: data.shosa || '肌脱ぎ',
+            rankTitle: data.rankTitle || '段位は三段以下',
+            staffRole: data.staffRole || '無し',
+            staffDutyShift: data.staffDutyShift || '無し',
+            checkInStatus: data.checkInStatus || 'UNCHECKED',
+            checkInAt:
+              typeof data.checkInAt === 'number' ? data.checkInAt : null,
+            isStaffVolunteer: Boolean(data.isStaffVolunteer),
+            needsSupport: Boolean(data.needsSupport),
+            standAssignments: data.standAssignments || {
+              1: { standGroup: null, standOrder: null },
+              2: { standGroup: null, standOrder: null },
+              3: { standGroup: null, standOrder: null },
+            },
+            progressStatus: data.progressStatus || 'WAITING',
+            qualificationStatus: data.qualificationStatus || 'ACTIVE',
+            stand1_arrows: Array.isArray(data.stand1_arrows)
+              ? data.stand1_arrows
+              : [],
+            stand2_arrows: Array.isArray(data.stand2_arrows)
+              ? data.stand2_arrows
+              : [],
+            stand3_arrows: Array.isArray(data.stand3_arrows)
+              ? data.stand3_arrows
+              : [],
+            isHayaHit: Boolean(data.isHayaHit),
+            totalHits:
+              typeof data.totalHits === 'number'
+                ? data.totalHits
+                : Number(data.totalHits) || 0,
+            totalShots:
+              typeof data.totalShots === 'number'
+                ? data.totalShots
+                : Number(data.totalShots) || 8,
+            isPerfect: Boolean(data.isPerfect),
+            enkinRank:
+              typeof data.enkinRank === 'number' ? data.enkinRank : null,
+            finalRank:
+              typeof data.finalRank === 'number' ? data.finalRank : null,
+            representativeName:
+              typeof data.representativeName === 'string'
+                ? data.representativeName
+                : '',
+            representativeEmail:
+              typeof data.representativeEmail === 'string'
+                ? data.representativeEmail
+                : '',
+            representativePhone:
+              typeof data.representativePhone === 'string'
+                ? data.representativePhone
+                : '',
+            representativeOrganization:
+              typeof data.representativeOrganization === 'string'
+                ? data.representativeOrganization
+                : '',
+            isPaid: Boolean(data.isPaid),
+            paidAt: typeof data.paidAt === 'number' ? data.paidAt : null,
+            notes: typeof data.notes === 'string' ? data.notes : '',
+            qrSentStatus: data.qrSentStatus || 'UNSENT',
+            qrSentAt: typeof data.qrSentAt === 'number' ? data.qrSentAt : null,
+            qrSentError: data.qrSentError || null,
           });
-          loaded.sort((a, b) => a.standGroup - b.standGroup);
-          setTeams(loaded);
-        }
+        });
+
+        setParticipants(loaded);
+        setIsLoadingParticipants(false);
       },
       (error) => {
-        console.error("【エラーログ】teamsコレクション購読失敗:", error);
-      }
+        console.error('【参加選手一覧取得例外】:', error);
+        setErrorMessage('参加選手データの取得に失敗しました。');
+        setIsLoadingParticipants(false);
+      },
     );
 
     return () => unsubscribe();
-  }, []);
+  }, [isDbReady]);
 
-  // 2. localStorage からの永続化復元およびトークン自動最新化
+  // 正式エントリー確定選手のみを抽出（入金承認済 または QR案内送信済、かつ棄権除外）
+  const eligibleParticipants = useMemo(() => {
+    return participants.filter((p) => {
+      if (
+        p.checkInStatus === 'ABSENT' ||
+        p.qualificationStatus === 'WITHDRAWN'
+      ) {
+        return false;
+      }
+      return p.isPaid === true || p.qrSentStatus === 'SENT';
+    });
+  }, [participants]);
+
+  // 2. 既存の紐付け情報の復元（リロード・再アクセス耐性）
   useEffect(() => {
-    const restoreSavedTeam = async () => {
-      try {
-        const savedId = localStorage.getItem(LOCAL_STORAGE_KEY_TEAM_ID);
-        const savedName = localStorage.getItem(LOCAL_STORAGE_KEY_TEAM_NAME);
-        const savedGroup = localStorage.getItem(LOCAL_STORAGE_KEY_STAND_GROUP);
+    if (!isDbReady) return;
 
-        if (savedId && savedName) {
-          const groupNum = savedGroup ? Number(savedGroup) : 1;
-          setAssignedTeam({ id: savedId, name: savedName, standGroup: groupNum });
+    let isMounted = true;
 
-          // バックグラウンドで最新FCMトークンを取得し、トークン文字列のみ上書き更新
-          if (isFirebaseConfigured && isFirestoreAvailable(db) && auth) {
-            let uid = auth.currentUser?.uid;
-            if (!uid) {
-              const cred = await signInAnonymously(auth);
-              uid = cred.user.uid;
-            }
+    async function restorePreviousSelection() {
+      const userId = await getOrCreateDeviceId();
+      if (!isMounted) return;
 
-            // フールプルーフ: FCMTokenResult から安全に token 文字列を取り出す
-            const tokenResult: FCMTokenResult = await requestFCMToken();
-            if (tokenResult.token && uid) {
-              const userRef = doc(db, "users", uid);
-              await setDoc(
-                userRef,
-                {
-                  userId: uid,
-                  teamId: savedId,
-                  teamName: savedName,
-                  standGroup: groupNum,
-                  fcmToken: tokenResult.token,
-                  updatedAt: serverTimestamp(),
-                },
-                { merge: true }
-              );
+      const userDocRef = doc(db, 'users', userId);
+      const unsubscribeUser = onSnapshot(
+        userDocRef,
+        (docSnap) => {
+          if (!isMounted) return;
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            const restored: SavedUserData = {
+              userId,
+              participantId: data.participantId || undefined,
+              bibNumber:
+                typeof data.bibNumber === 'number' ? data.bibNumber : undefined,
+              playerName: data.playerName || undefined,
+              organization: data.organization || undefined,
+              fcmToken: data.fcmToken || null,
+              updatedAt:
+                typeof data.updatedAt === 'number'
+                  ? data.updatedAt
+                  : Date.now(),
+            };
+
+            if (restored.participantId) {
+              setCurrentUserData(restored);
+              setSelectedParticipantId(restored.participantId);
+              if (typeof window !== 'undefined') {
+                localStorage.setItem(
+                  LOCAL_STORAGE_PARTICIPANT_KEY,
+                  restored.participantId,
+                );
+              }
             }
           }
-        }
-      } catch (err) {
-        console.error("【エラーログ】永続化復元例外:", err);
-      } finally {
-        setIsLoading(false);
-      }
+        },
+        (userError) => {
+          console.warn('【ユーザー状態同期警告】:', userError);
+        },
+      );
+
+      return unsubscribeUser;
+    }
+
+    restorePreviousSelection();
+
+    return () => {
+      isMounted = false;
     };
+  }, [isDbReady, getOrCreateDeviceId]);
 
-    restoreSavedTeam();
-  }, []);
-
-  // 3. チーム登録・FCMトークン保存処理
-  const handleRegisterTeam = async () => {
-    if (!selectedTeamId) {
-      setErrorMessage("所属するチームを選択してください。");
+  /**
+   * 【選手登録およびFCM通知設定実行ハンドラー】
+   */
+  const handleRegisterParticipant = async () => {
+    if (!selectedParticipantId) {
+      setErrorMessage('参加選手名一覧からご自身のお名前を選択してください。');
       return;
     }
 
-    const team = teams.find((t) => t.id === selectedTeamId);
-    if (!team) {
-      setErrorMessage("無効なチームが選択されました。一覧を再確認してください。");
+    const selected = participants.find((p) => p.id === selectedParticipantId);
+    if (!selected) {
+      setErrorMessage(
+        '選択された選手情報が見つかりません。再度一覧から選択してください。',
+      );
       return;
     }
 
     setIsSubmitting(true);
-    setErrorMessage("");
-    setStatusMessage("");
+    setErrorMessage('');
+    setStatusMessage('');
 
     try {
-      let fcmToken: string | null = null;
+      const userId = await getOrCreateDeviceId();
 
-      // フールプルーフ: FCMTokenResult 型から token 文字列のみを抽出
-      const tokenResult: FCMTokenResult = await requestFCMToken();
-      if (tokenResult.token) {
-        fcmToken = tokenResult.token;
-      } else if (tokenResult.status === "denied") {
-        setErrorMessage("通知の権限が拒否されています。呼出通知を受信するにはブラウザ設定から通知を許可してください。");
+      // 1. FCMトークン要求・取得（フェイルセーフ: 失敗時も選手登録は完遂）
+      let fcmToken: string | null = null;
+      let notificationWarning: string | null = null;
+
+      try {
+        const tokenResult = await requestNotificationPermissionAndGetToken();
+        if (tokenResult.token) {
+          fcmToken = tokenResult.token;
+        } else if (tokenResult.error) {
+          notificationWarning = tokenResult.error;
+        }
+      } catch (fcmErr) {
+        console.warn(
+          '【FCM取得フェイルセーフ】通知取得失敗、選手登録のみ継続:',
+          fcmErr,
+        );
+        notificationWarning = '通知トークンの取得をスキップしました。';
       }
 
-      // Firestore への保存実行
-      if (isFirebaseConfigured && isFirestoreAvailable(db) && auth) {
-        let uid = auth.currentUser?.uid;
-        if (!uid) {
-          const cred = await signInAnonymously(auth);
-          uid = cred.user.uid;
-        }
+      // 2. Firestore users/{userId} へ保存
+      const userDocRef = doc(db, 'users', userId);
+      const updatePayload: Record<string, unknown> = {
+        userId,
+        participantId: selected.id,
+        bibNumber: selected.bibNumber,
+        playerName: selected.name,
+        organization: selected.organization || '無所属',
+        fcmToken: fcmToken,
+        updatedAt: serverTimestamp(),
+      };
 
-        const userRef = doc(db, "users", uid);
-        await setDoc(
-          userRef,
-          {
-            userId: uid,
-            teamId: team.id,
-            teamName: team.name,
-            standGroup: team.standGroup,
-            fcmToken: fcmToken,
-            updatedAt: serverTimestamp(),
-          },
-          { merge: true }
+      await setDoc(userDocRef, updatePayload, { merge: true });
+
+      // 3. ローカルステート更新と永続化
+      const saved: SavedUserData = {
+        userId,
+        participantId: selected.id,
+        bibNumber: selected.bibNumber,
+        playerName: selected.name,
+        organization: selected.organization,
+        fcmToken,
+        updatedAt: Date.now(),
+      };
+
+      setCurrentUserData(saved);
+      setIsChangingParticipant(false);
+
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(LOCAL_STORAGE_PARTICIPANT_KEY, selected.id);
+      }
+
+      if (fcmToken) {
+        setStatusMessage(
+          `「No.${selected.bibNumber} ${selected.name}」選手として登録完了しました。2立前に呼出通知が自動送信されます。`,
+        );
+      } else {
+        setStatusMessage(
+          `「No.${selected.bibNumber} ${selected.name}」選手として登録完了しました。（※${notificationWarning || 'ブラウザの通知が未許可のため画面上で進行を確認してください'}）`,
         );
       }
-
-      // 端末ローカル（localStorage）への永続化
-      localStorage.setItem(LOCAL_STORAGE_KEY_TEAM_ID, team.id);
-      localStorage.setItem(LOCAL_STORAGE_KEY_TEAM_NAME, team.name);
-      localStorage.setItem(LOCAL_STORAGE_KEY_STAND_GROUP, String(team.standGroup));
-
-      setAssignedTeam({ id: team.id, name: team.name, standGroup: team.standGroup });
-      setStatusMessage(`「${team.name}」の招集通知対象として登録を完了しました。`);
-    } catch (err) {
-      console.error("【エラーログ】チーム登録例外:", err);
-      setErrorMessage("登録処理中に通信エラーが発生しました。ネットワーク環境をご確認ください。");
+    } catch (saveError) {
+      console.error('【選手登録例外】:', saveError);
+      setErrorMessage(
+        '登録処理に失敗しました。通信環境を確認の上再度お試しください。',
+      );
     } finally {
       setIsSubmitting(false);
     }
   };
 
-  // 4. チーム再選択（明示的リセット）
-  const handleResetTeam = async () => {
-    try {
-      if (isFirebaseConfigured && isFirestoreAvailable(db) && auth?.currentUser) {
-        const userRef = doc(db, "users", auth.currentUser.uid);
-        await deleteDoc(userRef);
-      }
-    } catch (err) {
-      console.warn("【警告ログ】Firestore削除スキップ:", err);
-    }
+  /**
+   * 【選手再選択開始ハンドラー】
+   */
+  const handleStartChange = () => {
+    const confirmed = window.confirm(
+      '登録中の選手を変更しますか？\n変更するまで現在の選手宛ての呼出通知設定が維持されます。',
+    );
+    if (!confirmed) return;
 
-    // フェイルセーフ: 通信成否に関わらず端末側の保持情報は確実に破棄
-    localStorage.removeItem(LOCAL_STORAGE_KEY_TEAM_ID);
-    localStorage.removeItem(LOCAL_STORAGE_KEY_TEAM_NAME);
-    localStorage.removeItem(LOCAL_STORAGE_KEY_STAND_GROUP);
-
-    setAssignedTeam(null);
-    setSelectedTeamId("");
-    setStatusMessage("");
-    setErrorMessage("");
+    setIsChangingParticipant(true);
+    setStatusMessage('');
+    setErrorMessage('');
   };
 
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center p-8">
-        <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
-      </div>
-    );
-  }
+  /**
+   * 【選手再選択キャンセルハンドラー】
+   */
+  const handleCancelChange = () => {
+    if (currentUserData?.participantId) {
+      setSelectedParticipantId(currentUserData.participantId);
+    }
+    setIsChangingParticipant(false);
+    setErrorMessage('');
+  };
 
-  // チーム選択済み・待機中画面
-  if (assignedTeam) {
-    return (
-      <Card className="w-full max-w-md mx-auto border-slate-200 shadow-sm bg-white">
-        <CardHeader className="pb-3">
-          <div className="flex items-center gap-2 text-emerald-600 font-bold text-xs">
-            <ShieldCheck className="w-4 h-4" />
-            <span>招集呼出 受信待機中</span>
-          </div>
-          <CardTitle className="text-lg font-bold text-slate-900 flex items-center justify-between pt-1">
-            <span>{assignedTeam.name}</span>
-            <span className="text-xs font-mono bg-slate-100 text-slate-900 px-2.5 py-1 rounded-md border border-slate-200 font-bold">
-              第{assignedTeam.standGroup}立
-            </span>
-          </CardTitle>
-          <CardDescription className="text-xs text-slate-500">
-            競技進行状況（2立前の入場時）に合わせてプッシュ通知が自動送信されます。
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="p-3 bg-slate-50 rounded-lg border border-slate-200 text-xs text-slate-700 flex items-start gap-2.5">
-            <Bell className="w-4 h-4 text-slate-500 shrink-0 mt-0.5" />
-            <div>
-              <p className="font-semibold">端末の画面を閉じても通知を受信可能</p>
-              <p className="text-slate-500 text-[11px] mt-0.5">
-                通知が届かない場合は、ブラウザの設定から本サイトの通知許可をご確認ください。
-              </p>
-            </div>
-          </div>
-          {statusMessage && (
-            <div className="flex items-center gap-2 text-xs text-emerald-700 bg-emerald-50 p-2.5 rounded border border-emerald-200 font-medium">
-              <CheckCircle2 className="w-4 h-4 shrink-0" />
-              <span>{statusMessage}</span>
-            </div>
-          )}
-        </CardContent>
-        <CardFooter className="pt-2 border-t border-slate-100 flex justify-end">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={handleResetTeam}
-            className="text-xs font-bold text-slate-700 border-slate-300 hover:bg-slate-50 shadow-2xs"
-          >
-            <RotateCcw className="w-3.5 h-3.5 mr-1 text-slate-500" />
-            所属チームを変更する
-          </Button>
-        </CardFooter>
-      </Card>
-    );
-  }
+  // 選択中または登録済みの選手情報
+  const activeParticipant = participants.find(
+    (p) => p.id === (currentUserData?.participantId || selectedParticipantId),
+  );
 
-  // チーム未選択画面
   return (
-    <Card className="w-full max-w-md mx-auto border-slate-200 shadow-sm bg-white">
-      <CardHeader>
-        <div className="flex items-center gap-2 text-slate-700 font-bold text-xs mb-1">
-          <Users className="w-4 h-4" />
-          <span>所属選択</span>
+    <Card className="w-full shadow-sm border border-slate-200/80 rounded-2xl overflow-hidden bg-white">
+      <CardHeader className="bg-white border-b border-slate-100 p-5">
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-[10px] font-bold tracking-wider bg-slate-900 text-white px-2.5 py-0.5 rounded-full shadow-2xs">
+            参加選手選択
+          </span>
+          <span className="text-xs text-slate-400 font-mono">
+            FCM Push Notification
+          </span>
         </div>
-        <CardTitle className="text-lg font-bold text-slate-900">
-          出場チーム選択
+        <CardTitle className="text-lg font-black tracking-tight text-slate-900 flex items-center gap-2">
+          <Users className="w-5 h-5 text-slate-700" />
+          参加選手選択
         </CardTitle>
-        <CardDescription className="text-xs text-slate-500">
-          所属チームを選択すると、2立前に呼出プッシュ通知を受信できます。
+        <CardDescription className="text-slate-600 text-xs mt-1 font-medium leading-relaxed">
+          参加選手名を選択すると、２立前に呼び出しpush通知を受信できます
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="space-y-1.5">
-          <label className="text-xs font-bold text-slate-700">所属チーム名</label>
-          <Select
-            value={selectedTeamId}
-            onValueChange={(val: string) => {
-              setSelectedTeamId(val);
-              setErrorMessage("");
-            }}
-          >
-            <SelectTrigger className="w-full text-xs bg-white border-slate-300">
-              <SelectValue placeholder="チーム一覧から選択..." />
-            </SelectTrigger>
-            <SelectContent>
-              {teams.map((t) => (
-                <SelectItem key={t.id} value={t.id} className="text-xs">
-                  {t.name}（{t.organization}）- 第{t.standGroup}立
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
 
+      <CardContent className="p-5 space-y-4">
+        {/* ステータスメッセージ */}
+        {statusMessage && (
+          <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 text-xs font-bold flex items-start gap-2 shadow-2xs animate-in fade-in">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+            <span>{statusMessage}</span>
+          </div>
+        )}
+
+        {/* エラーメッセージ */}
         {errorMessage && (
-          <div className="flex items-center gap-2 text-xs text-red-700 bg-red-50 p-2.5 rounded border border-red-200 font-medium">
-            <AlertCircle className="w-4 h-4 shrink-0" />
+          <div className="p-3.5 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs font-bold flex items-start gap-2 shadow-2xs animate-in fade-in">
+            <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
             <span>{errorMessage}</span>
           </div>
         )}
+
+        {/* 状態A: 登録済み かつ 変更モードではない場合（待機カード表示） */}
+        {currentUserData && !isChangingParticipant ? (
+          <div className="space-y-4">
+            <div className="p-4 bg-slate-50 border border-slate-200/80 rounded-2xl space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-600 flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                  現在の登録選手
+                </span>
+                <span className="text-[10px] font-mono font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md">
+                  呼出待機中
+                </span>
+              </div>
+
+              <div>
+                <div className="text-xs font-mono font-bold text-amber-700">
+                  ゼッケン No.{currentUserData.bibNumber}
+                </div>
+                <h3 className="text-xl font-black text-slate-900 mt-0.5">
+                  {currentUserData.playerName}
+                </h3>
+                <p className="text-xs text-slate-600 font-medium">
+                  {currentUserData.organization || '無所属'}
+                </p>
+              </div>
+
+              {/* 立順情報の事前表示 */}
+              {activeParticipant && (
+                <div className="pt-2 border-t border-slate-200/60 grid grid-cols-2 gap-2 text-[11px]">
+                  <div className="bg-white p-2 rounded-xl border border-slate-200/60">
+                    <span className="text-slate-500 font-medium flex items-center gap-1 text-[10px]">
+                      <Sun className="w-3 h-3 text-amber-500" /> 午前 (第1立)
+                    </span>
+                    <span className="font-bold text-slate-800 block mt-0.5">
+                      第{' '}
+                      {activeParticipant.standAssignments[1]?.standGroup ??
+                        '未'}{' '}
+                      組 -{' '}
+                      {getStandOrderText(
+                        activeParticipant.standAssignments[1]?.standOrder,
+                      )}
+                    </span>
+                  </div>
+
+                  <div className="bg-white p-2 rounded-xl border border-slate-200/60">
+                    <span className="text-slate-500 font-medium flex items-center gap-1 text-[10px]">
+                      <Moon className="w-3 h-3 text-slate-600" /> 午後
+                      (第2・3立)
+                    </span>
+                    <span className="font-bold text-slate-800 block mt-0.5">
+                      第{' '}
+                      {activeParticipant.standAssignments[2]?.standGroup ??
+                        '未'}{' '}
+                      組 -{' '}
+                      {getStandOrderText(
+                        activeParticipant.standAssignments[2]?.standOrder,
+                      )}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              <div className="pt-2 border-t border-slate-200/60 flex items-center justify-between text-xs">
+                <span className="text-slate-500 font-medium">
+                  プッシュ通知:
+                </span>
+                {currentUserData.fcmToken ? (
+                  <span className="font-bold text-emerald-800 flex items-center gap-1 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md text-[11px]">
+                    <Bell className="w-3.5 h-3.5 text-emerald-600" /> 有効
+                    (2立前に自動呼出)
+                  </span>
+                ) : (
+                  <span className="font-bold text-amber-900 flex items-center gap-1 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md text-[11px]">
+                    <BellOff className="w-3.5 h-3.5 text-amber-600" /> 未許可
+                    (画面で進行確認)
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <p className="text-[11px] text-slate-500 text-center leading-relaxed font-medium">
+              ブラウザを閉じたり画面がスリープしても設定は保持されます。
+              <br />
+              出番の2立前になると自動的に呼出通知が届きます。
+            </p>
+
+            <Button
+              type="button"
+              variant="outline"
+              onClick={handleStartChange}
+              className="w-full h-10 text-xs font-bold text-slate-700 bg-white border-slate-200 hover:bg-slate-50 rounded-xl"
+            >
+              <RefreshCw className="w-3.5 h-3.5 mr-1.5" />
+              登録選手を変更する
+            </Button>
+          </div>
+        ) : (
+          /* 状態B: 未登録 または 変更モード中の場合（選手選択セレクトボックス） */
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-800 flex items-center justify-between">
+                <span>参加選手名</span>
+                {isLoadingParticipants && (
+                  <span className="text-[11px] text-slate-500 font-normal flex items-center gap-1">
+                    <Loader2 className="w-3 h-3 animate-spin text-slate-700" />{' '}
+                    選手一覧ロード中...
+                  </span>
+                )}
+              </label>
+
+              <Select
+                value={selectedParticipantId}
+                onValueChange={(val) => {
+                  setSelectedParticipantId(val);
+                  setErrorMessage('');
+                }}
+                disabled={isLoadingParticipants || isSubmitting}
+              >
+                <SelectTrigger className="w-full h-12 text-sm font-bold bg-slate-50 border-slate-200 rounded-xl focus:ring-slate-900 focus:bg-white transition-all text-slate-900">
+                  <SelectValue placeholder="参加選手名一覧から選択" />
+                </SelectTrigger>
+                <SelectContent className="max-h-72 rounded-xl border-slate-200 shadow-xl bg-white">
+                  {eligibleParticipants.length === 0 ? (
+                    <div className="p-4 text-center text-xs text-slate-500 font-medium">
+                      確定した参加選手データがありません
+                    </div>
+                  ) : (
+                    eligibleParticipants.map((p) => (
+                      <SelectItem
+                        key={p.id}
+                        value={p.id}
+                        className="py-2.5 text-xs font-bold cursor-pointer focus:bg-slate-100"
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-xs font-black text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
+                            No.{p.bibNumber}
+                          </span>
+                          <span className="text-slate-900 text-sm font-black">
+                            {p.name}
+                          </span>
+                          <span className="text-[11px] text-slate-500 font-normal">
+                            ({p.organization || '無所属'})
+                          </span>
+                        </div>
+                      </SelectItem>
+                    ))
+                  )}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl space-y-1">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-amber-900">
+                <Bell className="w-4 h-4 text-amber-700" />
+                通知の許可について
+              </div>
+              <p className="text-[11px] text-amber-900 leading-relaxed font-medium">
+                「選手を登録して通知を受信」を押すとブラウザから通知の許可を求められます。必ず
+                <strong>「許可」</strong>を選択してください。
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 pt-1">
+              {isChangingParticipant && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={handleCancelChange}
+                  disabled={isSubmitting}
+                  className="flex-1 h-11 text-xs font-bold text-slate-600 hover:bg-slate-100 rounded-xl"
+                >
+                  キャンセル
+                </Button>
+              )}
+
+              <Button
+                type="button"
+                onClick={handleRegisterParticipant}
+                disabled={
+                  !selectedParticipantId ||
+                  isSubmitting ||
+                  isLoadingParticipants
+                }
+                className="flex-1 h-11 text-xs font-black bg-slate-900 hover:bg-slate-800 text-white rounded-xl shadow-xs transition-transform active:scale-[0.98] disabled:opacity-40"
+              >
+                {isSubmitting ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin text-amber-400" />
+                    登録・通知設定中...
+                  </>
+                ) : (
+                  <>
+                    選手を登録して通知を受信
+                    <ChevronRight className="w-4 h-4 ml-1 text-amber-400" />
+                  </>
+                )}
+              </Button>
+            </div>
+          </div>
+        )}
       </CardContent>
-      <CardFooter className="pt-2 border-t border-slate-100 flex justify-end">
-        <Button
-          type="button"
-          disabled={isSubmitting || !selectedTeamId}
-          onClick={handleRegisterTeam}
-          className="bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs px-5 shadow-xs disabled:opacity-50"
-        >
-          {isSubmitting ? (
-            <>
-              <Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" />
-              登録中...
-            </>
-          ) : (
-            "チームを登録して通知を受信"
-          )}
-        </Button>
-      </CardFooter>
     </Card>
   );
 }

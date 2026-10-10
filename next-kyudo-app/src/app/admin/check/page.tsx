@@ -1,32 +1,32 @@
 /**
  * 【エントリー照会・入金承認・立順編成・QRコード配信専用コンソール】
  * /admin/check パスに対応するページコンポーネント。
- * 選手情報一体型「QRカード画像」を生成し、FastAPI経由でメール添付＆CIDインライン埋め込み配信。
  *
  * 役割:
- * 1. エントリー詳細の照会（ゼッケン番号、選手氏名、ふりがな、所属団体、所作区分、段位、サポート希望）。
- * 2. 参加申込担当者（代表者氏名、メールアドレス）の表示。
- * 3. 参加費納付（isPaid）のワンタップ承認・取り消しと Firestore entries コレクションの即時同期（楽観的UI更新）。
- * 4. 立順編成（午前: 第1立 / 午後: 第2立・第3立共通）のインライン編集・保存。
- * 5. 立順設定（組番号・射位）の数値重複を午前・午後それぞれリアルタイムに検知し、警告表示および保存ブロック。
- * 6. 選手情報一体型QRカード画像のプレビュー・LINE共有・画像保存モーダルの起動。
- * 7. 選手氏名・ゼッケン・立順が焼き込まれたQRカード画像をFastAPIへ送信し、CID埋め込みでメール本文内に確実表示。
- * 8. サマリー統計カード（総エントリー、入金済、立順未割当、QR未送信）のリアルタイム集計表示。
+ * 1. エントリー詳細の照会（ゼッケン番号、選手氏名、所属、所作、段位、サポート希望、担当者情報）。
+ * 2. 参加費納付（isPaid）の承認・取り消しと Firestore への即時反映（楽観的UI更新）。
+ * 3. 午前（第1立）および午後（第2・3立）の立ち順インライン編集。
+ * 4. 【立順設定・保存・送信の段階的連動（フールプルーフ）】:
+ *    - 午前・午後の組および射位がすべて選択された時点で「保存」ボタンがアクティブ化。
+ *    - 保存ボタンが押下され、Firestore への書き込みが完了した後に「メール送信」ボタンがアクティブ化。
+ *    - 編集後に保存されていない状態（未保存/Dirty）ではメール送信を遮断し、誤った立順での誤送信を未然に防止。
+ * 5. 立順重複（同一組・同一射位の衝突）およびゼッケン重複のリアルタイム検知・保存ブロック。
+ * 6. メール送信ボタンによる一体型QRカード添付メールの配信（個別送信・一括送信）。
+ * 7. サマリー統計カード（総エントリー、入金済、立順未割当、QR未送信）のリアルタイム集計表示。
  *
- * フールプルーフ設計:
- * - メール送信ボタンの非活性理由（未入金／立順未設定）を行内にバッジとして明示し、ユーザーの誤解を防止。
- * - 条件未充足（未入金または立順未確定）の状態で送信ボタンが押下された場合、何が不足しているかを即座に画面上部警告バナーで提示。
- * - 入金状態の切り替えを楽観的UI更新（Optimistic Update）で行い、操作直後のUI反映遅延を解消。
- * - 重複立順の保存処理を即時ブロック。
+ * フールプルーフ設計（事故前・対人間）:
+ * - 午前午後の立順が揃っていない段階では保存ボタンを非活性化（理由をツールチップ・バッジで明示）。
+ * - 変更後に未保存のままメール送信ボタンを押す操作を非活性化により入口で遮断。
+ * - 重複した立ち順の選手は保存をブロックし、該当セルを赤色警告表示。
  *
- * フェイルセーフ設計:
- * - メールAPIリクエストに AbortController（15秒タイムアウト）を適用。
- * - 送信結果を Firestore ドキュメントへ同期。
+ * フェイルセーフ設計（事故後・対故障）:
+ * - Firestore 書き込み失敗時は直前の確定状態へ安全にロールバック。
+ * - メールAPIリクエストに 15秒 のタイムアウト（AbortController）を設定し、UI膠着を回避。
  */
 
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   collection,
@@ -45,6 +45,7 @@ import {
   QrDeliveryStatus,
   sanitizeStandOrder,
   sanitizeStandGroup,
+  StandAssignment,
 } from '@/types';
 import { generateQrCardImage } from '@/lib/qrCardGenerator';
 import { Button } from '@/components/ui/button';
@@ -56,7 +57,6 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { QrCardModal } from '@/components/admin/QrCardModal';
 import {
   ArrowLeft,
   Search,
@@ -75,7 +75,7 @@ import {
   Moon,
   Save,
   Filter,
-  Share2,
+  Check,
 } from 'lucide-react';
 
 const API_TIMEOUT_MS = 15000;
@@ -84,12 +84,32 @@ function getNowTimestamp(): number {
   return Date.now();
 }
 
+/**
+ * 立ち順の比較用ハッシュキーを生成するヘルパー関数
+ */
+function createAssignmentKey(
+  assignments: Record<StandRoundIndex, StandAssignment>,
+): string {
+  const m = assignments[1];
+  const a = assignments[2];
+  const mG = m?.standGroup ?? '';
+  const mO = m?.standOrder ?? '';
+  const aG = a?.standGroup ?? '';
+  const aO = a?.standOrder ?? '';
+  return `${mG}:${mO}:${aG}:${aO}`;
+}
+
 export default function AdminCheckManagementPage() {
   const router = useRouter();
-
   const isDbReady = isFirebaseConfigured && isFirestoreAvailable(db);
 
+  // 画面編集用参加者リスト
   const [participants, setParticipants] = useState<Participant[]>([]);
+  // Firestoreに確定保存されている立順ハッシュマップ (participantId -> string)
+  const [savedAssignmentsMap, setSavedAssignmentsMap] = useState<
+    Record<string, string>
+  >({});
+
   const [isLoading, setIsLoading] = useState<boolean>(() => isDbReady);
   const [savingId, setSavingId] = useState<string | null>(null);
   const [processingQrId, setProcessingQrId] = useState<string | null>(null);
@@ -99,14 +119,9 @@ export default function AdminCheckManagementPage() {
     !isDbReady ? 'Firebaseデータベースに接続されていません。' : '',
   );
 
-  // QRカードモーダル用ステート
-  const [selectedCardParticipant, setSelectedCardParticipant] =
-    useState<Participant | null>(null);
-  const [isCardModalOpen, setIsCardModalOpen] = useState<boolean>(false);
-
   // 検索・フィルターステート
   const [searchTerm, setSearchTerm] = useState<string>('');
-  const [filterPaid, setFilterPaid] = useState<'ALL' | 'PAID' | 'UNPAID'>(
+  const [filterPaid, setFilterPaid] = useState<'ALL' | 'PAID' | 'UNPaid'>(
     'ALL',
   );
   const [filterQr, setFilterQr] = useState<'ALL' | 'SENT' | 'UNSENT'>('ALL');
@@ -114,6 +129,7 @@ export default function AdminCheckManagementPage() {
     'ALL' | 'ASSIGNED' | 'UNASSIGNED'
   >('ALL');
 
+  // 1. Firestore entries コレクションのリアルタイム購読
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
       return;
@@ -124,6 +140,8 @@ export default function AdminCheckManagementPage() {
       q,
       (snapshot) => {
         const loaded: Participant[] = [];
+        const savedMap: Record<string, string> = {};
+
         snapshot.forEach((docSnap) => {
           const raw = docSnap.data();
           const rawAssignments = raw.standAssignments || {};
@@ -161,7 +179,7 @@ export default function AdminCheckManagementPage() {
             },
           };
 
-          loaded.push({
+          const participantItem: Participant = {
             id: docSnap.id,
             bibNumber:
               typeof raw.bibNumber === 'number'
@@ -230,10 +248,14 @@ export default function AdminCheckManagementPage() {
             updatedAt:
               typeof raw.updatedAt === 'number' ? raw.updatedAt : undefined,
             userId: typeof raw.userId === 'string' ? raw.userId : undefined,
-          });
+          };
+
+          loaded.push(participantItem);
+          savedMap[docSnap.id] = createAssignmentKey(safeAssignments);
         });
 
         setParticipants(loaded);
+        setSavedAssignmentsMap(savedMap);
         setIsLoading(false);
       },
       (err) => {
@@ -246,6 +268,7 @@ export default function AdminCheckManagementPage() {
     return () => unsubscribe();
   }, []);
 
+  // ゼッケン重複チェック
   const duplicateBibNumbers = useMemo(() => {
     const counts = new Map<number, number>();
     participants.forEach((p) => {
@@ -260,6 +283,7 @@ export default function AdminCheckManagementPage() {
     return duplicates;
   }, [participants]);
 
+  // 立順重複チェック（午前・午後）
   const {
     duplicateMorningPlayerIds,
     duplicateAfternoonPlayerIds,
@@ -323,6 +347,7 @@ export default function AdminCheckManagementPage() {
     };
   }, [participants]);
 
+  // サマリー集計
   const stats = useMemo(() => {
     const total = participants.length;
     const paidCount = participants.filter((p) => p.isPaid).length;
@@ -344,6 +369,7 @@ export default function AdminCheckManagementPage() {
     return { total, paidCount, qrSentCount, unassignedCount };
   }, [participants]);
 
+  // フィルタリング処理
   const filteredParticipants = useMemo(() => {
     return participants.filter((p) => {
       const matchesSearch =
@@ -358,7 +384,7 @@ export default function AdminCheckManagementPage() {
       const matchesPaid =
         filterPaid === 'ALL' ||
         (filterPaid === 'PAID' && p.isPaid) ||
-        (filterPaid === 'UNPAID' && !p.isPaid);
+        (filterPaid === 'UNPaid' && !p.isPaid);
 
       const matchesQr =
         filterQr === 'ALL' ||
@@ -384,6 +410,7 @@ export default function AdminCheckManagementPage() {
     });
   }, [participants, searchTerm, filterPaid, filterQr, filterStand]);
 
+  // 一括送信対象の判定（入金済、立順完全設定済、保存完了済み、未送信）
   const pendingQrParticipants = useMemo(() => {
     return participants.filter((p) => {
       const m = p.standAssignments[1];
@@ -396,10 +423,17 @@ export default function AdminCheckManagementPage() {
         a.standGroup !== null &&
         a.standOrder !== null;
 
-      return p.isPaid && isFullyAssigned && p.qrSentStatus !== 'SENT';
-    });
-  }, [participants]);
+      const currentKey = createAssignmentKey(p.standAssignments);
+      const savedKey = savedAssignmentsMap[p.id] || '';
+      const isSaved = currentKey === savedKey;
 
+      return (
+        p.isPaid && isFullyAssigned && isSaved && p.qrSentStatus !== 'SENT'
+      );
+    });
+  }, [participants, savedAssignmentsMap]);
+
+  // 入金承認トグル
   const handleTogglePayment = async (participant: Participant) => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -437,6 +471,7 @@ export default function AdminCheckManagementPage() {
       setTimeout(() => setStatusMessage(''), 2500);
     } catch (err) {
       console.error('【入金更新エラー】:', err);
+      // ロールバック
       setParticipants((prev) =>
         prev.map((p) =>
           p.id === participant.id
@@ -452,6 +487,7 @@ export default function AdminCheckManagementPage() {
     }
   };
 
+  // 立順変更入力ハンドラー
   const handleAssignmentChange = (
     id: string,
     period: 'morning' | 'afternoon',
@@ -493,6 +529,7 @@ export default function AdminCheckManagementPage() {
     );
   };
 
+  // 【立順保存処理】午前午後の設定完了かつ変更がある場合に実行可能
   const handleSaveParticipantSettings = async (participant: Participant) => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -513,7 +550,7 @@ export default function AdminCheckManagementPage() {
             ? '午前'
             : '午後';
       setErrorMessage(
-        `ゼッケンNo.${participant.bibNumber} ${participant.name} 選手の${periodText}の立順（組・射位）が他の選手と重複しています。一意の設定に修正してください。`,
+        `ゼッケンNo.${participant.bibNumber} ${participant.name} 選手の${periodText}の立順が他の選手と重複しています。修正してください。`,
       );
       return;
     }
@@ -547,10 +584,17 @@ export default function AdminCheckManagementPage() {
         updatedAt: serverTimestamp(),
       });
 
+      // 保存済みハッシュを更新してメール送信ボタンをアクティブ化
+      const newKey = createAssignmentKey(normalizedAssignments);
+      setSavedAssignmentsMap((prev) => ({
+        ...prev,
+        [participant.id]: newKey,
+      }));
+
       setStatusMessage(
-        `ゼッケンNo.${participant.bibNumber} ${participant.name} 選手の立順設定を保存しました。`,
+        `ゼッケンNo.${participant.bibNumber} ${participant.name} 選手の立順設定を保存しました。メール送信が可能になりました。`,
       );
-      setTimeout(() => setStatusMessage(''), 2000);
+      setTimeout(() => setStatusMessage(''), 3000);
     } catch (err) {
       console.error('【保存エラー】:', err);
       setErrorMessage('立順設定の保存に失敗しました。');
@@ -559,15 +603,13 @@ export default function AdminCheckManagementPage() {
     }
   };
 
-  /**
-   * 【個別QRコード送信ハンドラー】
-   */
+  // 【個別QRコード送信処理】保存完了後のみ実行可能
   const handleSendSingleQr = async (participant: Participant) => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
     if (!participant.isPaid) {
       setErrorMessage(
-        `【No.${participant.bibNumber} ${participant.name} 選手】参加費が未納です。「参加費納付承認」ボタンを押して入金を承認してください。`,
+        `【No.${participant.bibNumber} ${participant.name} 選手】参加費が未納です。入金を承認してください。`,
       );
       return;
     }
@@ -580,15 +622,18 @@ export default function AdminCheckManagementPage() {
       !a || a.standGroup === null || a.standOrder === null;
 
     if (isMorningMissing || isAfternoonMissing) {
-      const missingDetails = [
-        isMorningMissing ? '午前の部' : null,
-        isAfternoonMissing ? '午後の部' : null,
-      ]
-        .filter(Boolean)
-        .join('・');
-
       setErrorMessage(
-        `【No.${participant.bibNumber} ${participant.name} 選手】立ち順（${missingDetails}）が未設定です。組番号と立順を選択し、「保存」ボタンを押してからQRコードを送信してください。`,
+        `【No.${participant.bibNumber} ${participant.name} 選手】立ち順が未設定です。設定後に「保存」を行ってください。`,
+      );
+      return;
+    }
+
+    // 未保存変更のガード（フールプルーフ）
+    const currentKey = createAssignmentKey(participant.standAssignments);
+    const savedKey = savedAssignmentsMap[participant.id] || '';
+    if (currentKey !== savedKey) {
+      setErrorMessage(
+        `【No.${participant.bibNumber} ${participant.name} 選手】立順の変更が保存されていません。先に「保存」ボタンを押してください。`,
       );
       return;
     }
@@ -700,14 +745,12 @@ export default function AdminCheckManagementPage() {
     }
   };
 
-  /**
-   * 【一括QRコード送信ハンドラー】
-   */
+  // 【一括QRコード送信処理】
   const handleBatchSendQr = async () => {
     if (pendingQrParticipants.length === 0) return;
 
     const confirmed = window.confirm(
-      `入金承認済みかつ立順確定済みの選手 ${pendingQrParticipants.length} 名に一体型QRカード付き案内メールを一括送信しますか？`,
+      `入金承認済みかつ立順が確定・保存済みの選手 ${pendingQrParticipants.length} 名に一体型QRカード付き案内メールを一括送信しますか？`,
     );
     if (!confirmed) return;
 
@@ -820,11 +863,6 @@ export default function AdminCheckManagementPage() {
     );
   };
 
-  const handleOpenCardModal = (participant: Participant) => {
-    setSelectedCardParticipant(participant);
-    setIsCardModalOpen(true);
-  };
-
   if (isLoading) {
     return (
       <div className="min-h-screen bg-[#F8FAFC] flex flex-col items-center justify-center p-8 text-slate-500 w-full">
@@ -854,7 +892,7 @@ export default function AdminCheckManagementPage() {
             入金確認・立順編成・正式QRコード発行
           </h1>
           <p className="text-xs text-slate-500 font-medium">
-            参加費納付の承認、午前・午後の立ち順設定（未割当対応・重複検知ガード付）、QRカード画像の生成・LINE配布、および一体型QRカード付き正式受付メール配信を一元管理します。
+            午前・午後の立ち順を選択すると「保存」が有効化され、保存完了後に「メール送信」がアクティブになります。
           </p>
         </div>
 
@@ -884,8 +922,7 @@ export default function AdminCheckManagementPage() {
             ) : (
               <>
                 <Send className="w-3.5 h-3.5 mr-1.5 text-amber-400" />
-                入金＆立順確定済みに一括QR送信 ({pendingQrParticipants.length}
-                名)
+                入金＆保存済みに一括QR送信 ({pendingQrParticipants.length}名)
               </>
             )}
           </Button>
@@ -939,7 +976,7 @@ export default function AdminCheckManagementPage() {
         </div>
       </div>
 
-      {/* ステータスメッセージ */}
+      {/* ステータスメッセージバナー */}
       {statusMessage && (
         <div className="w-full p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 text-xs font-bold flex items-center gap-2">
           <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
@@ -954,7 +991,7 @@ export default function AdminCheckManagementPage() {
         </div>
       )}
 
-      {/* ゼッケン番号重複警告バナー */}
+      {/* ゼッケン番号重複警告 */}
       {duplicateBibNumbers.size > 0 && (
         <div className="w-full p-4 bg-red-50 border border-red-200 rounded-xl text-red-900 text-xs flex items-start gap-2.5">
           <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
@@ -964,13 +1001,13 @@ export default function AdminCheckManagementPage() {
               {Array.from(duplicateBibNumbers).join(', ')}）
             </p>
             <p className="text-[11px] text-red-700">
-              ※同一のゼッケン番号を持つ選手は保存できません。それぞれ一意の番号に修正してください。
+              同一のゼッケン番号を持つ選手は保存できません。それぞれ一意の番号に修正してください。
             </p>
           </div>
         </div>
       )}
 
-      {/* 立順設定重複警告バナー */}
+      {/* 立順重複警告 */}
       {(duplicateMorningSlotLabels.length > 0 ||
         duplicateAfternoonSlotLabels.length > 0) && (
         <div className="w-full p-4 bg-red-50 border border-red-200 rounded-xl text-red-900 text-xs flex items-start gap-2.5">
@@ -981,18 +1018,18 @@ export default function AdminCheckManagementPage() {
             </p>
             {duplicateMorningSlotLabels.length > 0 && (
               <p className="text-[11px] text-red-700">
-                ・午前の部（第1立） 重複枠:{' '}
+                ・午前の部 重複枠:{' '}
                 <strong>{duplicateMorningSlotLabels.join(', ')}</strong>
               </p>
             )}
             {duplicateAfternoonSlotLabels.length > 0 && (
               <p className="text-[11px] text-red-700">
-                ・午後の部（第2立・第3立） 重複枠:{' '}
+                ・午後の部 重複枠:{' '}
                 <strong>{duplicateAfternoonSlotLabels.join(', ')}</strong>
               </p>
             )}
             <p className="text-[10px] text-red-600 pt-0.5">
-              ※同一の組番号・射位に複数の選手を割り当てることはできません。重複が解消されるまで対象選手の保存処理はブロックされます。
+              同一の組番号・射位に複数の選手を割り当てることはできません。修正するまで保存はブロックされます。
             </p>
           </div>
         </div>
@@ -1017,13 +1054,13 @@ export default function AdminCheckManagementPage() {
             <select
               value={filterPaid}
               onChange={(e) =>
-                setFilterPaid(e.target.value as 'ALL' | 'PAID' | 'UNPAID')
+                setFilterPaid(e.target.value as 'ALL' | 'PAID' | 'UNPaid')
               }
               className="bg-transparent text-slate-700 font-bold outline-none cursor-pointer"
             >
               <option value="ALL">入金: すべて</option>
               <option value="PAID">入金承認済のみ</option>
-              <option value="UNPAID">未納のみ</option>
+              <option value="UNPaid">未納のみ</option>
             </select>
           </div>
 
@@ -1081,11 +1118,8 @@ export default function AdminCheckManagementPage() {
               <TableHead className="font-bold text-slate-900">
                 立順設定 (午前 / 午後連動)
               </TableHead>
-              <TableHead className="font-bold text-slate-900 text-center w-20">
-                保存
-              </TableHead>
-              <TableHead className="font-bold text-slate-900 text-center w-36">
-                QRカード配布
+              <TableHead className="font-bold text-slate-900 text-center w-28">
+                立順保存
               </TableHead>
               <TableHead className="font-bold text-slate-900 text-center w-40">
                 メール送信
@@ -1096,7 +1130,7 @@ export default function AdminCheckManagementPage() {
             {filteredParticipants.length === 0 ? (
               <TableRow>
                 <TableCell
-                  colSpan={8}
+                  colSpan={7}
                   className="py-16 text-center text-slate-400 font-medium"
                 >
                   該当するエントリー選手は見つかりませんでした。
@@ -1126,16 +1160,35 @@ export default function AdminCheckManagementPage() {
                   standOrder: null,
                 };
 
-                const isMorningAssigned =
+                // 1. 午前・午後の両方の組・射位がすべて選択されているか判定
+                const isMorningComplete =
                   morningAssign.standGroup !== null &&
                   morningAssign.standOrder !== null;
-                const isAfternoonAssigned =
+                const isAfternoonComplete =
                   afternoonAssign.standGroup !== null &&
                   afternoonAssign.standOrder !== null;
-                const isFullyAssigned =
-                  isMorningAssigned && isAfternoonAssigned;
+                const isFullySelected =
+                  isMorningComplete && isAfternoonComplete;
 
-                const canSendQr = p.isPaid && isFullyAssigned;
+                // 2. 現在の入力値と、Firestore上の保存確定値を比較（未保存差分があるか判定）
+                const currentKey = createAssignmentKey(p.standAssignments);
+                const savedKey = savedAssignmentsMap[p.id] || '';
+                const isDirty = currentKey !== savedKey;
+                const isSavedInDb = isFullySelected && !isDirty;
+
+                // 3. 【保存ボタンのアクティブ判定】
+                const canSave =
+                  isFullySelected &&
+                  isDirty &&
+                  !isBibDuplicate &&
+                  !isAssignmentDuplicate;
+
+                // 4. 【メール送信ボタンのアクティブ判定】
+                const canSendEmail =
+                  p.isPaid &&
+                  isSavedInDb &&
+                  !isBibDuplicate &&
+                  !isAssignmentDuplicate;
 
                 return (
                   <TableRow
@@ -1146,6 +1199,7 @@ export default function AdminCheckManagementPage() {
                         : ''
                     }`}
                   >
+                    {/* ゼッケン番号 */}
                     <TableCell className="font-mono font-black text-sm text-slate-900 align-top pt-4">
                       No.{p.bibNumber}
                       {isBibDuplicate && (
@@ -1155,6 +1209,7 @@ export default function AdminCheckManagementPage() {
                       )}
                     </TableCell>
 
+                    {/* 選手情報 */}
                     <TableCell className="align-top pt-4">
                       <div className="font-bold text-slate-900 text-sm">
                         {p.name}
@@ -1175,6 +1230,7 @@ export default function AdminCheckManagementPage() {
                       )}
                     </TableCell>
 
+                    {/* 申込担当者情報 */}
                     <TableCell className="align-top pt-4 max-w-[200px]">
                       <div className="font-bold text-slate-800 text-xs">
                         {p.representativeName || '未登録'} 様
@@ -1190,6 +1246,7 @@ export default function AdminCheckManagementPage() {
                       </div>
                     </TableCell>
 
+                    {/* 入金承認 */}
                     <TableCell className="text-center align-top pt-4">
                       <button
                         type="button"
@@ -1222,8 +1279,10 @@ export default function AdminCheckManagementPage() {
                       )}
                     </TableCell>
 
+                    {/* 立順入力フォーム */}
                     <TableCell className="align-top pt-3">
                       <div className="space-y-2">
+                        {/* 午前 */}
                         <div
                           className={`flex items-center gap-2 p-2 rounded-lg border transition-colors ${
                             isMorningDuplicate
@@ -1241,7 +1300,7 @@ export default function AdminCheckManagementPage() {
                             <input
                               type="number"
                               min={1}
-                              placeholder="未設定"
+                              placeholder="組"
                               value={morningAssign.standGroup ?? ''}
                               onChange={(e) => {
                                 const val =
@@ -1303,6 +1362,7 @@ export default function AdminCheckManagementPage() {
                           )}
                         </div>
 
+                        {/* 午後 */}
                         <div
                           className={`flex items-center gap-2 p-2 rounded-lg border transition-colors ${
                             isAfternoonDuplicate
@@ -1320,7 +1380,7 @@ export default function AdminCheckManagementPage() {
                             <input
                               type="number"
                               min={1}
-                              placeholder="未設定"
+                              placeholder="組"
                               value={afternoonAssign.standGroup ?? ''}
                               onChange={(e) => {
                                 const val =
@@ -1384,82 +1444,97 @@ export default function AdminCheckManagementPage() {
                       </div>
                     </TableCell>
 
+                    {/* 【立順保存ボタン】午前午後設定完了でアクティブ化 */}
                     <TableCell className="text-center align-top pt-4">
-                      <Button
-                        type="button"
-                        size="sm"
-                        disabled={
-                          isSaving || isBibDuplicate || isAssignmentDuplicate
-                        }
-                        onClick={() => handleSaveParticipantSettings(p)}
-                        className={`h-8 px-2.5 font-bold text-xs rounded-lg shadow-2xs transition-all ${
-                          isBibDuplicate || isAssignmentDuplicate
-                            ? 'bg-slate-200 text-slate-400 cursor-not-allowed shadow-none'
-                            : 'bg-slate-900 hover:bg-slate-800 text-white'
-                        }`}
-                        title={
-                          isBibDuplicate
-                            ? 'ゼッケン番号が重複しているため保存できません'
-                            : isAssignmentDuplicate
-                              ? '立順（組番号・射位）が他の選手と重複しているため保存できません'
-                              : '立順の変更を保存'
-                        }
-                      >
-                        {isSaving ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <Save className="w-3.5 h-3.5" />
+                      <div className="flex flex-col items-center gap-1">
+                        <Button
+                          type="button"
+                          size="sm"
+                          disabled={isSaving || !canSave}
+                          onClick={() => handleSaveParticipantSettings(p)}
+                          className={`h-8 px-3 font-bold text-xs rounded-xl shadow-2xs transition-all flex items-center gap-1 ${
+                            canSave
+                              ? 'bg-emerald-600 hover:bg-emerald-500 text-white animate-pulse'
+                              : isSavedInDb
+                                ? 'bg-slate-100 text-slate-400 border border-slate-200 cursor-default shadow-none'
+                                : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed shadow-none'
+                          }`}
+                          title={
+                            !isFullySelected
+                              ? '午前・午後の組番号と立順をすべて選択してください'
+                              : !isDirty
+                                ? '変更はありません（保存完了済み）'
+                                : isAssignmentDuplicate
+                                  ? '立順が重複しているため保存できません'
+                                  : '立ち順をFirestoreに確定保存します'
+                          }
+                        >
+                          {isSaving ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : isSavedInDb ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-600" />
+                              保存済
+                            </>
+                          ) : (
+                            <>
+                              <Save className="w-3.5 h-3.5" />
+                              保存
+                            </>
+                          )}
+                        </Button>
+
+                        {/* 保存状態のステータス明示 */}
+                        {isFullySelected && isDirty && (
+                          <span className="text-[9px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.2 rounded">
+                            未保存の変更あり
+                          </span>
                         )}
-                      </Button>
+                        {!isFullySelected && (
+                          <span className="text-[9px] font-medium text-slate-400">
+                            未選択あり
+                          </span>
+                        )}
+                      </div>
                     </TableCell>
 
-                    <TableCell className="text-center align-top pt-4">
-                      <Button
-                        type="button"
-                        size="sm"
-                        onClick={() => handleOpenCardModal(p)}
-                        className="h-8 px-3 rounded-lg text-xs font-bold bg-[#06C755] hover:bg-[#05B34C] text-white shadow-2xs transition-transform active:scale-95 flex items-center justify-center gap-1 mx-auto"
-                        title="選手情報一体型のQRカード画像を生成しLINE等で配布"
-                      >
-                        <Share2 className="w-3.5 h-3.5 text-white" />
-                        QRカード配布
-                      </Button>
-                    </TableCell>
-
+                    {/* 【メール送信ボタン】立順保存完了後のみアクティブ化 */}
                     <TableCell className="text-center align-top pt-4">
                       <div className="flex flex-col items-center gap-1.5">
                         <Button
                           type="button"
                           size="sm"
-                          disabled={isSendingQr}
+                          disabled={isSendingQr || !canSendEmail}
                           onClick={() => handleSendSingleQr(p)}
-                          className={`h-8 px-3 rounded-lg text-xs font-bold transition-all shadow-2xs active:scale-95 ${
-                            !canSendQr
-                              ? 'bg-slate-100 text-slate-500 border border-slate-300 hover:bg-slate-200'
-                              : isQrSent
+                          className={`h-8 px-3 rounded-xl text-xs font-bold transition-all shadow-2xs active:scale-95 flex items-center gap-1 ${
+                            canSendEmail
+                              ? isQrSent
                                 ? 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-50'
                                 : 'bg-slate-900 hover:bg-slate-800 text-white'
+                              : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed shadow-none'
                           }`}
                           title={
                             !p.isPaid
-                              ? '入金承認が必要です（クリックで詳細表示）'
-                              : !isFullyAssigned
-                                ? '立ち順（午前・午後）の設定・保存が必要です（クリックで詳細表示）'
-                                : '選手情報一体型QRカードを添付してメール送信'
+                              ? '参加費の入金承認が必要です'
+                              : !isFullySelected
+                                ? '午前・午後の立ち順設定が必要です'
+                                : isDirty
+                                  ? '立順の変更が保存されていません。先に「保存」を押してください'
+                                  : '選手情報一体型QRカードを添付して案内メールを送信'
                           }
                         >
                           {isSendingQr ? (
                             <Loader2 className="w-3.5 h-3.5 animate-spin" />
                           ) : isQrSent ? (
                             <>
-                              <RefreshCw className="w-3.5 h-3.5 mr-1 text-slate-500" />
+                              <RefreshCw className="w-3.5 h-3.5 text-slate-500" />
                               再送信
                             </>
                           ) : (
                             <>
                               <QrCode
-                                className={`w-3.5 h-3.5 mr-1 ${
-                                  canSendQr
+                                className={`w-3.5 h-3.5 ${
+                                  canSendEmail
                                     ? 'text-amber-400'
                                     : 'text-slate-400'
                                 }`}
@@ -1469,24 +1544,31 @@ export default function AdminCheckManagementPage() {
                           )}
                         </Button>
 
-                        {!canSendQr && (
+                        {/* 非活性理由の明示（フールプルーフ表示） */}
+                        {!canSendEmail && (
                           <div className="flex flex-col items-center gap-0.5">
                             {!p.isPaid && (
                               <span className="text-[9px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.2 rounded">
                                 要 入金承認
                               </span>
                             )}
-                            {!isFullyAssigned && (
+                            {!isFullySelected && (
                               <span className="text-[9px] font-bold text-rose-700 bg-rose-50 border border-rose-200 px-1.5 py-0.2 rounded">
-                                要 立順設定・保存
+                                要 立順設定
+                              </span>
+                            )}
+                            {isFullySelected && isDirty && (
+                              <span className="text-[9px] font-bold text-amber-700 bg-amber-50 border border-amber-300 px-1.5 py-0.2 rounded animate-pulse">
+                                要 先に立順保存
                               </span>
                             )}
                           </div>
                         )}
 
+                        {/* 送信状態バッジ */}
                         {isQrSent && (
                           <span className="text-[10px] font-bold text-emerald-700 flex items-center gap-0.5">
-                            <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
                             送信済 (
                             {p.qrSentAt
                               ? new Date(p.qrSentAt).toLocaleTimeString(
@@ -1506,12 +1588,12 @@ export default function AdminCheckManagementPage() {
                             className="text-[10px] font-bold text-red-600 flex items-center gap-0.5"
                             title={p.qrSentError || ''}
                           >
-                            <AlertCircle className="w-3 h-3 text-red-600" />
+                            <AlertCircle className="w-3.5 h-3.5 text-red-600" />
                             送信失敗
                           </span>
                         )}
 
-                        {!isQrSent && !isQrFailed && canSendQr && (
+                        {!isQrSent && !isQrFailed && canSendEmail && (
                           <span className="text-[10px] text-slate-500 flex items-center gap-0.5">
                             <Clock className="w-2.5 h-2.5" /> 送信準備完了
                           </span>
@@ -1525,15 +1607,6 @@ export default function AdminCheckManagementPage() {
           </TableBody>
         </Table>
       </div>
-
-      <QrCardModal
-        participant={selectedCardParticipant}
-        isOpen={isCardModalOpen}
-        onClose={() => {
-          setIsCardModalOpen(false);
-          setSelectedCardParticipant(null);
-        }}
-      />
     </main>
   );
 }
