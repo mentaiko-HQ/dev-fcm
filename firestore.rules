@@ -11,32 +11,45 @@ service cloud.firestore {
       return request.auth != null && request.auth.token.admin == true;
     }
 
-    // 2. 運営スタッフ判定（フェイルセーフ: Claims未設定時でもパスワード認証済み運営アカウントの操作を継続）
+    // 2. 運営スタッフ判定（フェイルセーフ: Claims付与済み、または匿名以外の認証済み運営アカウントを許可）
     function isOperator() {
       return request.auth != null &&
         (
           request.auth.token.admin == true ||
-          (request.auth.token.firebase.sign_in_provider == 'password' && request.auth.token.email_verified != false)
+          (
+            request.auth.token.firebase.sign_in_provider != 'anonymous' &&
+            request.auth.token.email_verified != false
+          )
         );
     }
 
-    // 3. ユーザー自身判定（ログイン済みUIDの一致検証）
+    // 3. ユーザー自身判定（ログイン中UIDの一致検証）
     function isOwner(userId) {
       return request.auth != null && request.auth.uid == userId;
     }
 
-    // 4. エントリー更新バリデーション（フールプルーフ: 許可された運営管理キー以外の改ざんを入口で遮断）
+    // 4. 射位（大前〜落: 1〜5番）および立・組構造バリデーション（フールプルーフ）
+    // 1立 = 5名（射位1〜5）、2立 = 1組（第1立・第2立 → 第1組、第3立・第4立 → 第2組...）
+    function isValidStandStructure() {
+      let data = request.resource.data;
+      return (!('standOrder' in data) || (data.standOrder is int && data.standOrder >= 1 && data.standOrder <= 5)) &&
+             (!('standNumber' in data) || (data.standNumber is int && data.standNumber >= 1)) &&
+             (!('groupNumber' in data) || (data.groupNumber is int && data.groupNumber >= 1));
+    }
+
+    // 5. エントリー更新バリデーション（フールプルーフ: 許可された運営管理キー以外の改ざんを入口で遮断）
     function isValidEntryUpdate() {
       return request.resource.data.diff(resource.data).affectedKeys()
         .hasOnly([
           'isPaid', 'paidAt', 'bibNumber', 'standAssignments',
+          'standNumber', 'groupNumber', 'standGroup', 'standOrder',
           'checkInStatus', 'checkInAt', 'checkInMethod',
           'qualificationStatus', 'progressStatus',
           'stand1_arrows', 'stand2_arrows', 'stand3_arrows',
           'isHayaHit', 'totalHits', 'totalShots', 'isPerfect',
           'enkinRank', 'finalRank',
           'qrSentStatus', 'qrSentAt', 'qrSentError', 'updatedAt'
-        ]);
+        ]) && isValidStandStructure();
     }
 
     // ==========================================
@@ -57,7 +70,7 @@ service cloud.firestore {
       allow create, update, delete: if isOperator();
     }
 
-    // entries コレクション: 大会参加選手リスト
+    // entries コレクション: 大会参加選手リスト（無制限エントリー対応）
     match /entries/{entryId} {
       allow read: if true;
       allow create: if request.auth != null;
@@ -69,6 +82,12 @@ service cloud.firestore {
     match /matches/{matchId} {
       allow read: if true;
       allow create, update, delete: if isOperator();
+
+      // FCM呼出通知ログ サブコレクション
+      match /call_logs/{logId} {
+        allow read: if true;
+        allow create, update, delete: if isOperator();
+      }
     }
 
     // scores コレクション: 的中記録（射詰・遠近・本戦）
