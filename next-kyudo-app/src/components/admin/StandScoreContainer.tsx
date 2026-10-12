@@ -2,20 +2,25 @@
  * 【競技記録員用 スコア入力コンソール】
  *
  * 役割:
- * - 第1立（一手2射）および第2立（一手2射）の成績を [0, 1, 2] ボタンで入力。
- * - 第3立（四矢4射）の成績を [0, 1, 2, 3, 4] ボタンで入力。
- * - 第1立における「甲矢的中」ボタン押下時、即座に「1のボタンを押した（1中・甲矢〇・乙矢✕）」と同じ挙動を実行。
+ * - 大会回次（ラウンド）表記を「ステージ」へ完全統一:
+ *   - 第1ステージ（午前・一手2射）: [0, 1, 2] 的中ボタン入力
+ *   - 第2ステージ（午後・一手2射）: [0, 1, 2] 的中ボタン入力
+ *   - 第3ステージ（午後・四矢4射）: [0, 1, 2, 3, 4] 的中ボタン入力
+ * - 立（Stand）と組（Group）の構造定義:
+ *   - 選手5名を合わせて「立」（第1立、第2立、第3立、第4立...）
+ *   - 2つの立を合わせて「組」（第1立・第2立 → 第1組、第3立・第4立 → 第2組...）
+ * - 【選手数無制限対応】エントリー全選手および割当立番号から立選択ボタン（第1立〜第N立）を動的自動生成。
+ * - 第1ステージにおける「甲矢的中」ボタン押下時、即座に「1のボタンを押した（1中・甲矢〇・乙矢✕）」と同じ挙動を実行。
  * - 既に「1中・甲矢〇」の状態で再度甲矢的中ボタンを押した場合はトグル解除として「0中」にリセット。
  * - 直前の入力ミスを安全に復元する Undo（取り消し）機能。
- * - 立（ラウンド）および組（立グループ）の切り替えと、該当選手の立ち順順（大前〜落）表示。
+ * - ステージおよび立の切り替えと、該当選手の射位順（1大前〜5落）表示。
  *
  * フールプルーフ設計（事故前・対人間）:
- * 1. useEffect内での同期的なsetState（setIsLoading(false)）を排除し、useState初期値の遅延評価（() => isDbReady）によりカスケードレンダリングを防止。
+ * 1. useEffect内での同期的なsetStateを排除しカスケードレンダリングを防止。
  * 2. 甲矢的中ボタンを押す際、事前的中数の選択を不要化し、ワンタップで「1中（甲矢〇）」を確定。
- * 3. 第1立で「2中」を選択した際は、甲矢（1射目）が必ず的中しているため、甲矢的中を自動的にONに設定。
- * 4. 第1立で「0中」を選択した際は、甲矢は的中し得ないため、甲矢的中を自動的にOFFに同期。
- * 5. 棄権（ABSENT / WITHDRAWN）の選手はスコア入力を全面無効化し、誤入力を防止。
- * 6. 通信中の多重タップを処理中フラグ（savingId）で排他ロック。
+ * 3. 第1ステージで「2中」選択時は甲矢的中を自動ON、「0中」選択時は自動OFFに同期。
+ * 4. 棄権（ABSENT / WITHDRAWN）の選手はスコア入力を全面無効化し、誤入力を防止。
+ * 5. 通信中の多重タップを処理中フラグ（savingId）で排他ロック。
  *
  * フェイルセーフ設計（事故後・対故障）:
  * 1. 楽観的UI更新（Optimistic Update）を行い、Firestore書き込み失敗時は直前の状態へ自動ロールバック。
@@ -39,7 +44,6 @@ import { db, isFirebaseConfigured, isFirestoreAvailable } from '@/lib/firebase';
 import {
   TournamentConfig,
   StandRoundIndex,
-  STAND_CONFIGS,
   Participant,
   StandOrderIndex,
   ArrowHit,
@@ -66,6 +70,7 @@ import {
   Loader2,
   Check,
   X,
+  Layers,
 } from 'lucide-react';
 
 interface StandScoreContainerProps {
@@ -83,6 +88,25 @@ interface UndoHistoryEntry {
   previousTotalHits: number;
 }
 
+/**
+ * ステージ名称取得ヘルパー関数
+ */
+function getStageName(round: StandRoundIndex): string {
+  switch (round) {
+    case 1:
+      return '第1ステージ (午前・一手 2射)';
+    case 2:
+      return '第2ステージ (午後・一手 2射)';
+    case 3:
+      return '第3ステージ (午後・四矢 4射)';
+    default:
+      return `第${round}ステージ`;
+  }
+}
+
+/**
+ * 射位ラベル取得ヘルパー関数
+ */
 function getStandOrderLabel(order: StandOrderIndex | null | undefined): string {
   if (!order) return '未定';
   const labels: Record<number, string> = {
@@ -124,11 +148,11 @@ export function StandScoreContainer({
 }: StandScoreContainerProps) {
   const isDbReady = isFirebaseConfigured && isFirestoreAvailable(db);
 
-  // 選択ステート（立: 1, 2, 3 / 組: 1〜totalStandGroups）
+  // 選択ステート（回次は「ステージ」、行射枠は「立」）
   const [selectedRound, setSelectedRound] = useState<StandRoundIndex>(1);
-  const [selectedGroup, setSelectedGroup] = useState<number>(1);
+  const [selectedStandNumber, setSelectedStandNumber] = useState<number>(1);
 
-  // 参加者リスト（初期値でDB接続状態を評価し、エフェクト内での同期的なsetStateを防止）
+  // 参加者リスト
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(() => isDbReady);
   const [savingId, setSavingId] = useState<string | null>(null);
@@ -137,7 +161,7 @@ export function StandScoreContainer({
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string>('');
 
-  // Undo履歴スタック（最新の操作を最大10件保持）
+  // Undo履歴スタック
   const [undoStack, setUndoStack] = useState<UndoHistoryEntry[]>([]);
 
   // 1. Firestore entries コレクションのリアルタイム同期
@@ -265,37 +289,53 @@ export function StandScoreContainer({
     return () => unsubscribe();
   }, [isDbReady]);
 
-  // 2. 選択された立・組に合致する選手の抽出とソート（射位昇順: 1大前 〜 5落）
+  // 2. 選択されたステージ・立番号に合致する選手の抽出とソート（射位昇順: 1大前 〜 5落）
   const currentStandParticipants = useMemo(() => {
     return participants
       .filter((p) => {
         const assign = p.standAssignments[selectedRound];
-        return assign && assign.standGroup === selectedGroup;
+        return assign && assign.standGroup === selectedStandNumber;
       })
       .sort((a, b) => {
         const orderA = a.standAssignments[selectedRound]?.standOrder ?? 99;
         const orderB = b.standAssignments[selectedRound]?.standOrder ?? 99;
         return orderA - orderB;
       });
-  }, [participants, selectedRound, selectedGroup]);
+  }, [participants, selectedRound, selectedStandNumber]);
 
-  // 総組数のリスト生成
-  const groupOptions = useMemo(() => {
-    const total = Math.max(1, tournamentConfig.totalStandGroups || 4);
+  // 【選手数無制限対応】全選手の立番号から立選択ボタングループ（第1立〜第N立）を動的自動生成
+  const standOptions = useMemo(() => {
+    let maxAssignedStand = 1;
+    participants.forEach((p) => {
+      [1, 2, 3].forEach((r) => {
+        const s = p.standAssignments[r as StandRoundIndex]?.standGroup;
+        if (s && s > maxAssignedStand) maxAssignedStand = s;
+      });
+    });
+
+    const calculatedByCount = Math.ceil(participants.length / 5);
+    const total = Math.max(
+      1,
+      tournamentConfig.totalStandGroups || 1,
+      maxAssignedStand,
+      calculatedByCount,
+    );
+
     return Array.from({ length: total }, (_, i) => i + 1);
-  }, [tournamentConfig.totalStandGroups]);
+  }, [participants, tournamentConfig.totalStandGroups]);
+
+  // 現在選択中の立が属する「組」番号を算出（第1・2立 → 第1組、第3・4立 → 第2組...）
+  const currentGroupNumber = useMemo(() => {
+    return Math.ceil(selectedStandNumber / 2);
+  }, [selectedStandNumber]);
 
   /**
    * 【スコア入力実行処理】
-   * - 第1立: 0, 1, 2
-   * - 第2立: 0, 1, 2
-   * - 第3立: 0, 1, 2, 3, 4
    */
   const handleScoreChange = useCallback(
     async (participant: Participant, newHitCount: number) => {
       if (!isDbReady) return;
 
-      // 棄権選手のガード（フールプルーフ）
       if (
         participant.checkInStatus === 'ABSENT' ||
         participant.qualificationStatus === 'WITHDRAWN'
@@ -309,7 +349,6 @@ export function StandScoreContainer({
       setSavingId(participant.id);
       setErrorMessage('');
 
-      // 現在の状態を保存（Undoおよびロールバック用）
       const previousState = { ...participant };
       const previousArrows =
         selectedRound === 1
@@ -320,24 +359,21 @@ export function StandScoreContainer({
       const previousHayaHit = participant.isHayaHit;
       const previousTotalHits = participant.totalHits;
 
-      // フールプルーフ: 甲矢的中の連動計算
       let nextHayaHit = participant.isHayaHit;
       if (selectedRound === 1) {
         if (newHitCount === 2) {
-          nextHayaHit = true; // 2中なら甲矢は必ず的中
+          nextHayaHit = true;
         } else if (newHitCount === 0) {
-          nextHayaHit = false; // 0中なら甲矢は的中しない
+          nextHayaHit = false;
         }
       }
 
-      // 新しい矢配列の生成
       const newArrows = createArrowArray(
         selectedRound,
         newHitCount,
         nextHayaHit,
       );
 
-      // 合計的中数の再計算
       const s1Hits =
         selectedRound === 1
           ? newHitCount
@@ -353,7 +389,6 @@ export function StandScoreContainer({
       const nextTotalHits = s1Hits + s2Hits + s3Hits;
       const isPerfect = nextTotalHits === 8;
 
-      // 楽観的UI更新
       setParticipants((prev) =>
         prev.map((p) => {
           if (p.id !== participant.id) return p;
@@ -388,7 +423,6 @@ export function StandScoreContainer({
 
         await updateDoc(docRef, updatePayload);
 
-        // Undoスタックへ追加
         setUndoStack((prev) => [
           {
             participantId: participant.id,
@@ -403,12 +437,11 @@ export function StandScoreContainer({
         ]);
 
         setStatusMessage(
-          `No.${participant.bibNumber} ${participant.name} 選手: ${STAND_CONFIGS[selectedRound].name} を「${newHitCount}中」に更新しました。`,
+          `No.${participant.bibNumber} ${participant.name} 選手: ${getStageName(selectedRound)} を「${newHitCount}中」に更新しました。`,
         );
         setTimeout(() => setStatusMessage(''), 3000);
       } catch (err) {
         console.error('【スコア更新例外】:', err);
-        // フェイルセーフ: ロールバック
         setParticipants((prev) =>
           prev.map((p) => (p.id === participant.id ? previousState : p)),
         );
@@ -423,17 +456,12 @@ export function StandScoreContainer({
   );
 
   /**
-   * 【第1立 甲矢的中トグルハンドラー】
-   *
-   * 役割:
-   * - 甲矢的中ボタン押下時に「1のボタンを押した（1中・甲矢〇・乙矢✕）」と同じ挙動を実行。
-   * - 既に「1中 かつ 甲矢的中」が記録されている場合はトグル解除として「0中（0のボタン押下時と同等）」に更新。
+   * 【第1ステージ 甲矢的中トグルハンドラー】
    */
   const handleToggleHayaHit = useCallback(
     async (participant: Participant) => {
       if (!isDbReady || selectedRound !== 1) return;
 
-      // 棄権選手のガード（フールプルーフ）
       if (
         participant.checkInStatus === 'ABSENT' ||
         participant.qualificationStatus === 'WITHDRAWN'
@@ -454,8 +482,6 @@ export function StandScoreContainer({
 
       const currentStand1Hits =
         participant.stand1_arrows.filter(Boolean).length;
-
-      // 既に「1中 かつ 甲矢的中」の場合は0中にリセット、それ以外は「1中 かつ 甲矢的中」に設定
       const isAlreadyHayaOneHit =
         currentStand1Hits === 1 && participant.isHayaHit;
       const targetHitCount = isAlreadyHayaOneHit ? 0 : 1;
@@ -465,14 +491,12 @@ export function StandScoreContainer({
         ? [true, false]
         : [false, false];
 
-      // 合計的中数の再計算
       const s1Hits = targetHitCount;
       const s2Hits = participant.stand2_arrows.filter(Boolean).length;
       const s3Hits = participant.stand3_arrows.filter(Boolean).length;
       const nextTotalHits = s1Hits + s2Hits + s3Hits;
       const isPerfect = nextTotalHits === 8;
 
-      // 楽観的UI更新
       setParticipants((prev) =>
         prev.map((p) =>
           p.id === participant.id
@@ -497,7 +521,6 @@ export function StandScoreContainer({
           updatedAt: serverTimestamp(),
         });
 
-        // Undoスタックへ追加
         setUndoStack((prev) => [
           {
             participantId: participant.id,
@@ -519,7 +542,6 @@ export function StandScoreContainer({
         setTimeout(() => setStatusMessage(''), 3000);
       } catch (err) {
         console.error('【甲矢更新例外】:', err);
-        // フェイルセーフ: ロールバック
         setParticipants((prev) =>
           prev.map((p) => (p.id === participant.id ? previousState : p)),
         );
@@ -532,7 +554,7 @@ export function StandScoreContainer({
   );
 
   /**
-   * 【Undo（取り消し）実行ハンドラー】
+   * 【Undo実行ハンドラー】
    */
   const handleUndo = useCallback(async () => {
     if (!isDbReady || undoStack.length === 0) return;
@@ -594,7 +616,7 @@ export function StandScoreContainer({
                 記録員専用
               </span>
               <span className="text-xs text-slate-400 font-mono">
-                Real-time Score Input
+                Stage Score Console
               </span>
             </div>
             <CardTitle className="text-lg font-black text-slate-900 flex items-center gap-2">
@@ -602,12 +624,11 @@ export function StandScoreContainer({
               競技記録員用 スコア入力コンソール
             </CardTitle>
             <CardDescription className="text-slate-500 text-xs mt-0.5 font-medium">
-              第1立・第2立は「0, 1, 2」、第3立は「0, 1, 2, 3,
-              4」のボタンで入力できます。第1立は甲矢的中ボタンでも1中を即時入力できます。
+              第1・第2ステージは「0, 1, 2」、第3ステージは「0, 1, 2, 3,
+              4」のボタンで入力できます。
             </CardDescription>
           </div>
 
-          {/* グローバルUndoボタン */}
           {undoStack.length > 0 && (
             <Button
               type="button"
@@ -623,7 +644,7 @@ export function StandScoreContainer({
           )}
         </div>
 
-        {/* 立（ラウンド）切り替えタブ */}
+        {/* ステージ切り替えタブ */}
         <div className="flex flex-wrap items-center gap-2 pt-2">
           <button
             type="button"
@@ -635,7 +656,7 @@ export function StandScoreContainer({
             }`}
           >
             <Sun className="w-3.5 h-3.5 text-amber-400" />
-            第1立 (午前・一手 2射)
+            第1ステージ (午前・一手 2射)
           </button>
 
           <button
@@ -648,7 +669,7 @@ export function StandScoreContainer({
             }`}
           >
             <Moon className="w-3.5 h-3.5 text-slate-300" />
-            第2立 (午後・一手 2射)
+            第2ステージ (午後・一手 2射)
           </button>
 
           <button
@@ -661,34 +682,37 @@ export function StandScoreContainer({
             }`}
           >
             <Moon className="w-3.5 h-3.5 text-slate-300" />
-            第3立 (午後・四矢 4射)
+            第3ステージ (午後・四矢 4射)
           </button>
         </div>
 
-        {/* 組番号選択ツールバー */}
+        {/* 立番号選択ツールバー（5名＝1立、第1立〜第N立を動的自動展開） */}
         <div className="flex items-center gap-2 overflow-x-auto pt-1 pb-0.5">
           <span className="text-xs font-bold text-slate-600 shrink-0 flex items-center gap-1">
-            <Users className="w-3.5 h-3.5 text-slate-400" /> 組選択:
+            <Users className="w-3.5 h-3.5 text-slate-400" /> 立選択 (5名/立):
           </span>
-          {groupOptions.map((groupNum) => (
-            <button
-              key={groupNum}
-              type="button"
-              onClick={() => setSelectedGroup(groupNum)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all font-mono shrink-0 ${
-                selectedGroup === groupNum
-                  ? 'bg-amber-500 text-slate-950 font-black shadow-2xs'
-                  : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200'
-              }`}
-            >
-              第 {groupNum} 組
-            </button>
-          ))}
+          {standOptions.map((standNum) => {
+            const groupNum = Math.ceil(standNum / 2);
+            return (
+              <button
+                key={standNum}
+                type="button"
+                onClick={() => setSelectedStandNumber(standNum)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all font-mono shrink-0 ${
+                  selectedStandNumber === standNum
+                    ? 'bg-amber-500 text-slate-950 font-black shadow-2xs'
+                    : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200'
+                }`}
+                title={`第${standNum}立 (第${groupNum}組)`}
+              >
+                第 {standNum} 立
+              </button>
+            );
+          })}
         </div>
       </CardHeader>
 
       <CardContent className="p-5 space-y-4">
-        {/* ステータスメッセージ */}
         {statusMessage && (
           <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 text-xs font-bold flex items-center gap-2 shadow-2xs animate-in fade-in">
             <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
@@ -696,7 +720,6 @@ export function StandScoreContainer({
           </div>
         )}
 
-        {/* エラーメッセージ */}
         {errorMessage && (
           <div className="p-3.5 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs font-bold flex items-center gap-2 shadow-2xs animate-in fade-in">
             <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
@@ -704,19 +727,23 @@ export function StandScoreContainer({
           </div>
         )}
 
-        {/* 現在の立情報バナー */}
-        <div className="flex items-center justify-between p-3 bg-slate-50 border border-slate-200/80 rounded-xl text-xs font-medium">
-          <div className="flex items-center gap-2">
-            <span className="font-bold text-slate-900 font-sans">
-              【{STAND_CONFIGS[selectedRound].name}】
+        {/* 現在のステージおよび立・組バナー */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 border border-slate-200/80 rounded-xl text-xs font-medium gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="font-bold text-slate-900 font-sans flex items-center gap-1">
+              <Layers className="w-3.5 h-3.5 text-slate-700" />【
+              {getStageName(selectedRound)}】
             </span>
-            <span className="text-slate-600 font-mono">
-              第 {selectedGroup} 組 (該当選手: {currentStandParticipants.length}{' '}
-              名)
+            <span className="text-slate-700 font-mono font-bold">
+              第 {selectedStandNumber} 立
+            </span>
+            <span className="text-slate-500 text-[11px]">
+              (第 {currentGroupNumber} 組所属 / 該当選手:{' '}
+              {currentStandParticipants.length} 名)
             </span>
           </div>
-          <span className="text-[11px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md">
-            ボタン選択肢:{' '}
+          <span className="text-[11px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md self-start sm:self-auto">
+            入力選択肢:{' '}
             {selectedRound === 3 ? '0 〜 4 (四矢)' : '0 〜 2 (一手)'}
           </span>
         </div>
@@ -725,7 +752,7 @@ export function StandScoreContainer({
         <div className="space-y-3">
           {currentStandParticipants.length === 0 ? (
             <div className="py-12 text-center text-slate-400 text-xs font-medium bg-slate-50/50 rounded-xl border border-dashed border-slate-200">
-              第 {selectedGroup} 組に割り当てられた選手はいません。
+              第 {selectedStandNumber} 立に割り当てられた選手はいません。
             </div>
           ) : (
             currentStandParticipants.map((participant) => {
@@ -734,7 +761,6 @@ export function StandScoreContainer({
                 participant.qualificationStatus === 'WITHDRAWN';
               const isSavingThis = savingId === participant.id;
 
-              // 現在の立の矢配列と的中数
               const arrows =
                 selectedRound === 1
                   ? participant.stand1_arrows
@@ -746,8 +772,6 @@ export function StandScoreContainer({
               const maxScore = selectedRound === 3 ? 4 : 2;
               const standOrder =
                 participant.standAssignments[selectedRound]?.standOrder;
-
-              // 甲矢的中ボタンの選択中判定（1中以上かつ甲矢的中フラグがtrue）
               const isHayaHitActive =
                 participant.isHayaHit && (currentHits ?? 0) >= 1;
 
@@ -760,7 +784,6 @@ export function StandScoreContainer({
                       : 'bg-white border-slate-200/90 shadow-2xs hover:border-slate-300'
                   }`}
                 >
-                  {/* 選手基本情報 */}
                   <div className="flex items-start sm:items-center gap-3">
                     <div className="w-12 h-12 rounded-xl bg-slate-100 border border-slate-200 text-slate-900 flex flex-col items-center justify-center shrink-0">
                       <span className="text-[9px] font-mono text-slate-500">
@@ -800,9 +823,8 @@ export function StandScoreContainer({
                     </div>
                   </div>
 
-                  {/* スコア入力・コントロール部 */}
                   <div className="flex flex-wrap items-center gap-3 self-end md:self-auto">
-                    {/* 第1立専用: 甲矢的中ボタン（押下で「1」のボタンと同じ1中・甲矢〇を即時設定 / 再押下で0中にリセット） */}
+                    {/* 第1ステージ専用: 甲矢的中ボタン */}
                     {selectedRound === 1 && !isAbsent && (
                       <Button
                         type="button"
@@ -835,7 +857,6 @@ export function StandScoreContainer({
                       </Button>
                     )}
 
-                    {/* 成績入力ボタングループ（一手: 0,1,2 / 四矢: 0,1,2,3,4） */}
                     <ScoreButton
                       maxScore={maxScore}
                       currentScore={currentHits}
@@ -845,7 +866,6 @@ export function StandScoreContainer({
                       }
                     />
 
-                    {/* 的中プレビューインジケーター */}
                     <div className="min-w-20 px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-center gap-1">
                       {arrows.length === 0 ? (
                         <span className="text-[10px] text-slate-400 font-mono">

@@ -2,27 +2,18 @@
  * 【参加選手選択およびWebプッシュ通知 (FCM) トークン管理コンポーネント】
  *
  * 役割:
- * - 正式エントリー確定した参加選手（入金済または案内送付済、棄権を除く）をゼッケン番号昇順で一覧表示。
+ * - 【選手数無制限対応】エントリーされた全選手（棄権を除く）をゼッケン番号昇順で一覧表示。
  * - 参加選手自身の選択と、Webプッシュ通知（FCM）トークンの自動取得・Firestoreへの紐付け保存。
  * - リロード・再訪問時の登録選手情報の自動復元（localStorage & Firestore onSnapshot）。
  * - 登録完了後の待機ステータス表示および選手再選択（変更）機能。
  *
- * 表示要件:
- * - バッジ / タイトル: 「参加選手選択」
- * - 説明文: 「参加選手名を選択すると、２立前に呼び出しpush通知を受信できます」
- * - ラベル: 「参加選手名」
- * - プレースホルダー: 「参加選手名一覧から選択」
- * - 登録ボタン: 「選手を登録して通知を受信」
- *
  * フールプルーフ設計（事故前・対人間）:
  * - 選手未選択状態での登録ボタン押下をUI（disabled属性）およびロジックで二重遮断。
- * - 棄権（ABSENT / WITHDRAWN）となった選手は選択肢から除外。
+ * - 棄権（ABSENT / WITHDRAWN）となった選手のみを選択肢から除外。
  * - 登録完了後は待機画面へ遷移させ、誤操作による意図しない再選択を防止。
- * - 「選手を変更する」ボタン押下時に確認ダイアログ（confirm）を表示し、誤タップによる通知設定解除を抑止。
  * - 連続タップによる多重書き込みを処理中フラグ（isSubmitting）で完全ロック。
  *
  * フェイルセーフ設計（事故後・対故障）:
- * - useEffect内の同期setStateを排除し、初期値遅延評価（() => isDbReady）によりカスケードレンダリングを回避。
  * - プッシュ通知がブラウザでブロック（denied）された場合やFCMトークン取得失敗時でも、
  *   システム全体をクラッシュさせず、選手紐付けのみを安全に完了（縮退動作）。
  * - Firestore書き込み失敗時はlocalStorageをロールバックし、UIとDBの不整合を防止。
@@ -106,13 +97,11 @@ interface SavedUserData {
 export function TeamSelectForm() {
   const isDbReady = isFirebaseConfigured && isFirestoreAvailable(db);
 
-  // 参加選手一覧ステート（初期値でDB接続状態を判定し、エフェクト内での同期的setStateを排除）
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [isLoadingParticipants, setIsLoadingParticipants] = useState<boolean>(
     () => isDbReady,
   );
 
-  // 選択・認証ステート
   const [selectedParticipantId, setSelectedParticipantId] =
     useState<string>('');
   const [currentUserData, setCurrentUserData] = useState<SavedUserData | null>(
@@ -122,13 +111,9 @@ export function TeamSelectForm() {
   const [isChangingParticipant, setIsChangingParticipant] =
     useState<boolean>(false);
 
-  // 通知・メッセージステート
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string>('');
 
-  /**
-   * 【内部関数】安定したデバイスUIDの取得または発行（匿名認証 / localStorage）
-   */
   const getOrCreateDeviceId = useCallback(async (): Promise<string> => {
     if (auth) {
       try {
@@ -159,7 +144,7 @@ export function TeamSelectForm() {
     return 'unknown_device';
   }, []);
 
-  // 1. Firestore entries コレクションのリアルタイム購読（ゼッケン順昇順）
+  // entries コレクションのリアルタイム購読（全件・無制限取得）
   useEffect(() => {
     if (!isDbReady) {
       return;
@@ -261,20 +246,16 @@ export function TeamSelectForm() {
     return () => unsubscribe();
   }, [isDbReady]);
 
-  // 正式エントリー確定選手のみを抽出（入金承認済 または QR案内送信済、かつ棄権除外）
+  // 【無制限対応】棄権選手のみを除外し、登録されたすべての選手を対象とする
   const eligibleParticipants = useMemo(() => {
     return participants.filter((p) => {
-      if (
-        p.checkInStatus === 'ABSENT' ||
-        p.qualificationStatus === 'WITHDRAWN'
-      ) {
-        return false;
-      }
-      return p.isPaid === true || p.qrSentStatus === 'SENT';
+      return (
+        p.checkInStatus !== 'ABSENT' && p.qualificationStatus !== 'WITHDRAWN'
+      );
     });
   }, [participants]);
 
-  // 2. 既存の紐付け情報の復元（リロード・再アクセス耐性）
+  // 既存の紐付け情報の復元
   useEffect(() => {
     if (!isDbReady) return;
 
@@ -356,7 +337,6 @@ export function TeamSelectForm() {
     try {
       const userId = await getOrCreateDeviceId();
 
-      // 1. FCMトークン要求・取得（フェイルセーフ: 失敗時も選手登録は完遂）
       let fcmToken: string | null = null;
       let notificationWarning: string | null = null;
 
@@ -375,7 +355,6 @@ export function TeamSelectForm() {
         notificationWarning = '通知トークンの取得をスキップしました。';
       }
 
-      // 2. Firestore users/{userId} へ保存
       const userDocRef = doc(db, 'users', userId);
       const updatePayload: Record<string, unknown> = {
         userId,
@@ -389,7 +368,6 @@ export function TeamSelectForm() {
 
       await setDoc(userDocRef, updatePayload, { merge: true });
 
-      // 3. ローカルステート更新と永続化
       const saved: SavedUserData = {
         userId,
         participantId: selected.id,
@@ -426,9 +404,6 @@ export function TeamSelectForm() {
     }
   };
 
-  /**
-   * 【選手再選択開始ハンドラー】
-   */
   const handleStartChange = () => {
     const confirmed = window.confirm(
       '登録中の選手を変更しますか？\n変更するまで現在の選手宛ての呼出通知設定が維持されます。',
@@ -440,9 +415,6 @@ export function TeamSelectForm() {
     setErrorMessage('');
   };
 
-  /**
-   * 【選手再選択キャンセルハンドラー】
-   */
   const handleCancelChange = () => {
     if (currentUserData?.participantId) {
       setSelectedParticipantId(currentUserData.participantId);
@@ -451,7 +423,6 @@ export function TeamSelectForm() {
     setErrorMessage('');
   };
 
-  // 選択中または登録済みの選手情報
   const activeParticipant = participants.find(
     (p) => p.id === (currentUserData?.participantId || selectedParticipantId),
   );
@@ -477,7 +448,6 @@ export function TeamSelectForm() {
       </CardHeader>
 
       <CardContent className="p-5 space-y-4">
-        {/* ステータスメッセージ */}
         {statusMessage && (
           <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 text-xs font-bold flex items-start gap-2 shadow-2xs animate-in fade-in">
             <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
@@ -485,7 +455,6 @@ export function TeamSelectForm() {
           </div>
         )}
 
-        {/* エラーメッセージ */}
         {errorMessage && (
           <div className="p-3.5 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs font-bold flex items-start gap-2 shadow-2xs animate-in fade-in">
             <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
@@ -493,7 +462,6 @@ export function TeamSelectForm() {
           </div>
         )}
 
-        {/* 状態A: 登録済み かつ 変更モードではない場合（待機カード表示） */}
         {currentUserData && !isChangingParticipant ? (
           <div className="space-y-4">
             <div className="p-4 bg-slate-50 border border-slate-200/80 rounded-2xl space-y-3">
@@ -519,12 +487,12 @@ export function TeamSelectForm() {
                 </p>
               </div>
 
-              {/* 立順情報の事前表示 */}
               {activeParticipant && (
                 <div className="pt-2 border-t border-slate-200/60 grid grid-cols-2 gap-2 text-[11px]">
                   <div className="bg-white p-2 rounded-xl border border-slate-200/60">
                     <span className="text-slate-500 font-medium flex items-center gap-1 text-[10px]">
-                      <Sun className="w-3 h-3 text-amber-500" /> 午前 (第1立)
+                      <Sun className="w-3.5 h-3.5 text-amber-500" /> 午前
+                      (第1立)
                     </span>
                     <span className="font-bold text-slate-800 block mt-0.5">
                       第{' '}
@@ -539,7 +507,7 @@ export function TeamSelectForm() {
 
                   <div className="bg-white p-2 rounded-xl border border-slate-200/60">
                     <span className="text-slate-500 font-medium flex items-center gap-1 text-[10px]">
-                      <Moon className="w-3 h-3 text-slate-600" /> 午後
+                      <Moon className="w-3.5 h-3.5 text-slate-600" /> 午後
                       (第2・3立)
                     </span>
                     <span className="font-bold text-slate-800 block mt-0.5">
@@ -590,7 +558,6 @@ export function TeamSelectForm() {
             </Button>
           </div>
         ) : (
-          /* 状態B: 未登録 または 変更モード中の場合（選手選択セレクトボックス） */
           <div className="space-y-4">
             <div className="space-y-2">
               <label className="text-xs font-bold text-slate-800 flex items-center justify-between">

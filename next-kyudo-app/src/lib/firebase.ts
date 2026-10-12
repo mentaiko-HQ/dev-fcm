@@ -2,24 +2,25 @@
  * 【Firebase SDK 初期化およびクライアント接続モジュール】
  *
  * 役割:
- * - Next.js クライアント環境において Firebase App、Firestore、Auth、Storage、Messaging を初期化。
- * - 多重初期化の防止（getApps 照合）。
- * - FCM Messaging インスタンス取得関数（getMessagingInstance）のエクスポート。
+ * - Next.js (App Router) 環境において Firebase App、Firestore、Auth、Storage、Messaging を初期化。
+ * - 多重初期化の防止（getApps によるシングルトン制御）。
+ * - 匿名認証セッションの保証（ensureAnonymousAuth）。
+ * - FCM Messaging インスタンス取得関数（getMessagingInstance / getClientMessaging）の互換エクスポート。
  *
  * フールプルーフ設計（未然のクラッシュ遮断）:
- * - サーバーサイドレンダリング（SSR / SSG）実行時に window オブジェクトが存在しないため、
+ * - サーバーサイドレンダリング（SSR / SSG）実行時に window や ServiceWorker が存在しないため、
  *   ブラウザ環境でのみ Messaging 初期化を実行。
- * - 環境変数欠落時の安全な検知フラグ（isFirebaseConfigured）。
+ * - 環境変数欠落時の早期検知フラグ（isFirebaseConfigured）。
  *
  * フェイルセーフ設計（障害時の安全縮退）:
- * - Firebase Messaging の isSupported() によるブラウザ機能判定を実施し、
- *   非対応ブラウザ（プライベートブラウズ、古い環境等）で例外を投げずに null を返却して安全縮退。
- * - インスタンス生成エラー発生時はスタックトレースをログ出力し、null を返却。
+ * - SSR時でも Firestore / Auth / Storage のインスタンスは正常生成し、Null参照例外によるサーバークラッシュを完全防止。
+ * - Messaging isSupported() による機能判定を実施し、非対応ブラウザ（プライベートブラウズ、非PWA等）では
+ *   例外を投げずに null を返却して安全に縮退動作。
  */
 
 import { initializeApp, getApps, getApp, FirebaseApp } from 'firebase/app';
 import { getFirestore, Firestore } from 'firebase/firestore';
-import { getAuth, Auth } from 'firebase/auth';
+import { getAuth, Auth, signInAnonymously } from 'firebase/auth';
 import { getStorage, FirebaseStorage } from 'firebase/storage';
 import { getMessaging, isSupported, Messaging } from 'firebase/messaging';
 
@@ -32,29 +33,23 @@ const firebaseConfig = {
   appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
+// 必須環境変数の設定確認フラグ
 export const isFirebaseConfigured = Boolean(
   process.env.NEXT_PUBLIC_FIREBASE_API_KEY &&
   process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID &&
   process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
 );
 
-let app: FirebaseApp | undefined;
-let db: Firestore;
-let auth: Auth;
-let storage: FirebaseStorage;
+// シングルトン初期化（SSR・ブラウザ環境双方で安全にインスタンスを確立）
+const app: FirebaseApp =
+  getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+const db: Firestore = getFirestore(app);
+const auth: Auth = getAuth(app);
+const storage: FirebaseStorage = getStorage(app);
 
-if (typeof window !== 'undefined' || getApps().length > 0) {
-  app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
-  db = getFirestore(app);
-  auth = getAuth(app);
-  storage = getStorage(app);
-} else {
-  app = undefined;
-  db = null as unknown as Firestore;
-  auth = null as unknown as Auth;
-  storage = null as unknown as FirebaseStorage;
-}
-
+/**
+ * Firestore接続可否判定関数
+ */
 export function isFirestoreAvailable(
   instance: Firestore | null | undefined,
 ): boolean {
@@ -63,22 +58,9 @@ export function isFirestoreAvailable(
 
 /**
  * 【FCM Messaging インスタンス安全取得関数】
- *
- * 判断基準:
- * 1. SSR環境（window未定義）の場合は即座に null を返却。
- * 2. Firebase App 未初期化時は null を返却。
- * 3. ブラウザが FCM / ServiceWorker に対応しているか (isSupported) を非同期検証。
- * 4. 非対応または初期化失敗時は例外を外へ漏らさず null を返却。
  */
 export async function getMessagingInstance(): Promise<Messaging | null> {
   if (typeof window === 'undefined') {
-    return null;
-  }
-
-  if (!app) {
-    console.warn(
-      '【FCM】Firebase App が初期化されていないため、Messagingを取得できません。',
-    );
     return null;
   }
 
@@ -94,6 +76,34 @@ export async function getMessagingInstance(): Promise<Messaging | null> {
   } catch (error: unknown) {
     console.error(
       '【FCM初期化エラー】Messaging インスタンスの生成に失敗しました:',
+      error,
+    );
+    return null;
+  }
+}
+
+/**
+ * 既存コード互換用エイリアス
+ */
+export const getClientMessaging = getMessagingInstance;
+
+/**
+ * 【匿名認証セッション保証関数】
+ *
+ * 役割:
+ * - 未ログイン状態による Firestore の権限エラー（Missing or insufficient permissions）を防止。
+ * - 既にログイン済みの場合は既存の UID を返却し、未ログイン時のみ signInAnonymously を実行。
+ */
+export async function ensureAnonymousAuth(): Promise<string | null> {
+  try {
+    if (auth.currentUser) {
+      return auth.currentUser.uid;
+    }
+    const userCredential = await signInAnonymously(auth);
+    return userCredential.user.uid;
+  } catch (error: unknown) {
+    console.error(
+      '【Firebase Authエラー】匿名認証の確立に失敗しました:',
       error,
     );
     return null;

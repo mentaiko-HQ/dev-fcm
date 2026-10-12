@@ -1,20 +1,18 @@
 /**
  * 【弓道大会運営システム ドメイン型・定数・サニタイズ関数定義】
  *
- * 役割:
- * - 個人戦・団体戦、一手（2射）・四矢（4射）、計8射的中制の競技ルールを型安全に定義。
- * - 射詰（サドンデス競射）、遠近競射（的中位置判定）の状態管理。
- * - ParticipantDataTable、StandScoreContainer、立ち順編成、FCM通知、当日受付で要求される
- *   全データモデル、競技ルール定数、およびサニタイズ関数を一元管理。
+ * 競技構造仕様:
+ * - 1立 = 選手5名（射位: 1大前, 2二的, 3中, 4落前, 5落）
+ * - 1組 = 2立 = 選手10名（第1立・第2立 → 第1組、第3立・第4立 → 第2組...）
+ * - 人数制限: 完全無制限（登録選手数に応じて立数・組数を動的算出）
  *
- * フールプルーフ設計（事故前・対人間）:
- * - 的中結果（HitResult）、射位インデックス（1〜5）、立インデックス（1〜3）をUnion型で制約。
- * - 不正な文字列・null・undefinedが渡された場合でも安全な規定値へ強制変換するサニタイズ関数群
- *   （sanitizeCheckInStatus, sanitizeProgressStatus, sanitizeQualificationStatus 等）を完備。
+ * フールプルーフ設計:
+ * - 射位インデックス（1〜5）、立インデックス（1〜3）をUnion型で制約。
+ * - 立番号・組番号・ステータス等に対するサニタイズ関数により不正値を安全値へ強制補正。
  *
- * フェイルセーフ設計（事故後・対故障）:
- * - 各立の設定（STAND_CONFIGS）および大会総射数（TOTAL_TOURNAMENT_SHOTS）を不変定数としてエクスポート。
- * - standGroup, standOrder が null（未設定）の場合でもUIコンポーネントがクラッシュしない null 許容構造。
+ * フェイルセーフ設計:
+ * - STAND_CONFIGS, TOTAL_TOURNAMENT_SHOTS 等の競技ルールを不変定数としてエクスポート。
+ * - standGroup, standOrder が null の場合でも画面クラッシュを回避する null 許容構造。
  */
 
 // 的中結果区分（O: 的中 〇, X: はずれ ✕）
@@ -69,10 +67,10 @@ export type QrDeliveryStatus = 'UNSENT' | 'SENT' | 'FAILED';
 // 矢の的中判定（true: 的中 〇, false: はずれ ✕）
 export type ArrowHit = boolean;
 
-// 立順割当情報
+// 立順割当情報（standGroup は立番号を保持）
 export interface StandAssignment {
-  standGroup: number | null; // 組番号
-  standOrder: StandOrderIndex | null; // 射位
+  standGroup: number | null; // 立番号（第1立, 第2立...）
+  standOrder: StandOrderIndex | null; // 射位（1〜5番）
 }
 
 // 立別競技設定定義
@@ -90,6 +88,15 @@ export interface StandConfig {
 
 // 大会総射数（午前の部: 一手2射 + 午後の部: 一手2射 + 四矢4射 = 計8射）
 export const TOTAL_TOURNAMENT_SHOTS = 8;
+
+// 1立あたりの最大射位数（大前〜落: 5名）
+export const PLAYERS_PER_STAND = 5;
+
+// 1組あたりの立数（2立 = 1組）
+export const STANDS_PER_GROUP = 2;
+
+// 1組あたりの最大定員（10名）
+export const PLAYERS_PER_GROUP = PLAYERS_PER_STAND * STANDS_PER_GROUP;
 
 // 各立の構成設定マップ
 export const STAND_CONFIGS: Record<StandRoundIndex, StandConfig> = {
@@ -136,7 +143,7 @@ export interface Participant {
   checkInMethod?: 'QR_SCAN' | 'MANUAL' | null; // 受付手段
   isStaffVolunteer: boolean; // 役員協力可否
   needsSupport: boolean; // 所作サポート希望
-  standAssignments: Record<StandRoundIndex, StandAssignment>; // 各ラウンドの立ち順
+  standAssignments: Record<StandRoundIndex, StandAssignment>; // 各ラウンドの立ち順割当
   progressStatus: ProgressStatus; // 進行状況
   qualificationStatus: QualificationStatus; // 参加資格
   stand1_arrows: ArrowHit[]; // 第1立（一手2射）的中記録
@@ -182,7 +189,7 @@ export interface AppUser {
   playerName?: string; // 選手氏名
   teamId?: string; // 所属チームID
   teamName?: string; // 所属チーム名
-  standGroup?: number; // 所属組
+  standGroup?: number; // 所属立番号
   fcmToken: string | null; // FCMプッシュ通知デバイストークン
   updatedAt: number; // 更新日時
 }
@@ -193,36 +200,88 @@ export interface TournamentConfig {
   title: string; // 大会名称
   date: string; // 開催日 (YYYY-MM-DD)
   venue: string; // 競技会場
-  totalStandGroups: number; // 総立数・組数
-  currentStandGroup?: number; // 現在進行中の組
-  currentRound?: StandRoundIndex; // 現在進行中の立 (1:午前一手, 2:午後一手, 3:午後四矢)
+  totalStandGroups: number; // 総立数
+  currentStandGroup?: number; // 現在進行中の立
+  currentRound?: StandRoundIndex; // 現在進行中のラウンド (1:午前一手, 2:午後一手, 3:午後四矢)
   isEntryOpen?: boolean; // エントリー受付中フラグ
 }
 
 // 競射（タイブレーク）データモデル
 export interface TieBreakerState {
   type: 'IZUME' | 'ENKIN'; // 射詰（優勝決定）または 遠近（順位決定）
-  targetRank: number; // 対象順位（例: 1位決定, 2位決定）
+  targetRank: number; // 対象順位
   candidateParticipantIds: string[]; // 対象選手IDリスト
   roundHistory: Record<string, boolean[]>; // 射詰時の選手別的中推移
-  enkinDistanceOrder?: string[]; // 遠近競射時の的中位置順リスト（中心に近い順）
+  enkinDistanceOrder?: string[]; // 遠近競射時の的中位置順リスト
   isResolved: boolean; // 決着フラグ
+}
+
+// 招集・呼出FCMプッシュ通知送信履歴ログデータモデル
+export interface CallNotificationLog {
+  id: string; // ログID
+  matchId: string; // 大会ID
+  round: StandRoundIndex; // 対象ラウンド
+  standGroup: number; // 対象立番号
+  title: string; // 通知件名
+  body: string; // 通知本文
+  targetPlayerCount: number; // 立内総選手数
+  tokensFoundCount: number; // FCMトークン保有者数
+  sentSuccessCount: number; // 送信成功数
+  sentFailureCount: number; // 送信失敗数
+  status: 'SUCCESS' | 'PARTIAL' | 'FAILED'; // 送信結果ステータス
+  triggerType: 'AUTO_PROGRESS' | 'MANUAL_EXECUTE'; // トリガー種別
+  errorDetail?: string | null; // エラー詳細
+  createdAt: number; // 作成日時 (UNIXミリ秒)
+}
+
+// ==========================================
+// 立・組 構造計算ヘルパー関数群
+// ==========================================
+
+/**
+ * 立番号から組番号を算出（第1・2立 → 第1組、第3・4立 → 第2組...）
+ */
+export function calculateGroupFromStand(standNumber: number): number {
+  if (standNumber <= 0) return 1;
+  return Math.ceil(standNumber / STANDS_PER_GROUP);
+}
+
+/**
+ * 組番号から含まれる立番号範囲を算出（第1組 → [1, 2]、第2組 → [3, 4]...）
+ */
+export function calculateStandsFromGroup(
+  groupNumber: number,
+): [number, number] {
+  const safeGroup = Math.max(1, groupNumber);
+  const endStand = safeGroup * STANDS_PER_GROUP;
+  const startStand = endStand - 1;
+  return [startStand, endStand];
+}
+
+/**
+ * 選手総数から必要な総立数を動的算出（5名単位で切り上げ）
+ */
+export function calculateTotalStands(playerCount: number): number {
+  if (playerCount <= 0) return 1;
+  return Math.ceil(playerCount / PLAYERS_PER_STAND);
+}
+
+/**
+ * 選手総数から必要な総組数を動的算出（10名単位で切り上げ）
+ */
+export function calculateTotalGroups(playerCount: number): number {
+  if (playerCount <= 0) return 1;
+  return Math.ceil(playerCount / PLAYERS_PER_GROUP);
 }
 
 // ==========================================
 // 型ガード・サニタイズ関数群（フールプルーフ）
 // ==========================================
 
-/**
- * 的中結果型ガード（'O' または 'X' であるかを判定）
- */
 export function isHitResult(val: unknown): val is HitResult {
   return val === 'O' || val === 'X';
 }
 
-/**
- * 組番号サニタイズ（正の整数のみ許容）
- */
 export function sanitizeStandGroup(val: unknown): number | null {
   if (typeof val === 'number' && !isNaN(val) && val > 0) {
     return Math.floor(val);
@@ -236,9 +295,6 @@ export function sanitizeStandGroup(val: unknown): number | null {
   return null;
 }
 
-/**
- * 射位番号サニタイズ（1〜5のみ許容）
- */
 export function sanitizeStandOrder(val: unknown): StandOrderIndex | null {
   const num =
     typeof val === 'number'
@@ -252,17 +308,11 @@ export function sanitizeStandOrder(val: unknown): StandOrderIndex | null {
   return null;
 }
 
-/**
- * 所作区分サニタイズ
- */
 export function sanitizeShosaType(val: unknown): ShosaType {
   if (val === '襷掛け') return '襷掛け';
   return '肌脱ぎ';
 }
 
-/**
- * 称号・段位区分サニタイズ
- */
 export function sanitizeRankTitleType(val: unknown): RankTitleType {
   if (val === '称号を取得している' || val === '段位は四段以上') {
     return val;
@@ -270,9 +320,6 @@ export function sanitizeRankTitleType(val: unknown): RankTitleType {
   return '段位は三段以下';
 }
 
-/**
- * 当日役員役割サニタイズ
- */
 export function sanitizeStaffRole(val: unknown): StaffRoleType {
   const validRoles: StaffRoleType[] = [
     '進行',
@@ -289,9 +336,6 @@ export function sanitizeStaffRole(val: unknown): StaffRoleType {
   return '無し';
 }
 
-/**
- * 受付ステータスサニタイズ
- */
 export function sanitizeCheckInStatus(val: unknown): CheckInStatus {
   if (val === 'CHECKED_IN' || val === 'ABSENT' || val === 'UNCHECKED') {
     return val as CheckInStatus;
@@ -299,9 +343,6 @@ export function sanitizeCheckInStatus(val: unknown): CheckInStatus {
   return 'UNCHECKED';
 }
 
-/**
- * 進行状況ステータスサニタイズ
- */
 export function sanitizeProgressStatus(val: unknown): ProgressStatus {
   const validStatuses: ProgressStatus[] = [
     'WAITING',
@@ -320,9 +361,6 @@ export function sanitizeProgressStatus(val: unknown): ProgressStatus {
   return 'WAITING';
 }
 
-/**
- * 参加資格ステータスサニタイズ
- */
 export function sanitizeQualificationStatus(val: unknown): QualificationStatus {
   if (val === 'ACTIVE' || val === 'WITHDRAWN' || val === 'DISQUALIFIED') {
     return val as QualificationStatus;
