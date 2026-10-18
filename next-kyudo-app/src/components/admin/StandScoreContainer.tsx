@@ -1,31 +1,20 @@
 /**
- * 【競技記録員用 スコア入力コンソール】
+ * 【競技記録員用 スコア入力コンソール（組単位10名表示・各矢〇✕個別入力・自動判定版）】
  *
  * 役割:
- * - 大会回次（ラウンド）表記を「ステージ」へ完全統一:
- *   - 第1ステージ（午前・一手2射）: [0, 1, 2] 的中ボタン入力
- *   - 第2ステージ（午後・一手2射）: [0, 1, 2] 的中ボタン入力
- *   - 第3ステージ（午後・四矢4射）: [0, 1, 2, 3, 4] 的中ボタン入力
- * - 立（Stand）と組（Group）の構造定義:
- *   - 選手5名を合わせて「立」（第1立、第2立、第3立、第4立...）
- *   - 2つの立を合わせて「組」（第1立・第2立 → 第1組、第3立・第4立 → 第2組...）
- * - 【選手数無制限対応】エントリー全選手および割当立番号から立選択ボタン（第1立〜第N立）を動的自動生成。
- * - 第1ステージにおける「甲矢的中」ボタン押下時、即座に「1のボタンを押した（1中・甲矢〇・乙矢✕）」と同じ挙動を実行。
- * - 既に「1中・甲矢〇」の状態で再度甲矢的中ボタンを押した場合はトグル解除として「0中」にリセット。
- * - 直前の入力ミスを安全に復元する Undo（取り消し）機能。
- * - ステージおよび立の切り替えと、該当選手の射位順（1大前〜5落）表示。
+ * - 1組＝2立（計10名）を一画面に表示し、ステージ別の個別矢入力（〇/✕）を行うコンソール。
+ * - 【受付済み選手限定表示】当日受付（/admin/reception）にて「受付済」となった選手のみを対象として表示。
+ * - 【自動判定の連動】
+ *   - 甲矢的中賞: 第1ステージ1本目（インデックス0）が〇の場合のみ `isHayaHit = true` に更新。
+ *   - 一手束中賞: 第1ステージまたは第2ステージにおいて、合計2中した場合に `isSokuchu = true` に更新。
+ *   - 四矢皆中賞: 第3ステージにおいて、合計4中した場合に `isPerfect = true` に更新。
  *
  * フールプルーフ設計（事故前・対人間）:
- * 1. useEffect内での同期的なsetStateを排除しカスケードレンダリングを防止。
- * 2. 甲矢的中ボタンを押す際、事前的中数の選択を不要化し、ワンタップで「1中（甲矢〇）」を確定。
- * 3. 第1ステージで「2中」選択時は甲矢的中を自動ON、「0中」選択時は自動OFFに同期。
- * 4. 棄権（ABSENT / WITHDRAWN）の選手はスコア入力を全面無効化し、誤入力を防止。
- * 5. 通信中の多重タップを処理中フラグ（savingId）で排他ロック。
+ * 1. 未受付や棄権の選手をスコア入力対象から完全除外することで、当日不在の選手の誤入力を防止。
+ * 2. 甲矢的中賞のフラグ判定を `selectedRound === 1` に限定。
  *
  * フェイルセーフ設計（事故後・対故障）:
- * 1. 楽観的UI更新（Optimistic Update）を行い、Firestore書き込み失敗時は直前の状態へ自動ロールバック。
- * 2. 入力履歴スタックを保持し、操作直後にワンタップで元に戻せるUndoバナーを表示。
- * 3. ネットワーク切断やFirestore例外発生時はエラーログをコンソール出力し、画面上に明示。
+ * 1. 楽観的UI更新を行い、Firestore書き込み失敗時は直前の状態へ自動ロールバック。
  */
 
 'use client';
@@ -40,7 +29,12 @@ import {
   serverTimestamp,
   orderBy,
 } from 'firebase/firestore';
-import { db, isFirebaseConfigured, isFirestoreAvailable } from '@/lib/firebase';
+import {
+  db,
+  isFirebaseConfigured,
+  isFirestoreAvailable,
+  ensureAnonymousAuth,
+} from '@/lib/firebase';
 import {
   TournamentConfig,
   StandRoundIndex,
@@ -68,29 +62,38 @@ import {
   CheckCircle2,
   AlertCircle,
   Loader2,
-  Check,
-  X,
+  Sparkles,
   Layers,
+  Award,
 } from 'lucide-react';
 
 interface StandScoreContainerProps {
   tournamentConfig: TournamentConfig;
 }
 
-// Undo履歴管理用インターフェース
 interface UndoHistoryEntry {
   participantId: string;
   bibNumber: number;
   playerName: string;
   round: StandRoundIndex;
-  previousArrows: ArrowHit[];
+  previousArrows: (ArrowHit | null)[];
   previousHayaHit: boolean;
+  previousSokuchu: boolean;
+  previousPerfect: boolean;
   previousTotalHits: number;
 }
 
-/**
- * ステージ名称取得ヘルパー関数
- */
+const PLAYERS_PER_STAND = 5;
+const STANDS_PER_GROUP = 2;
+const PLAYERS_PER_GROUP = PLAYERS_PER_STAND * STANDS_PER_GROUP;
+
+function getStandNumbersByGroup(groupNumber: number): [number, number] {
+  const safeGroup = Math.max(1, Math.floor(groupNumber));
+  const firstStand = (safeGroup - 1) * STANDS_PER_GROUP + 1;
+  const secondStand = safeGroup * STANDS_PER_GROUP;
+  return [firstStand, secondStand];
+}
+
 function getStageName(round: StandRoundIndex): string {
   switch (round) {
     case 1:
@@ -104,9 +107,6 @@ function getStageName(round: StandRoundIndex): string {
   }
 }
 
-/**
- * 射位ラベル取得ヘルパー関数
- */
 function getStandOrderLabel(order: StandOrderIndex | null | undefined): string {
   if (!order) return '未定';
   const labels: Record<number, string> = {
@@ -119,28 +119,9 @@ function getStandOrderLabel(order: StandOrderIndex | null | undefined): string {
   return labels[order] || `${order}番`;
 }
 
-/**
- * 的中数から矢の真偽値配列を生成するヘルパー関数
- */
-function createArrowArray(
-  round: StandRoundIndex,
-  hits: number,
-  isHayaHit: boolean,
-): ArrowHit[] {
-  if (round === 1) {
-    if (hits === 2) return [true, true];
-    if (hits === 1) return isHayaHit ? [true, false] : [false, true];
-    return [false, false];
-  }
-
-  if (round === 2) {
-    if (hits === 2) return [true, true];
-    if (hits === 1) return [true, false];
-    return [false, false];
-  }
-
-  // round === 3 (四矢4射)
-  return Array.from({ length: 4 }, (_, i) => i < hits);
+function countHits(arrows: (ArrowHit | null | undefined)[]): number {
+  if (!Array.isArray(arrows)) return 0;
+  return arrows.filter((hit) => hit === true).length;
 }
 
 export function StandScoreContainer({
@@ -148,27 +129,24 @@ export function StandScoreContainer({
 }: StandScoreContainerProps) {
   const isDbReady = isFirebaseConfigured && isFirestoreAvailable(db);
 
-  // 選択ステート（回次は「ステージ」、行射枠は「立」）
   const [selectedRound, setSelectedRound] = useState<StandRoundIndex>(1);
-  const [selectedStandNumber, setSelectedStandNumber] = useState<number>(1);
-
-  // 参加者リスト
+  const [selectedGroupNumber, setSelectedGroupNumber] = useState<number>(1);
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(() => isDbReady);
   const [savingId, setSavingId] = useState<string | null>(null);
-
-  // フィードバック用ステート
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string>('');
-
-  // Undo履歴スタック
   const [undoStack, setUndoStack] = useState<UndoHistoryEntry[]>([]);
 
-  // 1. Firestore entries コレクションのリアルタイム同期
   useEffect(() => {
-    if (!isDbReady) {
-      return;
-    }
+    if (!isDbReady) return;
+    ensureAnonymousAuth().catch((err) => {
+      console.warn('【StandScoreContainer】初期認証確認警告:', err);
+    });
+  }, [isDbReady]);
+
+  useEffect(() => {
+    if (!isDbReady) return;
 
     const q = query(collection(db, 'entries'), orderBy('bibNumber', 'asc'));
     const unsubscribe = onSnapshot(
@@ -240,6 +218,7 @@ export function StandScoreContainer({
               ? raw.stand3_arrows
               : [],
             isHayaHit: Boolean(raw.isHayaHit),
+            isSokuchu: Boolean(raw.isSokuchu),
             totalHits:
               typeof raw.totalHits === 'number'
                 ? raw.totalHits
@@ -289,51 +268,83 @@ export function StandScoreContainer({
     return () => unsubscribe();
   }, [isDbReady]);
 
-  // 2. 選択されたステージ・立番号に合致する選手の抽出とソート（射位昇順: 1大前 〜 5落）
-  const currentStandParticipants = useMemo(() => {
-    return participants
+  // ★ 受付済み（CHECKED_IN）の選手のみにフィルタリング
+  const checkedInParticipants = useMemo(() => {
+    return participants.filter((p) => p.checkInStatus === 'CHECKED_IN');
+  }, [participants]);
+
+  // グループオプションの動的生成（受付済み選手ベース）
+  const groupOptions = useMemo(() => {
+    let maxAssignedStand = 1;
+    checkedInParticipants.forEach((p) => {
+      ([1, 2, 3] as StandRoundIndex[]).forEach((r) => {
+        const s = p.standAssignments[r]?.standGroup;
+        if (s && s > maxAssignedStand) {
+          maxAssignedStand = s;
+        }
+      });
+    });
+
+    const groupsFromMaxStand = Math.ceil(maxAssignedStand / STANDS_PER_GROUP);
+    const groupsFromPlayerCount = Math.ceil(
+      checkedInParticipants.length / PLAYERS_PER_GROUP,
+    );
+    const groupsFromConfig = Math.ceil(
+      (tournamentConfig.totalStandGroups || 1) / STANDS_PER_GROUP,
+    );
+
+    const totalGroups = Math.max(
+      1,
+      groupsFromMaxStand,
+      groupsFromPlayerCount,
+      groupsFromConfig,
+    );
+
+    return Array.from({ length: totalGroups }, (_, i) => i + 1);
+  }, [checkedInParticipants, tournamentConfig.totalStandGroups]);
+
+  const [firstStandNumber, secondStandNumber] = useMemo(() => {
+    return getStandNumbersByGroup(selectedGroupNumber);
+  }, [selectedGroupNumber]);
+
+  const firstStandParticipants = useMemo(() => {
+    return checkedInParticipants
       .filter((p) => {
         const assign = p.standAssignments[selectedRound];
-        return assign && assign.standGroup === selectedStandNumber;
+        return assign && assign.standGroup === firstStandNumber;
       })
       .sort((a, b) => {
         const orderA = a.standAssignments[selectedRound]?.standOrder ?? 99;
         const orderB = b.standAssignments[selectedRound]?.standOrder ?? 99;
         return orderA - orderB;
       });
-  }, [participants, selectedRound, selectedStandNumber]);
+  }, [checkedInParticipants, selectedRound, firstStandNumber]);
 
-  // 【選手数無制限対応】全選手の立番号から立選択ボタングループ（第1立〜第N立）を動的自動生成
-  const standOptions = useMemo(() => {
-    let maxAssignedStand = 1;
-    participants.forEach((p) => {
-      [1, 2, 3].forEach((r) => {
-        const s = p.standAssignments[r as StandRoundIndex]?.standGroup;
-        if (s && s > maxAssignedStand) maxAssignedStand = s;
+  const secondStandParticipants = useMemo(() => {
+    return checkedInParticipants
+      .filter((p) => {
+        const assign = p.standAssignments[selectedRound];
+        return assign && assign.standGroup === secondStandNumber;
+      })
+      .sort((a, b) => {
+        const orderA = a.standAssignments[selectedRound]?.standOrder ?? 99;
+        const orderB = b.standAssignments[selectedRound]?.standOrder ?? 99;
+        return orderA - orderB;
       });
-    });
+  }, [checkedInParticipants, selectedRound, secondStandNumber]);
 
-    const calculatedByCount = Math.ceil(participants.length / 5);
-    const total = Math.max(
-      1,
-      tournamentConfig.totalStandGroups || 1,
-      maxAssignedStand,
-      calculatedByCount,
-    );
-
-    return Array.from({ length: total }, (_, i) => i + 1);
-  }, [participants, tournamentConfig.totalStandGroups]);
-
-  // 現在選択中の立が属する「組」番号を算出（第1・2立 → 第1組、第3・4立 → 第2組...）
-  const currentGroupNumber = useMemo(() => {
-    return Math.ceil(selectedStandNumber / 2);
-  }, [selectedStandNumber]);
+  const currentGroupTotalPlayers =
+    firstStandParticipants.length + secondStandParticipants.length;
 
   /**
-   * 【スコア入力実行処理】
+   * 【各矢の〇・✕個別入力ハンドラー】
    */
-  const handleScoreChange = useCallback(
-    async (participant: Participant, newHitCount: number) => {
+  const handleSelectArrow = useCallback(
+    async (
+      participant: Participant,
+      arrowIndex: number,
+      result: boolean | null,
+    ) => {
       if (!isDbReady) return;
 
       if (
@@ -357,68 +368,77 @@ export function StandScoreContainer({
             ? [...participant.stand2_arrows]
             : [...participant.stand3_arrows];
       const previousHayaHit = participant.isHayaHit;
+      const previousSokuchu = participant.isSokuchu;
+      const previousPerfect = participant.isPerfect;
       const previousTotalHits = participant.totalHits;
 
-      let nextHayaHit = participant.isHayaHit;
-      if (selectedRound === 1) {
-        if (newHitCount === 2) {
-          nextHayaHit = true;
-        } else if (newHitCount === 0) {
-          nextHayaHit = false;
+      const maxArrows = selectedRound === 3 ? 4 : 2;
+      const updatedArrows = Array.from({ length: maxArrows }, (_, idx) => {
+        if (idx === arrowIndex) {
+          return result;
         }
-      }
+        return previousArrows[idx] !== undefined ? previousArrows[idx] : null;
+      }) as ArrowHit[];
 
-      const newArrows = createArrowArray(
-        selectedRound,
-        newHitCount,
-        nextHayaHit,
-      );
+      const nextHayaHit =
+        selectedRound === 1 ? updatedArrows[0] === true : participant.isHayaHit;
 
       const s1Hits =
         selectedRound === 1
-          ? newHitCount
-          : participant.stand1_arrows.filter(Boolean).length;
+          ? countHits(updatedArrows)
+          : countHits(participant.stand1_arrows);
       const s2Hits =
         selectedRound === 2
-          ? newHitCount
-          : participant.stand2_arrows.filter(Boolean).length;
+          ? countHits(updatedArrows)
+          : countHits(participant.stand2_arrows);
       const s3Hits =
         selectedRound === 3
-          ? newHitCount
-          : participant.stand3_arrows.filter(Boolean).length;
-      const nextTotalHits = s1Hits + s2Hits + s3Hits;
-      const isPerfect = nextTotalHits === 8;
+          ? countHits(updatedArrows)
+          : countHits(participant.stand3_arrows);
 
+      const nextSokuchu = s1Hits === 2 || s2Hits === 2;
+      const nextPerfect = s3Hits === 4;
+
+      const nextTotalHits = s1Hits + s2Hits + s3Hits;
+
+      // 楽観的UI更新
       setParticipants((prev) =>
         prev.map((p) => {
           if (p.id !== participant.id) return p;
           return {
             ...p,
-            stand1_arrows: selectedRound === 1 ? newArrows : p.stand1_arrows,
-            stand2_arrows: selectedRound === 2 ? newArrows : p.stand2_arrows,
-            stand3_arrows: selectedRound === 3 ? newArrows : p.stand3_arrows,
+            stand1_arrows:
+              selectedRound === 1 ? updatedArrows : p.stand1_arrows,
+            stand2_arrows:
+              selectedRound === 2 ? updatedArrows : p.stand2_arrows,
+            stand3_arrows:
+              selectedRound === 3 ? updatedArrows : p.stand3_arrows,
             isHayaHit: nextHayaHit,
+            isSokuchu: nextSokuchu,
+            isPerfect: nextPerfect,
             totalHits: nextTotalHits,
-            isPerfect,
           };
         }),
       );
 
       try {
+        await ensureAnonymousAuth();
+
         const docRef = doc(db, 'entries', participant.id);
         const updatePayload: Record<string, unknown> = {
           totalHits: nextTotalHits,
-          isPerfect,
+          isPerfect: nextPerfect,
+          isSokuchu: nextSokuchu,
           updatedAt: serverTimestamp(),
         };
 
         if (selectedRound === 1) {
-          updatePayload.stand1_arrows = newArrows;
+          updatePayload.stand1_arrows = updatedArrows;
           updatePayload.isHayaHit = nextHayaHit;
         } else if (selectedRound === 2) {
-          updatePayload.stand2_arrows = newArrows;
+          updatePayload.stand2_arrows = updatedArrows;
         } else {
-          updatePayload.stand3_arrows = newArrows;
+          updatePayload.stand3_arrows = updatedArrows;
         }
 
         await updateDoc(docRef, updatePayload);
@@ -431,23 +451,47 @@ export function StandScoreContainer({
             round: selectedRound,
             previousArrows,
             previousHayaHit,
+            previousSokuchu,
+            previousPerfect,
             previousTotalHits,
           },
           ...prev.slice(0, 9),
         ]);
 
+        const markLabel =
+          result === true
+            ? '〇（的中）'
+            : result === false
+              ? '✕（はずれ）'
+              : '未入力';
+
+        let notice = '';
+        if (selectedRound === 1 && arrowIndex === 0) {
+          notice = result === true ? ' [甲矢的中賞対象]' : ' [甲矢的中解除]';
+        }
+
         setStatusMessage(
-          `No.${participant.bibNumber} ${participant.name} 選手: ${getStageName(selectedRound)} を「${newHitCount}中」に更新しました。`,
+          `No.${participant.bibNumber} ${participant.name} 選手: ${getStageName(selectedRound)} ${arrowIndex + 1}本目を「${markLabel}」に更新しました。${notice}`,
         );
         setTimeout(() => setStatusMessage(''), 3000);
-      } catch (err) {
+      } catch (err: unknown) {
         console.error('【スコア更新例外】:', err);
         setParticipants((prev) =>
           prev.map((p) => (p.id === participant.id ? previousState : p)),
         );
-        setErrorMessage(
-          'スコアの保存に失敗しました。通信状態を確認してください。',
-        );
+        const errCode =
+          err && typeof err === 'object' && 'code' in err
+            ? String((err as { code: unknown }).code)
+            : '';
+        if (errCode === 'permission-denied') {
+          setErrorMessage(
+            '権限エラー: Firestoreのルールが反映されていないか、ログイン認証が切れています。',
+          );
+        } else {
+          setErrorMessage(
+            'スコアの保存に失敗しました。通信状態を確認してください。',
+          );
+        }
       } finally {
         setSavingId(null);
       }
@@ -455,107 +499,6 @@ export function StandScoreContainer({
     [isDbReady, selectedRound],
   );
 
-  /**
-   * 【第1ステージ 甲矢的中トグルハンドラー】
-   */
-  const handleToggleHayaHit = useCallback(
-    async (participant: Participant) => {
-      if (!isDbReady || selectedRound !== 1) return;
-
-      if (
-        participant.checkInStatus === 'ABSENT' ||
-        participant.qualificationStatus === 'WITHDRAWN'
-      ) {
-        setErrorMessage(
-          `No.${participant.bibNumber} ${participant.name} 選手は棄権のためスコアを入力できません。`,
-        );
-        return;
-      }
-
-      setSavingId(participant.id);
-      setErrorMessage('');
-
-      const previousState = { ...participant };
-      const previousArrows = [...participant.stand1_arrows];
-      const previousHayaHit = participant.isHayaHit;
-      const previousTotalHits = participant.totalHits;
-
-      const currentStand1Hits =
-        participant.stand1_arrows.filter(Boolean).length;
-      const isAlreadyHayaOneHit =
-        currentStand1Hits === 1 && participant.isHayaHit;
-      const targetHitCount = isAlreadyHayaOneHit ? 0 : 1;
-      const targetHayaHit = !isAlreadyHayaOneHit;
-
-      const newArrows: ArrowHit[] = targetHayaHit
-        ? [true, false]
-        : [false, false];
-
-      const s1Hits = targetHitCount;
-      const s2Hits = participant.stand2_arrows.filter(Boolean).length;
-      const s3Hits = participant.stand3_arrows.filter(Boolean).length;
-      const nextTotalHits = s1Hits + s2Hits + s3Hits;
-      const isPerfect = nextTotalHits === 8;
-
-      setParticipants((prev) =>
-        prev.map((p) =>
-          p.id === participant.id
-            ? {
-                ...p,
-                stand1_arrows: newArrows,
-                isHayaHit: targetHayaHit,
-                totalHits: nextTotalHits,
-                isPerfect,
-              }
-            : p,
-        ),
-      );
-
-      try {
-        const docRef = doc(db, 'entries', participant.id);
-        await updateDoc(docRef, {
-          stand1_arrows: newArrows,
-          isHayaHit: targetHayaHit,
-          totalHits: nextTotalHits,
-          isPerfect,
-          updatedAt: serverTimestamp(),
-        });
-
-        setUndoStack((prev) => [
-          {
-            participantId: participant.id,
-            bibNumber: participant.bibNumber,
-            playerName: participant.name,
-            round: 1,
-            previousArrows,
-            previousHayaHit,
-            previousTotalHits,
-          },
-          ...prev.slice(0, 9),
-        ]);
-
-        setStatusMessage(
-          targetHayaHit
-            ? `No.${participant.bibNumber} ${participant.name} 選手: 甲矢的中（1中）を登録しました。`
-            : `No.${participant.bibNumber} ${participant.name} 選手: 甲矢的中を解除し（0中）に更新しました。`,
-        );
-        setTimeout(() => setStatusMessage(''), 3000);
-      } catch (err) {
-        console.error('【甲矢更新例外】:', err);
-        setParticipants((prev) =>
-          prev.map((p) => (p.id === participant.id ? previousState : p)),
-        );
-        setErrorMessage('甲矢的中の保存に失敗しました。');
-      } finally {
-        setSavingId(null);
-      }
-    },
-    [isDbReady, selectedRound],
-  );
-
-  /**
-   * 【Undo実行ハンドラー】
-   */
   const handleUndo = useCallback(async () => {
     if (!isDbReady || undoStack.length === 0) return;
 
@@ -564,10 +507,13 @@ export function StandScoreContainer({
     setErrorMessage('');
 
     try {
+      await ensureAnonymousAuth();
+
       const docRef = doc(db, 'entries', latest.participantId);
       const updatePayload: Record<string, unknown> = {
         totalHits: latest.previousTotalHits,
-        isPerfect: latest.previousTotalHits === 8,
+        isPerfect: latest.previousPerfect,
+        isSokuchu: latest.previousSokuchu,
         updatedAt: serverTimestamp(),
       };
 
@@ -595,6 +541,113 @@ export function StandScoreContainer({
     }
   }, [isDbReady, undoStack]);
 
+  const renderParticipantScoreRow = (participant: Participant) => {
+    const isAbsent =
+      participant.checkInStatus === 'ABSENT' ||
+      participant.qualificationStatus === 'WITHDRAWN';
+    const isSavingThis = savingId === participant.id;
+
+    const arrows =
+      selectedRound === 1
+        ? participant.stand1_arrows
+        : selectedRound === 2
+          ? participant.stand2_arrows
+          : participant.stand3_arrows;
+
+    const stageHits = countHits(arrows);
+    const maxScore = selectedRound === 3 ? 4 : 2;
+    const standOrder = participant.standAssignments[selectedRound]?.standOrder;
+
+    return (
+      <div
+        key={participant.id}
+        className={`p-3.5 rounded-2xl border transition-all flex flex-col xl:flex-row xl:items-center justify-between gap-3 ${
+          isAbsent
+            ? 'bg-rose-50/30 border-rose-200 opacity-60'
+            : 'bg-white border-slate-200/90 shadow-2xs hover:border-slate-300'
+        }`}
+      >
+        <div className="flex items-start sm:items-center gap-3">
+          <div className="w-11 h-11 rounded-xl bg-slate-100 border border-slate-200 text-slate-900 flex flex-col items-center justify-center shrink-0">
+            <span className="text-[9px] font-mono text-slate-500">射位</span>
+            <span className="text-base font-black leading-none font-mono">
+              {standOrder ?? '-'}
+            </span>
+          </div>
+
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-mono text-xs font-black text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.2 rounded">
+                No.{participant.bibNumber}
+              </span>
+              <h4 className="text-base font-black text-slate-900 flex items-center gap-1.5">
+                {participant.name}
+              </h4>
+              {isAbsent && (
+                <span className="text-[10px] font-bold text-rose-700 bg-rose-50 border border-rose-200 px-1.5 py-0.2 rounded">
+                  棄権
+                </span>
+              )}
+              {participant.isHayaHit && (
+                <span className="inline-flex items-center gap-1 text-[10px] font-black text-emerald-800 bg-emerald-50 border border-emerald-300 px-2 py-0.5 rounded-full shadow-2xs">
+                  <Sparkles className="w-3 h-3 text-emerald-600" />
+                  甲矢的中賞
+                </span>
+              )}
+              {participant.isSokuchu && (
+                <span className="inline-flex items-center gap-1 text-[10px] font-black text-blue-800 bg-blue-50 border border-blue-300 px-2 py-0.5 rounded-full shadow-2xs">
+                  <Target className="w-3 h-3 text-blue-600" />
+                  一手束中賞
+                </span>
+              )}
+              {participant.isPerfect && (
+                <span className="inline-flex items-center gap-1 text-[10px] font-black text-amber-900 bg-amber-100 border border-amber-300 px-2 py-0.5 rounded-full shadow-2xs">
+                  <Award className="w-3 h-3 text-amber-700" />
+                  四矢皆中賞
+                </span>
+              )}
+            </div>
+
+            <div className="text-[11px] text-slate-500 font-medium mt-0.5 flex flex-wrap items-center gap-2">
+              <span>{participant.organization || '無所属'}</span>
+              <span>・</span>
+              <span className="text-slate-600 font-mono">
+                {getStandOrderLabel(standOrder)}
+              </span>
+              <span>・</span>
+              <span className="font-bold text-slate-700 font-mono">
+                通算: {participant.totalHits} / 8中
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-end gap-3 self-end xl:self-auto">
+          <ScoreButton
+            round={selectedRound}
+            arrows={arrows}
+            disabled={isAbsent || isSavingThis}
+            onSelectArrow={(arrowIndex, result) =>
+              handleSelectArrow(participant, arrowIndex, result)
+            }
+          />
+
+          <div className="min-w-20 px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl flex flex-col items-center justify-center shrink-0">
+            <span className="text-[9px] font-bold text-slate-400">
+              ステージ計
+            </span>
+            <span className="text-sm font-black font-mono text-slate-900">
+              {stageHits}{' '}
+              <span className="text-[10px] font-normal text-slate-400">
+                / {maxScore}中
+              </span>
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   if (isLoading) {
     return (
       <div className="p-8 text-center text-slate-500 flex flex-col items-center justify-center">
@@ -616,16 +669,15 @@ export function StandScoreContainer({
                 記録員専用
               </span>
               <span className="text-xs text-slate-400 font-mono">
-                Stage Score Console
+                Shot-by-Shot Score Console
               </span>
             </div>
             <CardTitle className="text-lg font-black text-slate-900 flex items-center gap-2">
               <Target className="w-5 h-5 text-amber-500" />
-              競技記録員用 スコア入力コンソール
+              競技記録員用 スコア入力コンソール（受付済み選手限定）
             </CardTitle>
             <CardDescription className="text-slate-500 text-xs mt-0.5 font-medium">
-              第1・第2ステージは「0, 1, 2」、第3ステージは「0, 1, 2, 3,
-              4」のボタンで入力できます。
+              当日受付（/admin/reception）にて「受付済」となった選手のみ表示されます。第1・第2ステージは1・2本目、第3ステージは1〜4本目を「〇」「✕」で入力します。
             </CardDescription>
           </div>
 
@@ -644,7 +696,6 @@ export function StandScoreContainer({
           )}
         </div>
 
-        {/* ステージ切り替えタブ */}
         <div className="flex flex-wrap items-center gap-2 pt-2">
           <button
             type="button"
@@ -686,33 +737,33 @@ export function StandScoreContainer({
           </button>
         </div>
 
-        {/* 立番号選択ツールバー（5名＝1立、第1立〜第N立を動的自動展開） */}
         <div className="flex items-center gap-2 overflow-x-auto pt-1 pb-0.5">
           <span className="text-xs font-bold text-slate-600 shrink-0 flex items-center gap-1">
-            <Users className="w-3.5 h-3.5 text-slate-400" /> 立選択 (5名/立):
+            <Users className="w-3.5 h-3.5 text-slate-400" /> 組選択
+            (2立・10名/組):
           </span>
-          {standOptions.map((standNum) => {
-            const groupNum = Math.ceil(standNum / 2);
+          {groupOptions.map((groupNum) => {
+            const [s1, s2] = getStandNumbersByGroup(groupNum);
             return (
               <button
-                key={standNum}
+                key={groupNum}
                 type="button"
-                onClick={() => setSelectedStandNumber(standNum)}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all font-mono shrink-0 ${
-                  selectedStandNumber === standNum
+                onClick={() => setSelectedGroupNumber(groupNum)}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all font-mono shrink-0 ${
+                  selectedGroupNumber === groupNum
                     ? 'bg-amber-500 text-slate-950 font-black shadow-2xs'
                     : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200'
                 }`}
-                title={`第${standNum}立 (第${groupNum}組)`}
+                title={`第${groupNum}組（第${s1}立・第${s2}立の計10名を表示）`}
               >
-                第 {standNum} 立
+                第 {groupNum} 組 (第{s1}・{s2}立)
               </button>
             );
           })}
         </div>
       </CardHeader>
 
-      <CardContent className="p-5 space-y-4">
+      <CardContent className="p-5 space-y-5">
         {statusMessage && (
           <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 text-xs font-bold flex items-center gap-2 shadow-2xs animate-in fade-in">
             <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
@@ -727,170 +778,86 @@ export function StandScoreContainer({
           </div>
         )}
 
-        {/* 現在のステージおよび立・組バナー */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 border border-slate-200/80 rounded-xl text-xs font-medium gap-2">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-bold text-slate-900 font-sans flex items-center gap-1">
               <Layers className="w-3.5 h-3.5 text-slate-700" />【
               {getStageName(selectedRound)}】
             </span>
-            <span className="text-slate-700 font-mono font-bold">
-              第 {selectedStandNumber} 立
+            <span className="text-slate-900 font-mono font-black bg-amber-100 border border-amber-300 px-2 py-0.5 rounded">
+              第 {selectedGroupNumber} 組
             </span>
-            <span className="text-slate-500 text-[11px]">
-              (第 {currentGroupNumber} 組所属 / 該当選手:{' '}
-              {currentStandParticipants.length} 名)
+            <span className="text-slate-600 text-[11px] font-mono">
+              （受付済選手・第 {firstStandNumber} 立・第 {secondStandNumber} 立
+              / 該当: {currentGroupTotalPlayers} 名）
             </span>
           </div>
           <span className="text-[11px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md self-start sm:self-auto">
-            入力選択肢:{' '}
-            {selectedRound === 3 ? '0 〜 4 (四矢)' : '0 〜 2 (一手)'}
+            {selectedRound === 1
+              ? '1本目(甲矢)・2本目(乙矢) 〇✕入力（1本目〇で甲矢的中賞）'
+              : selectedRound === 2
+                ? '1本目(甲矢)・2本目(乙矢) 〇✕入力'
+                : '1本目〜4本目(四矢) 〇✕入力（4中で皆中賞）'}
           </span>
         </div>
 
-        {/* 選手行一覧 */}
-        <div className="space-y-3">
-          {currentStandParticipants.length === 0 ? (
-            <div className="py-12 text-center text-slate-400 text-xs font-medium bg-slate-50/50 rounded-xl border border-dashed border-slate-200">
-              第 {selectedStandNumber} 立に割り当てられた選手はいません。
+        <div className="space-y-6">
+          <div className="space-y-2.5 bg-slate-50/70 p-4 rounded-2xl border border-slate-200/90">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-2">
+              <div className="flex items-center gap-2">
+                <span className="px-2.5 py-0.5 rounded-md bg-slate-900 text-white font-mono text-xs font-black">
+                  第 {firstStandNumber} 立
+                </span>
+                <span className="text-xs text-slate-500 font-bold">
+                  （第 {selectedGroupNumber} 組 前半立・受付済最大5名）
+                </span>
+              </div>
+              <span className="text-xs font-mono font-bold text-slate-600">
+                受付済登録: {firstStandParticipants.length} 名
+              </span>
             </div>
-          ) : (
-            currentStandParticipants.map((participant) => {
-              const isAbsent =
-                participant.checkInStatus === 'ABSENT' ||
-                participant.qualificationStatus === 'WITHDRAWN';
-              const isSavingThis = savingId === participant.id;
 
-              const arrows =
-                selectedRound === 1
-                  ? participant.stand1_arrows
-                  : selectedRound === 2
-                    ? participant.stand2_arrows
-                    : participant.stand3_arrows;
-              const currentHits =
-                arrows.length > 0 ? arrows.filter(Boolean).length : null;
-              const maxScore = selectedRound === 3 ? 4 : 2;
-              const standOrder =
-                participant.standAssignments[selectedRound]?.standOrder;
-              const isHayaHitActive =
-                participant.isHayaHit && (currentHits ?? 0) >= 1;
+            {firstStandParticipants.length === 0 ? (
+              <div className="py-8 text-center text-slate-400 text-xs font-medium bg-white rounded-xl border border-dashed border-slate-200">
+                第 {firstStandNumber}{' '}
+                立に受付済みの選手はいません（受付を完了させてください）。
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                {firstStandParticipants.map((participant) =>
+                  renderParticipantScoreRow(participant),
+                )}
+              </div>
+            )}
+          </div>
 
-              return (
-                <div
-                  key={participant.id}
-                  className={`p-4 rounded-2xl border transition-all flex flex-col md:flex-row md:items-center justify-between gap-4 ${
-                    isAbsent
-                      ? 'bg-rose-50/30 border-rose-200 opacity-60'
-                      : 'bg-white border-slate-200/90 shadow-2xs hover:border-slate-300'
-                  }`}
-                >
-                  <div className="flex items-start sm:items-center gap-3">
-                    <div className="w-12 h-12 rounded-xl bg-slate-100 border border-slate-200 text-slate-900 flex flex-col items-center justify-center shrink-0">
-                      <span className="text-[9px] font-mono text-slate-500">
-                        射位
-                      </span>
-                      <span className="text-base font-black leading-none font-mono">
-                        {standOrder ?? '-'}
-                      </span>
-                    </div>
+          <div className="space-y-2.5 bg-slate-50/70 p-4 rounded-2xl border border-slate-200/90">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-2">
+              <div className="flex items-center gap-2">
+                <span className="px-2.5 py-0.5 rounded-md bg-slate-800 text-amber-400 font-mono text-xs font-black">
+                  第 {secondStandNumber} 立
+                </span>
+                <span className="text-xs text-slate-500 font-bold">
+                  （第 {selectedGroupNumber} 組 後半立・受付済最大5名）
+                </span>
+              </div>
+              <span className="text-xs font-mono font-bold text-slate-600">
+                受付済登録: {secondStandParticipants.length} 名
+              </span>
+            </div>
 
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="font-mono text-xs font-black text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.2 rounded">
-                          No.{participant.bibNumber}
-                        </span>
-                        <h4 className="text-base font-black text-slate-900 flex items-center gap-1.5">
-                          {participant.name}
-                          {isAbsent && (
-                            <span className="text-[10px] font-bold text-rose-700 bg-rose-50 border border-rose-200 px-1.5 py-0.2 rounded">
-                              棄権
-                            </span>
-                          )}
-                        </h4>
-                      </div>
-
-                      <div className="text-[11px] text-slate-500 font-medium mt-0.5 flex items-center gap-2">
-                        <span>{participant.organization || '無所属'}</span>
-                        <span>・</span>
-                        <span className="text-slate-600 font-mono">
-                          {getStandOrderLabel(standOrder)}
-                        </span>
-                        <span>・</span>
-                        <span className="font-bold text-slate-700 font-mono">
-                          通算: {participant.totalHits} / 8中
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-3 self-end md:self-auto">
-                    {/* 第1ステージ専用: 甲矢的中ボタン */}
-                    {selectedRound === 1 && !isAbsent && (
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        disabled={isSavingThis}
-                        onClick={() => handleToggleHayaHit(participant)}
-                        className={`h-10 text-xs font-bold px-3 rounded-xl transition-all shadow-2xs ${
-                          isHayaHitActive
-                            ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-500 hover:text-white ring-2 ring-emerald-500'
-                            : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-                        } disabled:opacity-40`}
-                        title={
-                          isHayaHitActive
-                            ? '甲矢的中が記録されています（クリックで解除・0中にリセット）'
-                            : '甲矢的中（1のボタンと同じ1中・甲矢〇）を即時記録'
-                        }
-                      >
-                        {isHayaHitActive ? (
-                          <>
-                            <Check className="w-3.5 h-3.5 mr-1 text-white" />
-                            甲矢: 的中 〇 (1中)
-                          </>
-                        ) : (
-                          <>
-                            <X className="w-3.5 h-3.5 mr-1 text-slate-400" />
-                            甲矢的中 (1中入力)
-                          </>
-                        )}
-                      </Button>
-                    )}
-
-                    <ScoreButton
-                      maxScore={maxScore}
-                      currentScore={currentHits}
-                      disabled={isAbsent || isSavingThis}
-                      onSelectScore={(hits) =>
-                        handleScoreChange(participant, hits)
-                      }
-                    />
-
-                    <div className="min-w-20 px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-center gap-1">
-                      {arrows.length === 0 ? (
-                        <span className="text-[10px] text-slate-400 font-mono">
-                          未記録
-                        </span>
-                      ) : (
-                        arrows.map((hit, idx) => (
-                          <span
-                            key={idx}
-                            className={`w-5 h-5 rounded-full flex items-center justify-center text-xs font-black font-mono shadow-2xs ${
-                              hit
-                                ? 'bg-red-600 text-white'
-                                : 'bg-slate-200 text-slate-500'
-                            }`}
-                          >
-                            {hit ? '〇' : '✕'}
-                          </span>
-                        ))
-                      )}
-                    </div>
-                  </div>
-                </div>
-              );
-            })
-          )}
+            {secondStandParticipants.length === 0 ? (
+              <div className="py-8 text-center text-slate-400 text-xs font-medium bg-white rounded-xl border border-dashed border-slate-200">
+                第 {secondStandNumber} 立に受付済みの選手はいません。
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                {secondStandParticipants.map((participant) =>
+                  renderParticipantScoreRow(participant),
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </CardContent>
     </Card>

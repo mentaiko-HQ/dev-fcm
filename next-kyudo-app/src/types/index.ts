@@ -43,7 +43,7 @@ export type StaffDutyShiftType = '午前のみ' | '午後のみ' | '終日' | '�
 // 立ち順・射位（1: 大前, 2: 二的, 3: 中, 4: 落前, 5: 落）
 export type StandOrderIndex = 1 | 2 | 3 | 4 | 5;
 
-// ラウンド番号（1: 午前一手, 2: 午後一手, 3: 午後四矢）
+// ラウンド（ステージ）番号（1: 第1ステージ, 2: 第2ステージ, 3: 第3ステージ）
 export type StandRoundIndex = 1 | 2 | 3;
 
 // 進行ステータス
@@ -64,8 +64,8 @@ export type QualificationStatus = 'ACTIVE' | 'WITHDRAWN' | 'DISQUALIFIED';
 // 正式案内・QRカード送信ステータス
 export type QrDeliveryStatus = 'UNSENT' | 'SENT' | 'FAILED';
 
-// 矢の的中判定（true: 的中 〇, false: はずれ ✕）
-export type ArrowHit = boolean;
+// 矢の的中判定（true: 的中 〇, false: はずれ ✕, null: 未入力）
+export type ArrowHit = boolean | null;
 
 // 立順割当情報（standGroup は立番号を保持）
 export interface StandAssignment {
@@ -73,7 +73,7 @@ export interface StandAssignment {
   standOrder: StandOrderIndex | null; // 射位（1〜5番）
 }
 
-// 立別競技設定定義
+// 立（ステージ）別競技設定定義
 export interface StandConfig {
   round: StandRoundIndex;
   name: string;
@@ -86,7 +86,7 @@ export interface StandConfig {
 // 競技ルール定数定義
 // ==========================================
 
-// 大会総射数（午前の部: 一手2射 + 午後の部: 一手2射 + 四矢4射 = 計8射）
+// 大会総射数（第1S: 一手2射 + 第2S: 一手2射 + 第3S: 四矢4射 = 計8射）
 export const TOTAL_TOURNAMENT_SHOTS = 8;
 
 // 1立あたりの最大射位数（大前〜落: 5名）
@@ -98,25 +98,25 @@ export const STANDS_PER_GROUP = 2;
 // 1組あたりの最大定員（10名）
 export const PLAYERS_PER_GROUP = PLAYERS_PER_STAND * STANDS_PER_GROUP;
 
-// 各立の構成設定マップ
+// 各立の構成設定マップ（ステージ制）
 export const STAND_CONFIGS: Record<StandRoundIndex, StandConfig> = {
   1: {
     round: 1,
-    name: '第1立 (午前・一手)',
+    name: '第1ステージ (午前・一手)',
     arrowsCount: 2,
     format: '一手',
     timeSlot: '午前',
   },
   2: {
     round: 2,
-    name: '第2立 (午後・一手)',
+    name: '第2ステージ (午後・一手)',
     arrowsCount: 2,
     format: '一手',
     timeSlot: '午後',
   },
   3: {
     round: 3,
-    name: '第3立 (午後・四矢)',
+    name: '第3ステージ (午後・四矢)',
     arrowsCount: 4,
     format: '四矢',
     timeSlot: '午後',
@@ -126,6 +126,50 @@ export const STAND_CONFIGS: Record<StandRoundIndex, StandConfig> = {
 // ==========================================
 // 主要データモデル定義
 // ==========================================
+
+// 大会設定データモデル（エントリー期間等の設定拡張版）
+export interface TournamentConfig {
+  matchId: string; // 大会識別子
+  title: string; // 大会名称
+  date: string; // 開催日 (YYYY-MM-DD)
+  venue: string; // 競技会場
+  totalStandGroups?: number; // 設定上の総組数（動的算出により省略可）
+  totalStands?: number; // 設定上の総立数
+  totalArrows?: number; // 総射数
+  tieBreakerFormat?: string; // 競射形式 (射詰など)
+  status?: string; // 進行ステータス
+  currentStandGroup?: number; // 現在進行中の組
+  currentStandNumber?: number; // 現在進行中の立
+  currentRound?: StandRoundIndex; // 現在進行中のステージ
+  maxStandGroup?: number; // 最大組数
+  entryStartDate?: string; // エントリー受付開始日時 (ISO文字列)
+  entryEndDate?: string; // エントリー受付終了日時 (ISO文字列)
+  isEntryEnabled?: boolean; // エントリー受付有効フラグ
+}
+
+// ==========================================
+// エントリーフォーム用データモデル
+// ==========================================
+
+// エントリー時の個別選手情報
+export interface EntryPlayerItem {
+  name: string;
+  nameKana: string;
+  shosa: ShosaType;
+  rankTitle: RankTitleType;
+  needsSupport: boolean;
+  isStaffVolunteer: boolean;
+}
+
+// エントリーフォーム全体のデータ構造
+export interface RepresentativeEntryFormData {
+  representativeName: string;
+  representativeEmail: string;
+  representativePhone: string;
+  representativeOrganization: string;
+  players: EntryPlayerItem[];
+  notes: string;
+}
 
 // 参加選手データモデル
 export interface Participant {
@@ -146,13 +190,14 @@ export interface Participant {
   standAssignments: Record<StandRoundIndex, StandAssignment>; // 各ラウンドの立ち順割当
   progressStatus: ProgressStatus; // 進行状況
   qualificationStatus: QualificationStatus; // 参加資格
-  stand1_arrows: ArrowHit[]; // 第1立（一手2射）的中記録
-  stand2_arrows: ArrowHit[]; // 第2立（一手2射）的中記録
-  stand3_arrows: ArrowHit[]; // 第3立（四矢4射）的中記録
-  isHayaHit: boolean; // 甲矢（第1射）的中フラグ
+  stand1_arrows: ArrowHit[]; // 第1ステージ（一手2射）的中記録
+  stand2_arrows: ArrowHit[]; // 第2ステージ（一手2射）的中記録
+  stand3_arrows: ArrowHit[]; // 第3ステージ（四矢4射）的中記録
+  isHayaHit: boolean; // 一立目甲矢的中賞（第1Sの1本目）フラグ
+  isSokuchu: boolean; // 一手束中賞（第1Sまたは第2Sでの2中）フラグ
   totalHits: number; // 合計的中数（最大8）
   totalShots: number; // 合計行射数（通常8）
-  isPerfect: boolean; // 皆中（8射8中）フラグ
+  isPerfect: boolean; // 四矢皆中賞（第3Sで4中）フラグ
   enkinRank: number | null; // 遠近競射確定順位
   finalRank: number | null; // 最終確定順位
   representativeName: string; // 申込代表者氏名
@@ -194,18 +239,6 @@ export interface AppUser {
   updatedAt: number; // 更新日時
 }
 
-// 大会設定データモデル
-export interface TournamentConfig {
-  matchId: string; // 大会識別子
-  title: string; // 大会名称
-  date: string; // 開催日 (YYYY-MM-DD)
-  venue: string; // 競技会場
-  totalStandGroups: number; // 総立数
-  currentStandGroup?: number; // 現在進行中の立
-  currentRound?: StandRoundIndex; // 現在進行中のラウンド (1:午前一手, 2:午後一手, 3:午後四矢)
-  isEntryOpen?: boolean; // エントリー受付中フラグ
-}
-
 // 競射（タイブレーク）データモデル
 export interface TieBreakerState {
   type: 'IZUME' | 'ENKIN'; // 射詰（優勝決定）または 遠近（順位決定）
@@ -220,11 +253,11 @@ export interface TieBreakerState {
 export interface CallNotificationLog {
   id: string; // ログID
   matchId: string; // 大会ID
-  round: StandRoundIndex; // 対象ラウンド
-  standGroup: number; // 対象立番号
+  round: StandRoundIndex; // 対象ステージ
+  standGroup: number; // 対象組番号
   title: string; // 通知件名
   body: string; // 通知本文
-  targetPlayerCount: number; // 立内総選手数
+  targetPlayerCount: number; // 組内総選手数
   tokensFoundCount: number; // FCMトークン保有者数
   sentSuccessCount: number; // 送信成功数
   sentFailureCount: number; // 送信失敗数
@@ -238,17 +271,11 @@ export interface CallNotificationLog {
 // 立・組 構造計算ヘルパー関数群
 // ==========================================
 
-/**
- * 立番号から組番号を算出（第1・2立 → 第1組、第3・4立 → 第2組...）
- */
 export function calculateGroupFromStand(standNumber: number): number {
   if (standNumber <= 0) return 1;
   return Math.ceil(standNumber / STANDS_PER_GROUP);
 }
 
-/**
- * 組番号から含まれる立番号範囲を算出（第1組 → [1, 2]、第2組 → [3, 4]...）
- */
 export function calculateStandsFromGroup(
   groupNumber: number,
 ): [number, number] {
@@ -258,17 +285,11 @@ export function calculateStandsFromGroup(
   return [startStand, endStand];
 }
 
-/**
- * 選手総数から必要な総立数を動的算出（5名単位で切り上げ）
- */
 export function calculateTotalStands(playerCount: number): number {
   if (playerCount <= 0) return 1;
   return Math.ceil(playerCount / PLAYERS_PER_STAND);
 }
 
-/**
- * 選手総数から必要な総組数を動的算出（10名単位で切り上げ）
- */
 export function calculateTotalGroups(playerCount: number): number {
   if (playerCount <= 0) return 1;
   return Math.ceil(playerCount / PLAYERS_PER_GROUP);

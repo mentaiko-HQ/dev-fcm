@@ -3,7 +3,8 @@
  *
  * 役割:
  * 1. 参加者データの完全削除（entries コレクションの全ドキュメント削除）
- * 2. 入力済み成績データのみの削除（選手属性は保持し、スコア・順位のみ初期化）
+ * 2. 入力済み成績データのみの削除（選手属性は保持し、スコア・フラグ・順位のみ初期化）
+ *    ※ 初期化対象: スコア配列, totalHits, enkinRank, finalRank, isHayaHit, isSokuchu, isPerfect
  *
  * フールプルーフ設計（操作ミス・二重実行・未認証実行の入口遮断）:
  * - 実行直前に Firebase Auth の認証状態（auth.currentUser）を検証。未認証の場合は処理を中断し、Firestore への拒否リクエスト送信を防止。
@@ -185,7 +186,7 @@ export function DataResetPanel() {
       const totalCount = snapshot.size;
       const docs = snapshot.docs;
 
-      // 400件単位でチャンク分割してスコア関連フィールドのみ初期化（フェイルセーフ）
+      // 400件単位でチャンク分割してスコア・賞フラグ関連フィールドのみ初期化（フェイルセーフ）
       for (let i = 0; i < docs.length; i += BATCH_CHUNK_SIZE) {
         const chunk = docs.slice(i, i + BATCH_CHUNK_SIZE);
         const batch = writeBatch(db);
@@ -196,7 +197,9 @@ export function DataResetPanel() {
             stand2_arrows: [],
             stand3_arrows: [],
             totalHits: 0,
-            isPerfect: false,
+            isHayaHit: false, // 甲矢的中賞フラグ初期化
+            isSokuchu: false, // 一手束中賞フラグ初期化
+            isPerfect: false, // 四矢皆中賞フラグ初期化
             enkinRank: null,
             finalRank: null,
             updatedAt: serverTimestamp(),
@@ -207,7 +210,7 @@ export function DataResetPanel() {
       }
 
       setStatusMessage(
-        `全 ${totalCount} 名の成績（スコア）データを初期化しました（選手名・立順情報は保持されています）。`,
+        `全 ${totalCount} 名の成績・賞データ（スコア、甲矢・束中・皆中フラグ）を初期化しました（選手名・立順情報は保持されています）。`,
       );
       handleCloseModal();
     } catch (err: unknown) {
@@ -232,7 +235,7 @@ export function DataResetPanel() {
               入力された成績データのみ削除
             </span>
             <p className="text-[11px] text-slate-400 leading-relaxed">
-              登録された選手名・立順配置・受付状況は残し、第1立〜第3立の的中記録（〇✕）および通算的中数をすべて初期化します。
+              登録された選手名・立順配置・受付状況は残し、第1立〜第3立の的中記録（〇✕）、通算的中数、および各種賞のフラグをすべて初期化します。
             </p>
           </div>
           <Button
@@ -336,10 +339,10 @@ export function DataResetPanel() {
                 <div className="p-3 bg-amber-950/40 border border-amber-900 rounded-lg space-y-1.5 text-amber-200">
                   <p className="font-bold flex items-center gap-1 text-amber-400">
                     <AlertTriangle className="w-4 h-4" />
-                    的中記録がすべてリセットされます
+                    的中記録および各種賞フラグがすべてリセットされます
                   </p>
                   <p className="text-[11px] text-amber-300">
-                    全選手の第1立・第2立・第3立のスコアが消去され、0射0中に戻ります。選手一覧や立順設定は維持されます。
+                    全選手の第1立〜第3立のスコアが消去され、甲矢的中・束中・皆中フラグも初期化されます（0射0中に戻ります）。選手一覧や立順設定は維持されます。
                   </p>
                 </div>
               )}

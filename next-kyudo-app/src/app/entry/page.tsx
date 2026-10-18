@@ -15,7 +15,7 @@
  * - 必須項目（代表者氏名、メールアドレス、電話番号、選手氏名、ふりがな）の事前バリデーション。
  * - エントリー時点の組番号・立順（standAssignments）はすべて明示的に null で初期化し、
  *   仮計算による誤った立順の確定を防止。
- * - 新規選手登録時に isHayaHit: false を初期値として設定し、Participant 型の整合性を保証。
+ * - 新規選手登録時に isHayaHit: false および isSokuchu: false を初期値として設定し、整合性を保証。
  * - 多重クリックによる二重登録防止（isSubmittingによるボタン非活性化）。
  *
  * フェイルセーフ設計:
@@ -165,9 +165,6 @@ export default function EntryFormPage() {
 
   /**
    * 【データ登録・メール送信処理】
-   * 1. 入力内容のバリデーション
-   * 2. Firestore への一括バッチ保存（立ち順・組番号は未設定 null として登録）
-   * 3. FastAPI への非同期メール送信リクエスト（タイムアウト＆例外安全）
    */
   const handleSubmitEntry = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -224,7 +221,7 @@ export default function EntryFormPage() {
           const newEntryId = `player_${bibNumber}`;
           const entryDocRef = doc(firestoreInstance, 'entries', newEntryId);
 
-          // 【新運用仕様】エントリー時点では第1立・第2立・第3立すべて未割当（null）として登録
+          // エントリー時点では第1立・第2立・第3立すべて未割当（null）として登録
           const unassignedSlot: StandAssignment = {
             standGroup: null,
             standOrder: null,
@@ -246,7 +243,7 @@ export default function EntryFormPage() {
             shosa: player.shosa,
             rankTitle: sanitizeRankTitle(player.rankTitle),
             staffRole: player.isStaffVolunteer ? '運営' : '無し',
-            staffDutyShift: player.isStaffVolunteer ? 'AM' : '無し',
+            staffDutyShift: player.isStaffVolunteer ? '午前のみ' : '無し',
             checkInStatus: 'UNCHECKED',
             checkInAt: null,
             isStaffVolunteer: player.isStaffVolunteer,
@@ -258,6 +255,7 @@ export default function EntryFormPage() {
             stand2_arrows: [],
             stand3_arrows: [],
             isHayaHit: false,
+            isSokuchu: false,
             totalHits: 0,
             totalShots: 8,
             isPerfect: false,
@@ -271,6 +269,9 @@ export default function EntryFormPage() {
             isPaid: false,
             paidAt: null,
             notes: formData.notes.trim(),
+            qrSentStatus: 'UNSENT',
+            qrSentAt: null,
+            qrSentError: null,
             agreedAt: now,
             updatedAt: now,
           };

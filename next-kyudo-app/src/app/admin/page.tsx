@@ -1,7 +1,12 @@
 /**
  * 【管理者向け本部運営統合ダッシュボード】
  * /admin パスに対応するページコンポーネント。
- * 組番号・立順の未設定（null）データに対応。
+ *
+ * 競技回次（ラウンド）呼称設計:
+ * - 午前1回目: 「第1ステージ（午前・一手2射）」
+ * - 午後1回目: 「第2ステージ（午後・一手2射）」
+ * - 午後2回目: 「第3ステージ（午後・四矢4射）」
+ * ※5名1編成の行射枠を「立」、2つの立（10名）を「組」として完全分離。
  *
  * 役割:
  * - PC・タブレット端末に特化し、横幅制約（max-w）を解除して画面幅いっぱい（w-full）に情報を一覧表示。
@@ -71,7 +76,9 @@ import {
   QrCode,
   Download,
   AlertCircle,
+  Target,
 } from 'lucide-react';
+import { AdminAuthStatusBadge } from '@/components/admin/AdminAuthStatusBadge';
 
 const DEFAULT_TOURNAMENT_CONFIG: TournamentConfig = {
   matchId: 'match_2026_mentaiko',
@@ -145,7 +152,6 @@ function sanitizeCheckInStatus(val: unknown): CheckInStatus {
 function escapeCsvField(val: unknown): string {
   if (val === null || val === undefined) return '""';
   const str = String(val);
-  // ダブルクォート、カンマ、改行が含まれる場合は全体をダブルクォートで囲み、内部の " を "" に変換
   const escaped = str.replace(/"/g, '""');
   return `"${escaped}"`;
 }
@@ -266,6 +272,7 @@ export default function AdminConsolePage() {
                 ? raw.stand3_arrows
                 : [],
               isHayaHit: Boolean(raw.isHayaHit),
+              isSokuchu: Boolean(raw.isSokuchu), // 欠落していた isSokuchu を追加
               totalHits:
                 typeof raw.totalHits === 'number'
                   ? raw.totalHits
@@ -298,8 +305,8 @@ export default function AdminConsolePage() {
               isPaid: Boolean(raw.isPaid),
               paidAt: typeof raw.paidAt === 'number' ? raw.paidAt : null,
               notes: typeof raw.notes === 'string' ? raw.notes : '',
-              qrSentAt: typeof raw.qrSentAt === 'number' ? raw.qrSentAt : null,
               qrSentStatus: raw.qrSentStatus || 'UNSENT',
+              qrSentAt: typeof raw.qrSentAt === 'number' ? raw.qrSentAt : null,
               qrSentError: raw.qrSentError || null,
               agreedAt:
                 typeof raw.agreedAt === 'number' ? raw.agreedAt : undefined,
@@ -324,6 +331,7 @@ export default function AdminConsolePage() {
   /**
    * 【CSVエクスポートハンドラー】
    * UTF-8 BOM付きCSVファイルを生成しブラウザ経由でダウンロード。
+   * 回次表記を「第1ステージ」「第2ステージ」「第3ステージ」へ更新。
    */
   const handleExportCsv = useCallback(() => {
     setExportError(null);
@@ -343,12 +351,12 @@ export default function AdminConsolePage() {
         '称号段位',
         '役員役割',
         '役員シフト',
-        '午前(第1立)組',
-        '午前(第1立)射位',
-        '午後(第2立)組',
-        '午後(第2立)射位',
-        '午後(第3立)組',
-        '午後(第3立)射位',
+        '第1ステージ(午前一手)立番号',
+        '第1ステージ(午前一手)射位',
+        '第2ステージ(午後一手)立番号',
+        '第2ステージ(午後一手)射位',
+        '第3ステージ(午後四矢)立番号',
+        '第3ステージ(午後四矢)射位',
         '受付状態',
         '受付日時',
         '参加資格',
@@ -370,9 +378,9 @@ export default function AdminConsolePage() {
       ];
 
       const rows = participants.map((p) => {
-        const m = p.standAssignments[1];
-        const a2 = p.standAssignments[2];
-        const a3 = p.standAssignments[3];
+        const s1 = p.standAssignments[1];
+        const s2 = p.standAssignments[2];
+        const s3 = p.standAssignments[3];
 
         return [
           escapeCsvField(p.bibNumber),
@@ -383,12 +391,12 @@ export default function AdminConsolePage() {
           escapeCsvField(p.rankTitle),
           escapeCsvField(p.staffRole),
           escapeCsvField(p.staffDutyShift),
-          escapeCsvField(m?.standGroup ?? ''),
-          escapeCsvField(m?.standOrder ?? ''),
-          escapeCsvField(a2?.standGroup ?? ''),
-          escapeCsvField(a2?.standOrder ?? ''),
-          escapeCsvField(a3?.standGroup ?? ''),
-          escapeCsvField(a3?.standOrder ?? ''),
+          escapeCsvField(s1?.standGroup ?? ''),
+          escapeCsvField(s1?.standOrder ?? ''),
+          escapeCsvField(s2?.standGroup ?? ''),
+          escapeCsvField(s2?.standOrder ?? ''),
+          escapeCsvField(s3?.standGroup ?? ''),
+          escapeCsvField(s3?.standOrder ?? ''),
           escapeCsvField(
             p.checkInStatus === 'CHECKED_IN'
               ? '受付済'
@@ -428,7 +436,6 @@ export default function AdminConsolePage() {
         ].join(',');
       });
 
-      // UTF-8 BOM (\uFEFF) を付与してExcelでの文字化けを防止
       const csvContent = '\uFEFF' + [headers.join(','), ...rows].join('\r\n');
       const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
@@ -445,7 +452,6 @@ export default function AdminConsolePage() {
       downloadLink.click();
       document.body.removeChild(downloadLink);
 
-      // 一時URLの即時解放（メモリリーク防止）
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (err: unknown) {
       console.error('【CSVエクスポート例外】:', err);
@@ -467,15 +473,16 @@ export default function AdminConsolePage() {
               本部運営管理コンソール
             </span>
             <span className="text-xs font-semibold text-slate-600 bg-slate-100 px-2.5 py-0.5 rounded-md">
-              全8射的中制（個人戦）
+              全8射的中制（個人戦・全3ステージ制）
             </span>
+            <AdminAuthStatusBadge />
           </div>
           <h1 className="text-xl md:text-2xl font-black text-slate-900 pt-1">
             {tournamentConfig.title}
           </h1>
           <p className="text-xs text-slate-500 font-medium">
-            午前の部: 一手2射 / 午後の部:
-            一手2射＋四矢4射（合計8射・優勝決定射詰 / 2位以降遠近競射）
+            第1ステージ(午前・一手2射) / 第2ステージ(午後・一手2射) /
+            第3ステージ(午後・四矢4射) 計8射・優勝決定射詰 / 2位以降遠近競射
           </p>
         </div>
 
@@ -548,10 +555,20 @@ export default function AdminConsolePage() {
         <MatchControlPanel matchId={tournamentConfig.matchId} />
       </section>
 
+      {/* 5. 競技記録員用 スコア入力コンソール（ステージ別成績入力） */}
       <section className="w-full flex flex-col gap-2 bg-white p-6 border border-slate-200/80 rounded-2xl shadow-sm">
-        <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-          5. 競技記録員用 スコア入力コンソール
-        </h2>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 pb-1">
+          <div className="flex items-center gap-2">
+            <Target className="w-4 h-4 text-amber-500" />
+            <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+              5. 競技記録員用 スコア入力コンソール (ステージ別成績入力)
+            </h2>
+          </div>
+          <span className="text-[11px] text-slate-500 font-medium">
+            第1ステージ(午前・一手) / 第2ステージ(午後・一手) /
+            第3ステージ(午後・四矢)
+          </span>
+        </div>
         <StandScoreContainer tournamentConfig={tournamentConfig} />
       </section>
 

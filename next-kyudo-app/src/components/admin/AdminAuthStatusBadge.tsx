@@ -23,6 +23,7 @@ export function AdminAuthStatusBadge() {
     isAuthenticated: false,
     uid: null,
     email: null,
+    isAdmin: false, // 型定義に合わせて isAdmin を追加
     isLoading: true,
     errorMessage: null,
   });

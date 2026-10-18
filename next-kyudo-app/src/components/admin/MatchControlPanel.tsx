@@ -24,7 +24,7 @@
 
 'use client';
 
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   collection,
   doc,
@@ -57,13 +57,10 @@ import {
   Radio,
   Sun,
   Moon,
-  Users,
-  Smartphone,
   Send,
   History,
   Clock,
   Loader2,
-  ChevronRight,
   Infinity as InfinityIcon,
 } from 'lucide-react';
 
@@ -247,6 +244,7 @@ export function MatchControlPanel({
               ? raw.stand3_arrows
               : [],
             isHayaHit: Boolean(raw.isHayaHit),
+            isSokuchu: Boolean(raw.isSokuchu),
             totalHits:
               typeof raw.totalHits === 'number'
                 ? raw.totalHits
@@ -367,8 +365,8 @@ export function MatchControlPanel({
   const dynamicTotalStandGroups = useMemo(() => {
     let maxAssignedGroup = 1;
     participants.forEach((p) => {
-      [1, 2, 3].forEach((r) => {
-        const g = p.standAssignments[r as StandRoundIndex]?.standGroup;
+      ([1, 2, 3] as StandRoundIndex[]).forEach((r) => {
+        const g = p.standAssignments[r]?.standGroup;
         if (g && g > maxAssignedGroup) maxAssignedGroup = g;
       });
     });
@@ -464,6 +462,7 @@ export function MatchControlPanel({
           stand2_arrows: [],
           stand3_arrows: [],
           isHayaHit: false,
+          isSokuchu: false,
           totalHits: 0,
           totalShots: 8,
           isPerfect: false,
@@ -505,6 +504,7 @@ export function MatchControlPanel({
           stand2_arrows: [],
           stand3_arrows: [],
           isHayaHit: false,
+          isSokuchu: false,
           totalHits: 0,
           totalShots: 8,
           isPerfect: false,
@@ -546,6 +546,7 @@ export function MatchControlPanel({
           stand2_arrows: [],
           stand3_arrows: [],
           isHayaHit: false,
+          isSokuchu: false,
           totalHits: 0,
           totalShots: 8,
           isPerfect: false,
@@ -587,6 +588,7 @@ export function MatchControlPanel({
           stand2_arrows: [],
           stand3_arrows: [],
           isHayaHit: false,
+          isSokuchu: false,
           totalHits: 0,
           totalShots: 8,
           isPerfect: false,
@@ -869,7 +871,7 @@ export function MatchControlPanel({
           }`}
         >
           <Sun className="w-3.5 h-3.5 text-amber-400" />
-          第1立 (午前・一手)
+          第1ステージ (午前・一手)
         </button>
 
         <button
@@ -883,7 +885,7 @@ export function MatchControlPanel({
           }`}
         >
           <Moon className="w-3.5 h-3.5 text-slate-300" />
-          第2立 (午後・一手)
+          第2ステージ (午後・一手)
         </button>
 
         <button
@@ -897,7 +899,7 @@ export function MatchControlPanel({
           }`}
         >
           <Moon className="w-3.5 h-3.5 text-slate-300" />
-          第3立 (午後・四矢)
+          第3ステージ (午後・四矢)
         </button>
       </div>
 
@@ -967,7 +969,7 @@ export function MatchControlPanel({
                 <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
               ) : (
                 <>
-                  次立へ進行（第 {matchState.currentStandGroup + 1} 組開始）
+                  次組へ進行（第 {matchState.currentStandGroup + 1} 組開始）
                   <ArrowRight className="w-4 h-4 ml-1.5" />
                 </>
               )}
@@ -983,7 +985,7 @@ export function MatchControlPanel({
                 招集呼出対象（控席へ招中）
               </span>
               <span className="text-[10px] font-mono font-bold bg-amber-100 text-amber-900 border border-amber-300 px-2 py-0.5 rounded">
-                2立前呼出
+                2組前呼出
               </span>
             </div>
             <div className="flex items-baseline gap-2 my-2">
@@ -1049,7 +1051,7 @@ export function MatchControlPanel({
             </div>
           ) : (
             <div className="w-full overflow-x-auto">
-              <table className="w-full text-left text-xs min-w-[650px]">
+              <table className="w-full text-left text-xs min-w-162.5">
                 <thead className="bg-slate-100/80 text-slate-600 border-b border-slate-200 text-[11px]">
                   <tr>
                     <th className="py-2.5 px-3 font-bold">送信時刻</th>

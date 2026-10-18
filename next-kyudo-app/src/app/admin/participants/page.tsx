@@ -16,13 +16,13 @@
  * - 削除ボタン押下時に即座に削除せず、専用の確認モーダルを表示して選手名・ゼッケン番号を明示再確認。
  * - ゼッケン番号の重複をリアルタイムに検知し、重複時は警告表示とともに保存処理をブロック。
  * - 各選手の保存処理・削除処理中はボタンを非活性化（disabled）およびスピナー表示し、多重送信を防止。
- * - StaffDutyShiftType の型定義（'午前のみ' | '午後のみ' | '終日' | '無し'）に厳格準拠。
+ * - StaffDutyShiftType の型定義に厳格準拠。
  *
  * フェイルセーフ設計（障害時の安全縮退）:
  * - useRef による最新基準データ（originalParticipantsMapRef）の保持により、useEffectの依存関係を安定化しつつ、
  *   リモート更新時でも編集中（Dirty状態）の選手データを上書きせずローカル入力を保護。
  * - 更新・削除処理の例外を捕捉し、通信切断時でもクラッシュせずインラインエラー通知を表示。
- * - 更新時に既存の立順配置データ（standAssignments）を破壊せず完全に維持。
+ * - 更新時に既存の立順配置データ（standAssignments）やフラグ（isHayaHit, isSokuchu 等）を破壊せず完全に維持。
  */
 
 'use client';
@@ -252,6 +252,7 @@ export default function ParticipantsManagementPage() {
               ? raw.stand3_arrows
               : [],
             isHayaHit: Boolean(raw.isHayaHit),
+            isSokuchu: Boolean(raw.isSokuchu), // ★ここでプロパティを追加・マッピング
             totalHits:
               typeof raw.totalHits === 'number'
                 ? raw.totalHits
@@ -282,8 +283,8 @@ export default function ParticipantsManagementPage() {
             isPaid: Boolean(raw.isPaid),
             paidAt: typeof raw.paidAt === 'number' ? raw.paidAt : null,
             notes: typeof raw.notes === 'string' ? raw.notes : '',
-            qrSentAt: typeof raw.qrSentAt === 'number' ? raw.qrSentAt : null,
             qrSentStatus: raw.qrSentStatus || 'UNSENT',
+            qrSentAt: typeof raw.qrSentAt === 'number' ? raw.qrSentAt : null,
             qrSentError: raw.qrSentError || null,
             agreedAt:
               typeof raw.agreedAt === 'number' ? raw.agreedAt : undefined,
@@ -332,7 +333,7 @@ export default function ParticipantsManagementPage() {
     );
 
     return () => unsubscribe();
-  }, []);
+  }, [isDbReady]);
 
   /**
    * 各行の変更有無（Dirty判定）
@@ -879,7 +880,7 @@ export default function ParticipantsManagementPage() {
                       : 'border-slate-200/80'
                 }`}
               >
-                <div className="flex flex-col items-center justify-start shrink-0 pt-1 min-w-32.5 border-b xl:border-b-0 xl:border-r border-slate-100 pb-3 xl:pb-0 xl:pr-4">
+                <div className="flex flex-col items-center justify-start shrink-0 pt-1 min-w-[130px] border-b xl:border-b-0 xl:border-r border-slate-100 pb-3 xl:pb-0 xl:pr-4">
                   <div className="flex items-center gap-1.5 mb-1">
                     <span className="text-[10px] font-mono text-slate-400 font-bold">
                       ゼッケンNo.
@@ -926,7 +927,7 @@ export default function ParticipantsManagementPage() {
                       title={p.representativeEmail}
                     >
                       <Mail className="w-3 h-3 text-slate-400 shrink-0" />
-                      <span className="truncate max-w-27.5">
+                      <span className="truncate max-w-50">
                         {p.representativeEmail || '未登録'}
                       </span>
                     </span>

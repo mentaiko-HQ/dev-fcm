@@ -195,6 +195,7 @@ export function TeamSelectForm() {
               ? data.stand3_arrows
               : [],
             isHayaHit: Boolean(data.isHayaHit),
+            isSokuchu: Boolean(data.isSokuchu), // ★ここでプロパティを追加・マッピング
             totalHits:
               typeof data.totalHits === 'number'
                 ? data.totalHits

@@ -140,150 +140,6 @@ export default function ReceptionPage() {
   const scanInputRef = useRef<HTMLInputElement>(null);
   const isScanLockedRef = useRef<boolean>(false);
 
-  // 1. Firestore entries コレクションのリアルタイム購読
-  useEffect(() => {
-    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
-
-    const q = query(collection(db, 'entries'), orderBy('bibNumber', 'asc'));
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot) => {
-        const loaded: Participant[] = [];
-        snapshot.forEach((docSnap) => {
-          const raw = docSnap.data();
-          const rawAssignments = raw.standAssignments || {};
-
-          const afternoonGroup = sanitizeStandGroup(
-            rawAssignments[2]?.standGroup ??
-              rawAssignments[3]?.standGroup ??
-              null,
-          );
-          const afternoonOrder = sanitizeStandOrder(
-            rawAssignments[2]?.standOrder ??
-              rawAssignments[3]?.standOrder ??
-              null,
-          );
-
-          const safeAssignments: Record<
-            StandRoundIndex,
-            { standGroup: number | null; standOrder: StandOrderIndex | null }
-          > = {
-            1: {
-              standGroup: sanitizeStandGroup(
-                rawAssignments[1]?.standGroup ?? null,
-              ),
-              standOrder: sanitizeStandOrder(
-                rawAssignments[1]?.standOrder ?? null,
-              ),
-            },
-            2: {
-              standGroup: afternoonGroup,
-              standOrder: afternoonOrder,
-            },
-            3: {
-              standGroup: afternoonGroup,
-              standOrder: afternoonOrder,
-            },
-          };
-
-          loaded.push({
-            id: docSnap.id,
-            bibNumber:
-              typeof raw.bibNumber === 'number'
-                ? raw.bibNumber
-                : Number(raw.bibNumber) || 1,
-            name: typeof raw.name === 'string' ? raw.name : '選手名未設定',
-            nameKana: typeof raw.nameKana === 'string' ? raw.nameKana : '',
-            organization:
-              typeof raw.organization === 'string' ? raw.organization : '',
-            shosa: sanitizeShosaType(raw.shosa),
-            rankTitle: sanitizeRankTitleType(raw.rankTitle),
-            staffRole: raw.staffRole || '無し',
-            staffDutyShift: raw.staffDutyShift || '無し',
-            checkInStatus: (raw.checkInStatus as CheckInStatus) || 'UNCHECKED',
-            checkInAt: typeof raw.checkInAt === 'number' ? raw.checkInAt : null,
-            checkInMethod: raw.checkInMethod || null,
-            isStaffVolunteer: Boolean(raw.isStaffVolunteer),
-            needsSupport: Boolean(raw.needsSupport),
-            standAssignments: safeAssignments,
-            progressStatus: raw.progressStatus || 'WAITING',
-            qualificationStatus:
-              (raw.qualificationStatus as QualificationStatus) || 'ACTIVE',
-            stand1_arrows: Array.isArray(raw.stand1_arrows)
-              ? raw.stand1_arrows
-              : [],
-            stand2_arrows: Array.isArray(raw.stand2_arrows)
-              ? raw.stand2_arrows
-              : [],
-            stand3_arrows: Array.isArray(raw.stand3_arrows)
-              ? raw.stand3_arrows
-              : [],
-            isHayaHit: Boolean(raw.isHayaHit),
-            totalHits:
-              typeof raw.totalHits === 'number'
-                ? raw.totalHits
-                : Number(raw.totalHits) || 0,
-            totalShots:
-              typeof raw.totalShots === 'number'
-                ? raw.totalShots
-                : Number(raw.totalShots) || 8,
-            isPerfect: Boolean(raw.isPerfect),
-            enkinRank: typeof raw.enkinRank === 'number' ? raw.enkinRank : null,
-            finalRank: typeof raw.finalRank === 'number' ? raw.finalRank : null,
-            representativeName:
-              typeof raw.representativeName === 'string'
-                ? raw.representativeName
-                : '',
-            representativeEmail:
-              typeof raw.representativeEmail === 'string'
-                ? raw.representativeEmail
-                : '',
-            representativePhone:
-              typeof raw.representativePhone === 'string'
-                ? raw.representativePhone
-                : '',
-            representativeOrganization:
-              typeof raw.representativeOrganization === 'string'
-                ? raw.representativeOrganization
-                : '',
-            isPaid: Boolean(raw.isPaid),
-            paidAt: typeof raw.paidAt === 'number' ? raw.paidAt : null,
-            notes: typeof raw.notes === 'string' ? raw.notes : '',
-            qrSentAt: typeof raw.qrSentAt === 'number' ? raw.qrSentAt : null,
-            qrSentStatus: raw.qrSentStatus || 'UNSENT',
-            qrSentError: raw.qrSentError || null,
-          });
-        });
-
-        setParticipants(loaded);
-        setIsLoading(false);
-      },
-      (err) => {
-        console.error('【受付Firestore購読例外】:', err);
-        setErrorMessage('参加者データの取得に失敗しました。');
-        setIsLoading(false);
-      },
-    );
-
-    return () => unsubscribe();
-  }, []);
-
-  // 2. USBスキャナー向けフォーカス自動維持機構
-  const keepInputFocus = useCallback(() => {
-    if (scanInputRef.current) {
-      scanInputRef.current.focus();
-    }
-  }, []);
-
-  useEffect(() => {
-    keepInputFocus();
-    const handleDocumentClick = () => {
-      keepInputFocus();
-    };
-    document.addEventListener('click', handleDocumentClick);
-    return () => document.removeEventListener('click', handleDocumentClick);
-  }, [keepInputFocus]);
-
   // 3. 入場チェックイン実行処理
   const executeCheckIn = useCallback(
     async (targetParticipant: Participant, method: 'QR_SCAN' | 'MANUAL') => {
@@ -394,6 +250,182 @@ export default function ReceptionPage() {
     },
     [],
   );
+
+  // 7. スキャン入力完了（Enter）ハンドラー
+  const handleScanSubmit = useCallback(
+    (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!scanInputRef.current) return;
+
+      const rawText = scanInputRef.current.value;
+      scanInputRef.current.value = '';
+
+      if (!rawText.trim()) return;
+
+      // 多層救済解析の実行
+      const result = decodeAndMatchParticipant(rawText, participants);
+      setLastDecodeResult(result);
+
+      if (result.matchedParticipant) {
+        setErrorMessage('');
+        executeCheckIn(result.matchedParticipant, 'QR_SCAN');
+      } else {
+        playErrorSound();
+        const previewText =
+          rawText.length > 50 ? rawText.slice(0, 50) + '...' : rawText;
+        setErrorMessage(
+          `【照合エラー】スキャンデータ「${previewText}」に一致する選手が見つかりませんでした。（${result.debugMessage}）`,
+        );
+      }
+    },
+    [participants, executeCheckIn],
+  );
+
+  // 1. Firestore entries コレクションのリアルタイム購読
+  // ※ 依存配列（[]）を固定し、関数や変数を内部に閉じるか安定化してエラーを解消
+  useEffect(() => {
+    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
+
+    const q = query(collection(db, 'entries'), orderBy('bibNumber', 'asc'));
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        const loaded: Participant[] = [];
+        snapshot.forEach((docSnap) => {
+          const raw = docSnap.data();
+          const rawAssignments = raw.standAssignments || {};
+
+          const afternoonGroup = sanitizeStandGroup(
+            rawAssignments[2]?.standGroup ??
+              rawAssignments[3]?.standGroup ??
+              null,
+          );
+          const afternoonOrder = sanitizeStandOrder(
+            rawAssignments[2]?.standOrder ??
+              rawAssignments[3]?.standOrder ??
+              null,
+          );
+
+          const safeAssignments: Record<
+            StandRoundIndex,
+            { standGroup: number | null; standOrder: StandOrderIndex | null }
+          > = {
+            1: {
+              standGroup: sanitizeStandGroup(
+                rawAssignments[1]?.standGroup ?? null,
+              ),
+              standOrder: sanitizeStandOrder(
+                rawAssignments[1]?.standOrder ?? null,
+              ),
+            },
+            2: {
+              standGroup: afternoonGroup,
+              standOrder: afternoonOrder,
+            },
+            3: {
+              standGroup: afternoonGroup,
+              standOrder: afternoonOrder,
+            },
+          };
+
+          loaded.push({
+            id: docSnap.id,
+            bibNumber:
+              typeof raw.bibNumber === 'number'
+                ? raw.bibNumber
+                : Number(raw.bibNumber) || 1,
+            name: typeof raw.name === 'string' ? raw.name : '選手名未設定',
+            nameKana: typeof raw.nameKana === 'string' ? raw.nameKana : '',
+            organization:
+              typeof raw.organization === 'string' ? raw.organization : '',
+            shosa: sanitizeShosaType(raw.shosa),
+            rankTitle: sanitizeRankTitleType(raw.rankTitle),
+            staffRole: raw.staffRole || '無し',
+            staffDutyShift: raw.staffDutyShift || '無し',
+            checkInStatus: (raw.checkInStatus as CheckInStatus) || 'UNCHECKED',
+            checkInAt: typeof raw.checkInAt === 'number' ? raw.checkInAt : null,
+            checkInMethod: raw.checkInMethod || null,
+            isStaffVolunteer: Boolean(raw.isStaffVolunteer),
+            needsSupport: Boolean(raw.needsSupport),
+            standAssignments: safeAssignments,
+            progressStatus: raw.progressStatus || 'WAITING',
+            qualificationStatus:
+              (raw.qualificationStatus as QualificationStatus) || 'ACTIVE',
+            stand1_arrows: Array.isArray(raw.stand1_arrows)
+              ? raw.stand1_arrows
+              : [],
+            stand2_arrows: Array.isArray(raw.stand2_arrows)
+              ? raw.stand2_arrows
+              : [],
+            stand3_arrows: Array.isArray(raw.stand3_arrows)
+              ? raw.stand3_arrows
+              : [],
+            isHayaHit: Boolean(raw.isHayaHit),
+            isSokuchu: Boolean(raw.isSokuchu),
+            totalHits:
+              typeof raw.totalHits === 'number'
+                ? raw.totalHits
+                : Number(raw.totalHits) || 0,
+            totalShots:
+              typeof raw.totalShots === 'number'
+                ? raw.totalShots
+                : Number(raw.totalShots) || 8,
+            isPerfect: Boolean(raw.isPerfect),
+            enkinRank: typeof raw.enkinRank === 'number' ? raw.enkinRank : null,
+            finalRank: typeof raw.finalRank === 'number' ? raw.finalRank : null,
+            representativeName:
+              typeof raw.representativeName === 'string'
+                ? raw.representativeName
+                : '',
+            representativeEmail:
+              typeof raw.representativeEmail === 'string'
+                ? raw.representativeEmail
+                : '',
+            representativePhone:
+              typeof raw.representativePhone === 'string'
+                ? raw.representativePhone
+                : '',
+            representativeOrganization:
+              typeof raw.representativeOrganization === 'string'
+                ? raw.representativeOrganization
+                : '',
+            isPaid: Boolean(raw.isPaid),
+            paidAt: typeof raw.paidAt === 'number' ? raw.paidAt : null,
+            notes: typeof raw.notes === 'string' ? raw.notes : '',
+            qrSentAt: typeof raw.qrSentAt === 'number' ? raw.qrSentAt : null,
+            qrSentStatus: raw.qrSentStatus || 'UNSENT',
+            qrSentError: raw.qrSentError || null,
+          });
+        });
+
+        setParticipants(loaded);
+        setIsLoading(false);
+      },
+      (err) => {
+        console.error('【受付Firestore購読例外】:', err);
+        setErrorMessage('参加者データの取得に失敗しました。');
+        setIsLoading(false);
+      },
+    );
+
+    return () => unsubscribe();
+  }, []); // 依存配列を一定の空配列（[]）に固定
+
+  // 2. USBスキャナー向けフォーカス自動維持機構
+  const keepInputFocus = useCallback(() => {
+    if (scanInputRef.current) {
+      scanInputRef.current.focus();
+    }
+  }, []);
+
+  useEffect(() => {
+    keepInputFocus();
+    const handleDocumentClick = () => {
+      keepInputFocus();
+    };
+    document.addEventListener('click', handleDocumentClick);
+    return () => document.removeEventListener('click', handleDocumentClick);
+  }, [keepInputFocus]);
 
   // 4. 受付取り消し処理
   const handleRevertCheckIn = async (participant: Participant) => {
@@ -572,36 +604,6 @@ export default function ReceptionPage() {
       setIsProcessing(false);
     }
   };
-
-  // 7. スキャン入力完了（Enter）ハンドラー
-  const handleScanSubmit = useCallback(
-    (e: React.FormEvent) => {
-      e.preventDefault();
-      if (!scanInputRef.current) return;
-
-      const rawText = scanInputRef.current.value;
-      scanInputRef.current.value = '';
-
-      if (!rawText.trim()) return;
-
-      // 多層救済解析の実行
-      const result = decodeAndMatchParticipant(rawText, participants);
-      setLastDecodeResult(result);
-
-      if (result.matchedParticipant) {
-        setErrorMessage('');
-        executeCheckIn(result.matchedParticipant, 'QR_SCAN');
-      } else {
-        playErrorSound();
-        const previewText =
-          rawText.length > 50 ? rawText.slice(0, 50) + '...' : rawText;
-        setErrorMessage(
-          `【照合エラー】スキャンデータ「${previewText}」に一致する選手が見つかりませんでした。（${result.debugMessage}）`,
-        );
-      }
-    },
-    [participants, executeCheckIn],
-  );
 
   // 8. 集計統計
   const stats = useMemo(() => {
@@ -1028,7 +1030,7 @@ export default function ReceptionPage() {
       {/* 受付一覧テーブル */}
       <div className="w-full bg-white border border-slate-200/80 rounded-2xl overflow-hidden shadow-sm">
         <div className="w-full overflow-x-auto">
-          <Table className="w-full min-w-[880px] text-xs">
+          <Table className="w-full min-w-220 text-xs">
             <TableHeader className="bg-slate-50/90 text-slate-700 border-b border-slate-200">
               <TableRow>
                 <TableHead className="w-20 font-bold text-slate-900">
