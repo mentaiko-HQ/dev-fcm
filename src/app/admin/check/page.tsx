@@ -3,11 +3,28 @@
  * /admin/check パスに対応するページコンポーネント。
  *
  * 役割:
- * - エントリーデータのリアルタイム購読および一覧表示。
- * - 参加費納付（isPaid）の状態トグル更新（楽観的UI更新とロールバック機構）。
- * - 選手数無制限の動的立数（calculateTotalStands）に基づいた午前・午後の立順インライン編集。
- * - フールプルーフ: 重複や未選択時の保存ブロック、未保存変更時の送信遮断。
- * - フェイルセーフ: APIタイムアウト（AbortController）やFirestore書き込み失敗時のエラーハンドリング。
+ * 1. エントリー詳細の照会（ゼッケン番号、選手氏名、所属、所作、段位、サポート希望、担当者情報）。
+ * 2. 参加費納付（isPaid）の承認・取り消しと Firestore への即時反映（楽観的UI更新）。
+ * 3. 午前（第1立）および午後（第2・3立）の立順（立番号・射位）インライン編集。
+ * 4. 【選手数無制限・立番号自動算出対応（UI表示は「立」に完全統一）】:
+ *    - 登録された参加選手数（participants.length）に基づき、5人立での必要立数（Math.max(1, Math.ceil(participants.length / 5))）を動的自動計算。
+ *    - 18名の制限を完全に排除し、選手数が何名（50名、100名、200名等）であっても立番号（第1立、第2立...）を自動追従。
+ * 5. 【立順設定・保存・送信の段階的連動（フールプルーフ）】:
+ *    - 午前・午後の立番号および射位がすべて選択された時点で「保存」ボタンがアクティブ化。
+ *    - 保存ボタンが押下され、Firestore への書き込みが完了した後に「メール送信」ボタンがアクティブ化。
+ *    - 編集後に保存されていない状態（未保存/Dirty）ではメール送信を遮断し、誤送信を未然に防止。
+ * 6. 立順重複（同一立・同一射位の衝突）およびゼッケン重複のリアルタイム検知・保存ブロック。
+ * 7. メール送信ボタンによる一体型QRカード添付メールの配信（個別送信・一括送信）。
+ * 8. サマリー統計カード（総エントリー、入金済、立順未割当、QR未送信）のリアルタイム集計表示。
+ *
+ * フールプルーフ設計（事故前・対人間）:
+ * - 午前午後の立順が揃っていない段階では保存ボタンを非活性化。
+ * - 変更後に未保存のままメール送信ボタンを押す操作を入口で遮断。
+ * - 重複した立ち順の選手は保存をブロックし、該当セルを赤色警告表示。
+ *
+ * フェイルセーフ設計（事故後・対故障）:
+ * - Firestore 書き込み失敗時は直前の確定状態へ安全にロールバック。
+ * - メールAPIリクエストに 15秒 のタイムアウト（AbortController）を設定し、UI膠着を回避。
  */
 
 'use client';
@@ -63,6 +80,7 @@ import {
   Save,
   Filter,
   Check,
+  Infinity as InfinityIcon,
 } from 'lucide-react';
 
 const API_TIMEOUT_MS = 15000;
@@ -90,7 +108,9 @@ export default function AdminCheckManagementPage() {
   const router = useRouter();
   const isDbReady = isFirebaseConfigured && isFirestoreAvailable(db);
 
+  // 画面編集用参加者リスト
   const [participants, setParticipants] = useState<Participant[]>([]);
+  // Firestoreに確定保存されている立順ハッシュマップ (participantId -> string)
   const [savedAssignmentsMap, setSavedAssignmentsMap] = useState<
     Record<string, string>
   >({});
@@ -104,6 +124,7 @@ export default function AdminCheckManagementPage() {
     !isDbReady ? 'Firebaseデータベースに接続されていません。' : '',
   );
 
+  // 検索・フィルターステート
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [filterPaid, setFilterPaid] = useState<'ALL' | 'PAID' | 'UNPaid'>(
     'ALL',
@@ -113,7 +134,7 @@ export default function AdminCheckManagementPage() {
     'ALL' | 'ASSIGNED' | 'UNASSIGNED'
   >('ALL');
 
-  // Firestoreからエントリーデータを購読し、Participant型へ安全にマッピング
+  // 1. Firestore entries コレクションのリアルタイム購読（全件・無制限）
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
       return;
@@ -194,7 +215,7 @@ export default function AdminCheckManagementPage() {
               ? raw.stand3_arrows
               : [],
             isHayaHit: Boolean(raw.isHayaHit),
-            isSokuchu: Boolean(raw.isSokuchu), // 必須プロパティ: 束中フラグ
+            isSokuchu: Boolean(raw.isSokuchu),
             totalHits:
               typeof raw.totalHits === 'number'
                 ? raw.totalHits
@@ -253,10 +274,12 @@ export default function AdminCheckManagementPage() {
     return () => unsubscribe();
   }, []);
 
+  // 【動的立数算出】登録参加選手数に基づき5人立での必要立数を自動計算
   const calculatedTotalStands = useMemo(() => {
     return calculateTotalStands(participants.length);
   }, [participants.length]);
 
+  // 既に割当済みの最大立番号も考慮した総立数（フェイルセーフ）
   const totalStands = useMemo(() => {
     let maxStand = 1;
     participants.forEach((p) => {
@@ -268,6 +291,7 @@ export default function AdminCheckManagementPage() {
     return Math.max(calculatedTotalStands, maxStand);
   }, [calculatedTotalStands, participants]);
 
+  // ゼッケン重複チェック
   const duplicateBibNumbers = useMemo(() => {
     const counts = new Map<number, number>();
     participants.forEach((p) => {
@@ -282,6 +306,7 @@ export default function AdminCheckManagementPage() {
     return duplicates;
   }, [participants]);
 
+  // 立順重複チェック（午前・午後）
   const {
     duplicateMorningPlayerIds,
     duplicateAfternoonPlayerIds,
@@ -345,6 +370,7 @@ export default function AdminCheckManagementPage() {
     };
   }, [participants]);
 
+  // サマリー集計
   const stats = useMemo(() => {
     const total = participants.length;
     const paidCount = participants.filter((p) => p.isPaid).length;
@@ -366,6 +392,7 @@ export default function AdminCheckManagementPage() {
     return { total, paidCount, qrSentCount, unassignedCount };
   }, [participants]);
 
+  // フィルタリング処理
   const filteredParticipants = useMemo(() => {
     return participants.filter((p) => {
       const matchesSearch =
@@ -406,6 +433,7 @@ export default function AdminCheckManagementPage() {
     });
   }, [participants, searchTerm, filterPaid, filterQr, filterStand]);
 
+  // 一括送信対象の判定（入金済、立順完全設定済、保存完了済み、未送信）
   const pendingQrParticipants = useMemo(() => {
     return participants.filter((p) => {
       const m = p.standAssignments[1];
@@ -428,6 +456,7 @@ export default function AdminCheckManagementPage() {
     });
   }, [participants, savedAssignmentsMap]);
 
+  // 入金承認トグル
   const handleTogglePayment = async (participant: Participant) => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -480,6 +509,7 @@ export default function AdminCheckManagementPage() {
     }
   };
 
+  // 立順変更入力ハンドラー
   const handleAssignmentChange = (
     id: string,
     period: 'morning' | 'afternoon',
@@ -521,6 +551,7 @@ export default function AdminCheckManagementPage() {
     );
   };
 
+  // 立順保存処理
   const handleSaveParticipantSettings = async (participant: Participant) => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -593,6 +624,7 @@ export default function AdminCheckManagementPage() {
     }
   };
 
+  // 個別QRコード送信処理
   const handleSendSingleQr = async (participant: Participant) => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -733,6 +765,7 @@ export default function AdminCheckManagementPage() {
     }
   };
 
+  // 一括QRコード送信処理
   const handleBatchSendQr = async () => {
     if (pendingQrParticipants.length === 0) return;
 
@@ -863,6 +896,7 @@ export default function AdminCheckManagementPage() {
 
   return (
     <main className="min-h-screen bg-[#F8FAFC] text-slate-900 p-4 sm:p-6 lg:p-8 space-y-6 w-full">
+      {/* ページヘッダー */}
       <div className="w-full flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white border border-slate-200/80 p-6 rounded-2xl shadow-sm">
         <div className="space-y-1">
           <div className="flex items-center gap-2">
@@ -877,7 +911,7 @@ export default function AdminCheckManagementPage() {
           <p className="text-xs text-slate-500 font-medium">
             登録選手（現在: <strong>{participants.length}名</strong>
             ）から必要立数（全 <strong>{totalStands}立</strong>
-            ）を動的に自動計算しています。
+            ）を動的に自動計算しています。午前・午後の立ち順を選択すると「保存」が有効化され、保存完了後に「メール送信」がアクティブになります。
           </p>
         </div>
 
@@ -914,10 +948,12 @@ export default function AdminCheckManagementPage() {
         </div>
       </div>
 
+      {/* サマリーステータスカード群 */}
       <div className="w-full grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-2xs space-y-1">
           <span className="text-xs font-bold text-slate-500 flex items-center gap-1.5">
             <Users className="w-4 h-4 text-slate-600" /> 総エントリー数
+            (動的編成)
           </span>
           <div className="text-2xl font-black text-slate-900 font-mono">
             {stats.total}{' '}
@@ -962,6 +998,7 @@ export default function AdminCheckManagementPage() {
         </div>
       </div>
 
+      {/* ステータスメッセージバナー */}
       {statusMessage && (
         <div className="w-full p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 text-xs font-bold flex items-center gap-2">
           <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
@@ -976,6 +1013,51 @@ export default function AdminCheckManagementPage() {
         </div>
       )}
 
+      {/* ゼッケン番号重複警告 */}
+      {duplicateBibNumbers.size > 0 && (
+        <div className="w-full p-4 bg-red-50 border border-red-200 rounded-xl text-red-900 text-xs flex items-start gap-2.5">
+          <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+          <div className="space-y-0.5">
+            <p className="font-bold text-red-800">
+              ゼッケン番号の重複を検知しました（重複番号:{' '}
+              {Array.from(duplicateBibNumbers).join(', ')}）
+            </p>
+            <p className="text-[11px] text-red-700">
+              同一のゼッケン番号を持つ選手は保存できません。それぞれ一意の番号に修正してください。
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* 立順重複警告 */}
+      {(duplicateMorningSlotLabels.length > 0 ||
+        duplicateAfternoonSlotLabels.length > 0) && (
+        <div className="w-full p-4 bg-red-50 border border-red-200 rounded-xl text-red-900 text-xs flex items-start gap-2.5">
+          <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+          <div className="space-y-1">
+            <p className="font-bold text-red-800">
+              立ち順（立番号・射位）の重複を検知しました
+            </p>
+            {duplicateMorningSlotLabels.length > 0 && (
+              <p className="text-[11px] text-red-700">
+                ・午前の部 重複枠:{' '}
+                <strong>{duplicateMorningSlotLabels.join(', ')}</strong>
+              </p>
+            )}
+            {duplicateAfternoonSlotLabels.length > 0 && (
+              <p className="text-[11px] text-red-700">
+                ・午後の部 重複枠:{' '}
+                <strong>{duplicateAfternoonSlotLabels.join(', ')}</strong>
+              </p>
+            )}
+            <p className="text-[10px] text-red-600 pt-0.5">
+              同一の立番号・射位に複数の選手を割り当てることはできません。修正するまで保存はブロックされます。
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* 検索・フィルターツールバー */}
       <div className="w-full flex flex-col md:flex-row md:items-center justify-between gap-3 bg-white p-4 rounded-2xl border border-slate-200/80 shadow-xs">
         <div className="relative flex-1 max-w-lg">
           <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -983,38 +1065,62 @@ export default function AdminCheckManagementPage() {
             type="text"
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            placeholder="選手名・ふりがな・ゼッケン・所属で検索..."
+            placeholder="選手名・ふりがな・ゼッケン・所属・担当者名・メールで検索..."
             className="w-full pl-9 pr-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-900 placeholder:text-slate-400 outline-none focus:bg-white focus:border-slate-900 font-medium transition-colors"
           />
         </div>
 
         <div className="flex flex-wrap items-center gap-2 text-xs">
-          <select
-            value={filterPaid}
-            onChange={(e) =>
-              setFilterPaid(e.target.value as 'ALL' | 'PAID' | 'UNPaid')
-            }
-            className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-slate-700 font-bold outline-none cursor-pointer"
-          >
-            <option value="ALL">入金: すべて</option>
-            <option value="PAID">入金承認済のみ</option>
-            <option value="UNPaid">未納のみ</option>
-          </select>
+          <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
+            <CreditCard className="w-3.5 h-3.5 text-slate-500" />
+            <select
+              value={filterPaid}
+              onChange={(e) =>
+                setFilterPaid(e.target.value as 'ALL' | 'PAID' | 'UNPaid')
+              }
+              className="bg-transparent text-slate-700 font-bold outline-none cursor-pointer"
+            >
+              <option value="ALL">入金: すべて</option>
+              <option value="PAID">入金承認済のみ</option>
+              <option value="UNPaid">未納のみ</option>
+            </select>
+          </div>
 
-          <select
-            value={filterQr}
-            onChange={(e) =>
-              setFilterQr(e.target.value as 'ALL' | 'SENT' | 'UNSENT')
-            }
-            className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-slate-700 font-bold outline-none cursor-pointer"
-          >
-            <option value="ALL">QR: すべて</option>
-            <option value="SENT">QR送信済</option>
-            <option value="UNSENT">QR未送信</option>
-          </select>
+          <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
+            <Mail className="w-3.5 h-3.5 text-slate-500" />
+            <select
+              value={filterQr}
+              onChange={(e) =>
+                setFilterQr(e.target.value as 'ALL' | 'SENT' | 'UNSENT')
+              }
+              className="bg-transparent text-slate-700 font-bold outline-none cursor-pointer"
+            >
+              <option value="ALL">QR: すべて</option>
+              <option value="SENT">QR送信済</option>
+              <option value="UNSENT">QR未送信</option>
+            </select>
+          </div>
+
+          <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
+            <Filter className="w-3.5 h-3.5 text-slate-500" />
+            <select
+              value={filterStand}
+              onChange={(e) =>
+                setFilterStand(
+                  e.target.value as 'ALL' | 'ASSIGNED' | 'UNASSIGNED',
+                )
+              }
+              className="bg-transparent text-slate-700 font-bold outline-none cursor-pointer"
+            >
+              <option value="ALL">立順: すべて</option>
+              <option value="ASSIGNED">割当完了</option>
+              <option value="UNASSIGNED">未割当あり</option>
+            </select>
+          </div>
         </div>
       </div>
 
+      {/* エントリー照会・設定テーブル */}
       <div className="w-full bg-white border border-slate-200/80 rounded-2xl overflow-hidden shadow-sm">
         <Table className="w-full text-xs">
           <TableHeader className="bg-slate-50/90 text-slate-700 border-b border-slate-200">
@@ -1032,7 +1138,7 @@ export default function AdminCheckManagementPage() {
                 参加費納付承認
               </TableHead>
               <TableHead className="font-bold text-slate-900">
-                立順設定
+                立順設定 (午前 / 午後連動 - 全{totalStands}立対応)
               </TableHead>
               <TableHead className="font-bold text-slate-900 text-center w-28">
                 立順保存
@@ -1058,6 +1164,14 @@ export default function AdminCheckManagementPage() {
                 const isSendingQr = processingQrId === p.id;
                 const isQrSent = p.qrSentStatus === 'SENT';
                 const isQrFailed = p.qrSentStatus === 'FAILED';
+                const isBibDuplicate = duplicateBibNumbers.has(p.bibNumber);
+
+                const isMorningDuplicate = duplicateMorningPlayerIds.has(p.id);
+                const isAfternoonDuplicate = duplicateAfternoonPlayerIds.has(
+                  p.id,
+                );
+                const isAssignmentDuplicate =
+                  isMorningDuplicate || isAfternoonDuplicate;
 
                 const morningAssign = p.standAssignments[1] || {
                   standGroup: null,
@@ -1068,28 +1182,52 @@ export default function AdminCheckManagementPage() {
                   standOrder: null,
                 };
 
-                const isFullySelected =
+                const isMorningComplete =
                   morningAssign.standGroup !== null &&
-                  morningAssign.standOrder !== null &&
+                  morningAssign.standOrder !== null;
+                const isAfternoonComplete =
                   afternoonAssign.standGroup !== null &&
                   afternoonAssign.standOrder !== null;
+                const isFullySelected =
+                  isMorningComplete && isAfternoonComplete;
 
                 const currentKey = createAssignmentKey(p.standAssignments);
                 const savedKey = savedAssignmentsMap[p.id] || '';
                 const isDirty = currentKey !== savedKey;
                 const isSavedInDb = isFullySelected && !isDirty;
-                const canSave = isFullySelected && isDirty;
-                const canSendEmail = p.isPaid && isSavedInDb;
+
+                const canSave =
+                  isFullySelected &&
+                  isDirty &&
+                  !isBibDuplicate &&
+                  !isAssignmentDuplicate;
+
+                const canSendEmail =
+                  p.isPaid &&
+                  isSavedInDb &&
+                  !isBibDuplicate &&
+                  !isAssignmentDuplicate;
 
                 return (
                   <TableRow
                     key={p.id}
-                    className="hover:bg-slate-50/70 transition-colors"
+                    className={`hover:bg-slate-50/70 transition-colors ${
+                      isBibDuplicate || isAssignmentDuplicate
+                        ? 'bg-red-50/20'
+                        : ''
+                    }`}
                   >
+                    {/* ゼッケン番号 */}
                     <TableCell className="font-mono font-black text-sm text-slate-900 align-top pt-4">
                       No.{p.bibNumber}
+                      {isBibDuplicate && (
+                        <span className="text-[9px] font-bold text-red-600 block mt-0.5">
+                          重複
+                        </span>
+                      )}
                     </TableCell>
 
+                    {/* 選手情報 */}
                     <TableCell className="align-top pt-4">
                       <div className="font-bold text-slate-900 text-sm">
                         {p.name}
@@ -1103,18 +1241,30 @@ export default function AdminCheckManagementPage() {
                       <div className="text-[10px] text-slate-500 mt-0.5">
                         {p.shosa} ・ {p.rankTitle}
                       </div>
+                      {p.needsSupport && (
+                        <span className="inline-block mt-1 text-[9px] bg-amber-50 text-amber-800 border border-amber-200 px-1.5 py-0.2 rounded font-bold">
+                          所作サポート希望
+                        </span>
+                      )}
                     </TableCell>
 
+                    {/* 申込担当者情報 */}
                     <TableCell className="align-top pt-4 max-w-[200px]">
                       <div className="font-bold text-slate-800 text-xs">
                         {p.representativeName || '未登録'} 様
                       </div>
-                      <div className="text-[11px] text-slate-500 font-mono flex items-center gap-1 mt-1 truncate">
+                      <div className="text-[11px] text-slate-500 font-mono flex items-center gap-1 mt-1">
                         <Mail className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                        <span>{p.representativeEmail || '未登録'}</span>
+                        <span
+                          className="truncate"
+                          title={p.representativeEmail}
+                        >
+                          {p.representativeEmail || '未登録'}
+                        </span>
                       </div>
                     </TableCell>
 
+                    {/* 入金承認 */}
                     <TableCell className="text-center align-top pt-4">
                       <button
                         type="button"
@@ -1125,6 +1275,7 @@ export default function AdminCheckManagementPage() {
                             ? 'bg-emerald-50 text-emerald-800 border-emerald-300 hover:bg-emerald-100'
                             : 'bg-amber-50 text-amber-900 border-amber-300 hover:bg-amber-100'
                         }`}
+                        title="クリックして入金承認状態を切り替え"
                       >
                         {p.isPaid ? (
                           <>
@@ -1138,156 +1289,331 @@ export default function AdminCheckManagementPage() {
                           </>
                         )}
                       </button>
+                      {p.isPaid && p.paidAt && (
+                        <div className="text-[9px] text-slate-400 mt-1 font-mono">
+                          {new Date(p.paidAt).toLocaleDateString('ja-JP')}{' '}
+                          納付済
+                        </div>
+                      )}
                     </TableCell>
 
+                    {/* 立順入力フォーム（何立でも無制限に入力・編成可能） */}
                     <TableCell className="align-top pt-3">
                       <div className="space-y-2">
-                        <div className="flex items-center gap-2 p-2 rounded-lg border bg-slate-50 border-slate-200">
+                        {/* 午前 */}
+                        <div
+                          className={`flex items-center gap-2 p-2 rounded-lg border transition-colors ${
+                            isMorningDuplicate
+                              ? 'bg-red-50/90 border-red-300 text-red-950'
+                              : 'bg-slate-50 border-slate-200'
+                          }`}
+                        >
                           <span className="text-[10px] font-bold text-slate-700 w-12 flex items-center gap-0.5">
                             <Sun className="w-3 h-3 text-amber-500" /> 午前
                           </span>
-                          <input
-                            type="number"
-                            min={1}
-                            placeholder="立"
-                            value={morningAssign.standGroup ?? ''}
-                            onChange={(e) =>
-                              handleAssignmentChange(
-                                p.id,
-                                'morning',
-                                'standGroup',
-                                e.target.value.trim() === ''
-                                  ? null
-                                  : Number(e.target.value),
-                              )
-                            }
-                            className="w-14 p-1 text-center rounded text-xs font-bold font-mono outline-none bg-white border border-slate-300"
-                          />
-                          <select
-                            value={morningAssign.standOrder ?? ''}
-                            onChange={(e) =>
-                              handleAssignmentChange(
-                                p.id,
-                                'morning',
-                                'standOrder',
-                                e.target.value === ''
-                                  ? null
-                                  : (Number(e.target.value) as StandOrderIndex),
-                              )
-                            }
-                            className="p-1 rounded text-xs font-bold outline-none bg-white border border-slate-300"
-                          >
-                            <option value="">未設定</option>
-                            <option value={1}>1番 (大前)</option>
-                            <option value={2}>2番 (二的)</option>
-                            <option value={3}>3番 (中)</option>
-                            <option value={4}>4番 (落前)</option>
-                            <option value={5}>5番 (落)</option>
-                          </select>
+                          <div className="flex items-center gap-1">
+                            <span className="text-[10px] text-slate-500">
+                              立:
+                            </span>
+                            <input
+                              type="number"
+                              min={1}
+                              placeholder="立"
+                              value={morningAssign.standGroup ?? ''}
+                              onChange={(e) => {
+                                const val =
+                                  e.target.value.trim() === ''
+                                    ? null
+                                    : Math.max(1, Number(e.target.value));
+                                handleAssignmentChange(
+                                  p.id,
+                                  'morning',
+                                  'standGroup',
+                                  val,
+                                );
+                              }}
+                              className={`w-14 p-1 text-center rounded text-xs font-bold font-mono outline-none ${
+                                isMorningDuplicate
+                                  ? 'bg-white border border-red-300 text-red-900 focus:border-red-500'
+                                  : 'bg-white border border-slate-300 text-slate-900 focus:border-slate-900'
+                              }`}
+                            />
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <span className="text-[10px] text-slate-500">
+                              立順:
+                            </span>
+                            <select
+                              value={morningAssign.standOrder ?? ''}
+                              onChange={(e) => {
+                                const val =
+                                  e.target.value === ''
+                                    ? null
+                                    : (Number(
+                                        e.target.value,
+                                      ) as StandOrderIndex);
+                                handleAssignmentChange(
+                                  p.id,
+                                  'morning',
+                                  'standOrder',
+                                  val,
+                                );
+                              }}
+                              className={`p-1 rounded text-xs font-bold outline-none ${
+                                isMorningDuplicate
+                                  ? 'bg-white border border-red-300 text-red-900 focus:border-red-500'
+                                  : 'bg-white border border-slate-300 text-slate-900 focus:border-slate-900'
+                              }`}
+                            >
+                              <option value="">未設定</option>
+                              <option value={1}>1番 (大前)</option>
+                              <option value={2}>2番 (二的)</option>
+                              <option value={3}>3番 (中)</option>
+                              <option value={4}>4番 (落前)</option>
+                              <option value={5}>5番 (落)</option>
+                            </select>
+                          </div>
+                          {isMorningDuplicate && (
+                            <span className="text-[9px] font-bold text-red-600 shrink-0 ml-auto flex items-center gap-0.5">
+                              <AlertTriangle className="w-2.5 h-2.5" /> 重複
+                            </span>
+                          )}
                         </div>
 
-                        <div className="flex items-center gap-2 p-2 rounded-lg border bg-amber-50/60 border-amber-200">
+                        {/* 午後 */}
+                        <div
+                          className={`flex items-center gap-2 p-2 rounded-lg border transition-colors ${
+                            isAfternoonDuplicate
+                              ? 'bg-red-50/90 border-red-300 text-red-950'
+                              : 'bg-amber-50/60 border-amber-200'
+                          }`}
+                        >
                           <span className="text-[10px] font-bold text-amber-900 w-12 flex items-center gap-0.5">
                             <Moon className="w-3 h-3 text-slate-700" /> 午後
                           </span>
-                          <input
-                            type="number"
-                            min={1}
-                            placeholder="立"
-                            value={afternoonAssign.standGroup ?? ''}
-                            onChange={(e) =>
-                              handleAssignmentChange(
-                                p.id,
-                                'afternoon',
-                                'standGroup',
-                                e.target.value.trim() === ''
-                                  ? null
-                                  : Number(e.target.value),
-                              )
-                            }
-                            className="w-14 p-1 text-center rounded text-xs font-bold font-mono outline-none bg-white border border-amber-300"
-                          />
-                          <select
-                            value={afternoonAssign.standOrder ?? ''}
-                            onChange={(e) =>
-                              handleAssignmentChange(
-                                p.id,
-                                'afternoon',
-                                'standOrder',
-                                e.target.value === ''
-                                  ? null
-                                  : (Number(e.target.value) as StandOrderIndex),
-                              )
-                            }
-                            className="p-1 rounded text-xs font-bold outline-none bg-white border border-amber-300"
-                          >
-                            <option value="">未設定</option>
-                            <option value={1}>1番 (大前)</option>
-                            <option value={2}>2番 (二的)</option>
-                            <option value={3}>3番 (中)</option>
-                            <option value={4}>4番 (落前)</option>
-                            <option value={5}>5番 (落)</option>
-                          </select>
+                          <div className="flex items-center gap-1">
+                            <span className="text-[10px] text-amber-800">
+                              立:
+                            </span>
+                            <input
+                              type="number"
+                              min={1}
+                              placeholder="立"
+                              value={afternoonAssign.standGroup ?? ''}
+                              onChange={(e) => {
+                                const val =
+                                  e.target.value.trim() === ''
+                                    ? null
+                                    : Math.max(1, Number(e.target.value));
+                                handleAssignmentChange(
+                                  p.id,
+                                  'afternoon',
+                                  'standGroup',
+                                  val,
+                                );
+                              }}
+                              className={`w-14 p-1 text-center rounded text-xs font-bold font-mono outline-none ${
+                                isAfternoonDuplicate
+                                  ? 'bg-white border border-red-300 text-red-900 focus:border-red-500'
+                                  : 'bg-white border border-amber-300 text-slate-900 focus:border-amber-600'
+                              }`}
+                            />
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <span className="text-[10px] text-amber-800">
+                              立順:
+                            </span>
+                            <select
+                              value={afternoonAssign.standOrder ?? ''}
+                              onChange={(e) => {
+                                const val =
+                                  e.target.value === ''
+                                    ? null
+                                    : (Number(
+                                        e.target.value,
+                                      ) as StandOrderIndex);
+                                handleAssignmentChange(
+                                  p.id,
+                                  'afternoon',
+                                  'standOrder',
+                                  val,
+                                );
+                              }}
+                              className={`p-1 rounded text-xs font-bold outline-none ${
+                                isAfternoonDuplicate
+                                  ? 'bg-white border border-red-300 text-red-900 focus:border-red-500'
+                                  : 'bg-white border border-amber-300 text-slate-900 focus:border-amber-600'
+                              }`}
+                            >
+                              <option value="">未設定</option>
+                              <option value={1}>1番 (大前)</option>
+                              <option value={2}>2番 (二的)</option>
+                              <option value={3}>3番 (中)</option>
+                              <option value={4}>4番 (落前)</option>
+                              <option value={5}>5番 (落)</option>
+                            </select>
+                          </div>
+                          {isAfternoonDuplicate && (
+                            <span className="text-[9px] font-bold text-red-600 shrink-0 ml-auto flex items-center gap-0.5">
+                              <AlertTriangle className="w-2.5 h-2.5" /> 重複
+                            </span>
+                          )}
                         </div>
                       </div>
                     </TableCell>
 
+                    {/* 立順保存ボタン */}
                     <TableCell className="text-center align-top pt-4">
-                      <Button
-                        type="button"
-                        size="sm"
-                        disabled={isSaving || !canSave}
-                        onClick={() => handleSaveParticipantSettings(p)}
-                        className={`h-8 px-3 font-bold text-xs rounded-xl shadow-2xs transition-all flex items-center gap-1 ${
-                          canSave
-                            ? 'bg-emerald-600 hover:bg-emerald-500 text-white animate-pulse'
-                            : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-default shadow-none'
-                        }`}
-                      >
-                        {isSaving ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : isSavedInDb ? (
-                          <>
-                            <Check className="w-3.5 h-3.5 text-emerald-600" />
-                            保存済
-                          </>
-                        ) : (
-                          <>
-                            <Save className="w-3.5 h-3.5" />
-                            保存
-                          </>
+                      <div className="flex flex-col items-center gap-1">
+                        <Button
+                          type="button"
+                          size="sm"
+                          disabled={isSaving || !canSave}
+                          onClick={() => handleSaveParticipantSettings(p)}
+                          className={`h-8 px-3 font-bold text-xs rounded-xl shadow-2xs transition-all flex items-center gap-1 ${
+                            canSave
+                              ? 'bg-emerald-600 hover:bg-emerald-500 text-white animate-pulse'
+                              : isSavedInDb
+                                ? 'bg-slate-100 text-slate-400 border border-slate-200 cursor-default shadow-none'
+                                : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed shadow-none'
+                          }`}
+                          title={
+                            !isFullySelected
+                              ? '午前・午後の立番号と立順をすべて選択してください'
+                              : !isDirty
+                                ? '変更はありません（保存完了済み）'
+                                : isAssignmentDuplicate
+                                  ? '立順が重複しているため保存できません'
+                                  : '立ち順をFirestoreに確定保存します'
+                          }
+                        >
+                          {isSaving ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : isSavedInDb ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-600" />
+                              保存済
+                            </>
+                          ) : (
+                            <>
+                              <Save className="w-3.5 h-3.5" />
+                              保存
+                            </>
+                          )}
+                        </Button>
+
+                        {isFullySelected && isDirty && (
+                          <span className="text-[9px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.2 rounded">
+                            未保存の変更あり
+                          </span>
                         )}
-                      </Button>
+                        {!isFullySelected && (
+                          <span className="text-[9px] font-medium text-slate-400">
+                            未選択あり
+                          </span>
+                        )}
+                      </div>
                     </TableCell>
 
+                    {/* メール送信ボタン */}
                     <TableCell className="text-center align-top pt-4">
-                      <Button
-                        type="button"
-                        size="sm"
-                        disabled={isSendingQr || !canSendEmail}
-                        onClick={() => handleSendSingleQr(p)}
-                        className={`h-8 px-3 rounded-xl text-xs font-bold transition-all shadow-2xs active:scale-95 flex items-center gap-1 ${
-                          canSendEmail
-                            ? isQrSent
-                              ? 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-50'
-                              : 'bg-slate-900 hover:bg-slate-800 text-white'
-                            : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed shadow-none'
-                        }`}
-                      >
-                        {isSendingQr ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : isQrSent ? (
-                          <>
-                            <RefreshCw className="w-3.5 h-3.5 text-slate-500" />
-                            再送信
-                          </>
-                        ) : (
-                          <>
-                            <QrCode className="w-3.5 h-3.5 text-amber-400" />
-                            メール送信
-                          </>
+                      <div className="flex flex-col items-center gap-1.5">
+                        <Button
+                          type="button"
+                          size="sm"
+                          disabled={isSendingQr || !canSendEmail}
+                          onClick={() => handleSendSingleQr(p)}
+                          className={`h-8 px-3 rounded-xl text-xs font-bold transition-all shadow-2xs active:scale-95 flex items-center gap-1 ${
+                            canSendEmail
+                              ? isQrSent
+                                ? 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-50'
+                                : 'bg-slate-900 hover:bg-slate-800 text-white'
+                              : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed shadow-none'
+                          }`}
+                          title={
+                            !p.isPaid
+                              ? '参加費の入金承認が必要です'
+                              : !isFullySelected
+                                ? '午前・午後の立ち順設定が必要です'
+                                : isDirty
+                                  ? '立順の変更が保存されていません。先に「保存」を押してください'
+                                  : '選手情報一体型QRカードを添付して案内メールを送信'
+                          }
+                        >
+                          {isSendingQr ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : isQrSent ? (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5 text-slate-500" />
+                              再送信
+                            </>
+                          ) : (
+                            <>
+                              <QrCode
+                                className={`w-3.5 h-3.5 ${
+                                  canSendEmail
+                                    ? 'text-amber-400'
+                                    : 'text-slate-400'
+                                }`}
+                              />
+                              メール送信
+                            </>
+                          )}
+                        </Button>
+
+                        {!canSendEmail && (
+                          <div className="flex flex-col items-center gap-0.5">
+                            {!p.isPaid && (
+                              <span className="text-[9px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.2 rounded">
+                                要 入金承認
+                              </span>
+                            )}
+                            {!isFullySelected && (
+                              <span className="text-[9px] font-bold text-rose-700 bg-rose-50 border border-rose-200 px-1.5 py-0.2 rounded">
+                                要 立順設定
+                              </span>
+                            )}
+                            {isFullySelected && isDirty && (
+                              <span className="text-[9px] font-bold text-amber-700 bg-amber-50 border border-amber-300 px-1.5 py-0.2 rounded animate-pulse">
+                                要 先に立順保存
+                              </span>
+                            )}
+                          </div>
                         )}
-                      </Button>
+
+                        {isQrSent && (
+                          <span className="text-[10px] font-bold text-emerald-700 flex items-center gap-0.5">
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                            送信済 (
+                            {p.qrSentAt
+                              ? new Date(p.qrSentAt).toLocaleTimeString(
+                                  'ja-JP',
+                                  {
+                                    hour: '2-digit',
+                                    minute: '2-digit',
+                                  },
+                                )
+                              : '完了'}
+                            )
+                          </span>
+                        )}
+
+                        {isQrFailed && (
+                          <span
+                            className="text-[10px] font-bold text-red-600 flex items-center gap-0.5"
+                            title={p.qrSentError || ''}
+                          >
+                            <AlertCircle className="w-3.5 h-3.5 text-red-600" />
+                            送信失敗
+                          </span>
+                        )}
+
+                        {!isQrSent && !isQrFailed && canSendEmail && (
+                          <span className="text-[10px] text-slate-500 flex items-center gap-0.5">
+                            <Clock className="w-2.5 h-2.5" /> 送信準備完了
+                          </span>
+                        )}
+                      </div>
                     </TableCell>
                   </TableRow>
                 );

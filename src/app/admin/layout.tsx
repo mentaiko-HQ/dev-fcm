@@ -11,6 +11,7 @@
  * - 認証検証中（session.isLoading）は全画面スピナーを表示し、非認証状態での画面チラつき・不正アクセスを防止。
  * - 未認証状態ではレンダリングを遮断（return null）。
  * - /admin/login 自身は除外（isLoginPage判定）し、リダイレクト無限ループを防止。
+ * - 初期値に isAdmin: false を安全側デフォルトとして明示的に指定。
  *
  * フェイルセーフ設計（障害時の安全縮退）:
  * - 認証監視例外発生時も安全側に倒してログイン画面へ誘導。
@@ -32,8 +33,10 @@ export default function AdminLayout({
   const router = useRouter();
   const pathname = usePathname();
 
+  // フールプルーフ: 初期状態は未認証・非管理者として安全側に設定
   const [session, setSession] = useState<SessionStatus>({
     isAuthenticated: false,
+    isAdmin: false,
     uid: null,
     email: null,
     isLoading: true,
@@ -46,8 +49,12 @@ export default function AdminLayout({
     const unsubscribe = subscribeAdminSession((status) => {
       setSession(status);
 
-      // フールプルーフ: ログインページ以外で未認証が確定した時点で即時リダイレクト
-      if (!status.isLoading && !status.isAuthenticated && !isLoginPage) {
+      // フールプルーフ: ログインページ以外で未認証または非管理者が確定した時点で即時リダイレクト
+      if (
+        !status.isLoading &&
+        (!status.isAuthenticated || !status.isAdmin) &&
+        !isLoginPage
+      ) {
         router.replace('/admin/login');
       }
     });
@@ -72,8 +79,8 @@ export default function AdminLayout({
     );
   }
 
-  // 未認証状態（リダイレクト完了までの安全側遮断）
-  if (!session.isAuthenticated) {
+  // 未認証または非管理者状態（リダイレクト完了までの安全側遮断）
+  if (!session.isAuthenticated || !session.isAdmin) {
     return null;
   }
 

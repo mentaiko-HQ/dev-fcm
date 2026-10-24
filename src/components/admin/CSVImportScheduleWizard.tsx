@@ -10,6 +10,7 @@
  * - サンプルCSVにおいて、G列「所作（肌脱ぎ/襷掛け）」とH列「称号・段位（段位は三段以下/段位は四段以上/称号を取得している）」の
  *   全選択肢組み合わせ（2×3=6行）を提示し、表記揺れによるインポートエラーを未然に防止。
  * - sanitizeShosaType, sanitizeRankTitleType, sanitizeStaffDutyShift による厳格な入力値バリデーション。
+ * - 役員担当時間帯の表記揺れ（AM/PM/午前/午後/午前のみ/午後のみ）を '午前のみ' | '午後のみ' | '終日' | '無し' へ正規化。
  * - CSVヘッダー行および列数の妥当性チェック。
  * - 処理実行中の二重送信防止（isProcessing によるボタン非活性化とスピナー表示）。
  *
@@ -80,11 +81,18 @@ export function CSVImportScheduleWizard({
 
   /**
    * 【フールプルーフ】役員担当時間帯の文字列を正しい型（StaffDutyShiftType）に安全に変換
+   * 表記揺れ（AM, PM, 午前, 午後, 午前のみ, 午後のみ）を吸収し、定義された型に安全にマッピング
    */
   const sanitizeStaffDutyShift = (val: string): StaffDutyShiftType => {
-    const validShifts: StaffDutyShiftType[] = ['AM', 'PM', '終日', '無し'];
-    if (validShifts.includes(val as StaffDutyShiftType)) {
-      return val as StaffDutyShiftType;
+    const trimmed = val.trim();
+    if (trimmed === 'AM' || trimmed === '午前' || trimmed === '午前のみ') {
+      return '午前のみ';
+    }
+    if (trimmed === 'PM' || trimmed === '午後' || trimmed === '午後のみ') {
+      return '午後のみ';
+    }
+    if (trimmed === '終日') {
+      return '終日';
     }
     return '無し';
   };
@@ -128,7 +136,7 @@ export function CSVImportScheduleWizard({
         '090-0000-0001',
         'yamada@example.com',
         '進行',
-        'AM',
+        '午前のみ',
         '希望あり',
         '不要',
         '特記事項なし',
@@ -146,7 +154,7 @@ export function CSVImportScheduleWizard({
         '090-0000-0001',
         'yamada@example.com',
         '的前',
-        'PM',
+        '午後のみ',
         '希望あり',
         '不要',
         '',
@@ -182,7 +190,7 @@ export function CSVImportScheduleWizard({
         '090-0000-0003',
         'tanaka@example.com',
         '招集',
-        'AM',
+        '午前のみ',
         '希望あり',
         '不要',
         '',
@@ -200,7 +208,7 @@ export function CSVImportScheduleWizard({
         '090-0000-0003',
         'tanaka@example.com',
         '運営',
-        'PM',
+        '午後のみ',
         '希望あり',
         '要サポート',
         '介添え希望',
@@ -334,6 +342,9 @@ export function CSVImportScheduleWizard({
             stand1_arrows: [],
             stand2_arrows: [],
             stand3_arrows: [],
+            isHayaHit: false,
+            isSokuchu: false,
+            isPerfect: false,
             updatedAt: Date.now(),
           });
         }

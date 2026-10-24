@@ -8,12 +8,27 @@
  *
  * フールプルーフ設計:
  * - 射位インデックス（1〜5）、立インデックス（1〜3）をUnion型で制約。
+ * - 競技形態、射数形式、競射形式をリテラルユニオン型で厳格に定義。
  * - 立番号・組番号・ステータス等に対するサニタイズ関数により不正値を安全値へ強制補正。
+ * - 旧仕様の型参照との互換性を担保する型エイリアスを提供。
  *
  * フェイルセーフ設計:
  * - STAND_CONFIGS, TOTAL_TOURNAMENT_SHOTS 等の競技ルールを不変定数としてエクスポート。
  * - standGroup, standOrder が null の場合でも画面クラッシュを回避する null 許容構造。
  */
+
+// ==========================================
+// 試合形式・競技設定型定義
+// ==========================================
+
+// 競技形態区分（個人戦 / 団体戦 / 個人・団体複合）
+export type MatchType = 'INDIVIDUAL' | 'TEAM' | 'HYBRID';
+
+// 行射射数フォーマット（一手: 2射 / 四矢: 4射）
+export type ArrowCountFormat = '一手' | '四矢';
+
+// 同中発生時の競射形式（射詰 / 遠近 / 競射なし）
+export type TieBreakerFormat = '射詰' | '遠近' | 'なし';
 
 // 的中結果区分（O: 的中 〇, X: はずれ ✕）
 export type HitResult = 'O' | 'X';
@@ -66,6 +81,18 @@ export type QrDeliveryStatus = 'UNSENT' | 'SENT' | 'FAILED';
 
 // 矢の的中判定（true: 的中 〇, false: はずれ ✕, null: 未入力）
 export type ArrowHit = boolean | null;
+
+// ==========================================
+// 後方互換用型エイリアス
+// ==========================================
+
+export type StandOrderType = StandOrderIndex;
+export type ArrowCountType = ArrowCountFormat;
+export type CompetitionCategory = '個人' | '団体';
+export type ArrowRule = ArrowCountFormat;
+export type TieBreakerMethod = TieBreakerFormat;
+export type TieBreakerRule = TieBreakerFormat;
+export type MatchStatus = string;
 
 // 立順割当情報（standGroup は立番号を保持）
 export interface StandAssignment {
@@ -127,7 +154,7 @@ export const STAND_CONFIGS: Record<StandRoundIndex, StandConfig> = {
 // 主要データモデル定義
 // ==========================================
 
-// 大会設定データモデル（エントリー期間等の設定拡張版）
+// 大会設定データモデル（ウィザード設定・エントリー制御拡張版）
 export interface TournamentConfig {
   matchId: string; // 大会識別子
   title: string; // 大会名称
@@ -136,7 +163,7 @@ export interface TournamentConfig {
   totalStandGroups?: number; // 設定上の総組数（動的算出により省略可）
   totalStands?: number; // 設定上の総立数
   totalArrows?: number; // 総射数
-  tieBreakerFormat?: string; // 競射形式 (射詰など)
+  tieBreakerFormat?: TieBreakerFormat | string; // 競射形式 (射詰など)
   status?: string; // 進行ステータス
   currentStandGroup?: number; // 現在進行中の組
   currentStandNumber?: number; // 現在進行中の立
@@ -145,6 +172,40 @@ export interface TournamentConfig {
   entryStartDate?: string; // エントリー受付開始日時 (ISO文字列)
   entryEndDate?: string; // エントリー受付終了日時 (ISO文字列)
   isEntryEnabled?: boolean; // エントリー受付有効フラグ
+  targetCount?: number; // 射場規模 (的数)
+  matchType?: MatchType; // 競技形態 (個人/団体/複合)
+  playersPerTeam?: number; // 1チームあたりの人数
+  preliminaryArrowCount?: ArrowCountFormat; // 予選1立あたりの射数
+  preliminaryStands?: number; // 予選総立数
+  finalArrowCount?: ArrowCountFormat; // 決勝1立あたりの射数
+  finalStands?: number; // 決勝総立数
+  maxStandNumber?: number; // 最大立数
+  updatedAt?: unknown; // 最終更新日時
+}
+
+export type Match = TournamentConfig;
+
+// 大会要項設定データモデル（/guidelines 制御用）
+export interface TournamentGuidelines {
+  matchId: string;
+  title: string;
+  dateText: string;
+  venueText: string;
+  organizerText: string;
+  competitionRulesText: string;
+  eligibilityText: string;
+  entryFeeText: string;
+  notesText: string;
+  entryStartDate: string;
+  entryEndDate: string;
+  isEntryEnabled: boolean;
+  totalStands: number;
+  totalArrows: number;
+  tieBreakerFormat: TieBreakerFormat | string;
+  status: string;
+  currentStandGroup: number;
+  maxStandGroup: number;
+  updatedAt?: unknown;
 }
 
 // ==========================================
@@ -239,6 +300,52 @@ export interface AppUser {
   updatedAt: number; // 更新日時
 }
 
+// ==========================================
+// スコア記録・集計関連データモデル
+// ==========================================
+
+export interface ScoreHistoryItem {
+  round: StandRoundIndex;
+  shotNumber: number;
+  hit: boolean;
+  timestamp: number;
+}
+
+export interface ScoreRecord {
+  participantId: string;
+  round: StandRoundIndex;
+  arrows: ArrowHit[];
+  totalHits: number;
+  updatedAt: number;
+}
+
+export interface TieBreakerRecord {
+  participantId: string;
+  type: 'IZUME' | 'ENKIN';
+  hits: boolean[];
+  rank: number | null;
+}
+
+export interface PlayerScore {
+  participantId: string;
+  stand1_hits: number;
+  stand2_hits: number;
+  stand3_hits: number;
+  totalHits: number;
+}
+
+export interface StandMatchScore {
+  standGroup: number;
+  round: StandRoundIndex;
+  scores: Record<string, ArrowHit[]>;
+}
+
+export interface MatchProgress {
+  currentStandGroup: number;
+  currentRound: StandRoundIndex;
+  status: ProgressStatus;
+}
+
 // 競射（タイブレーク）データモデル
 export interface TieBreakerState {
   type: 'IZUME' | 'ENKIN'; // 射詰（優勝決定）または 遠近（順位決定）
@@ -303,6 +410,15 @@ export function isHitResult(val: unknown): val is HitResult {
   return val === 'O' || val === 'X';
 }
 
+export function isStandRoundIndex(val: unknown): val is StandRoundIndex {
+  return val === 1 || val === 2 || val === 3;
+}
+
+export function sanitizeStandRoundIndex(val: unknown): StandRoundIndex {
+  if (val === 1 || val === 2 || val === 3) return val;
+  return 1;
+}
+
 export function sanitizeStandGroup(val: unknown): number | null {
   if (typeof val === 'number' && !isNaN(val) && val > 0) {
     return Math.floor(val);
@@ -329,9 +445,21 @@ export function sanitizeStandOrder(val: unknown): StandOrderIndex | null {
   return null;
 }
 
+export function isShosaType(val: unknown): val is ShosaType {
+  return val === '肌脱ぎ' || val === '襷掛け';
+}
+
 export function sanitizeShosaType(val: unknown): ShosaType {
   if (val === '襷掛け') return '襷掛け';
   return '肌脱ぎ';
+}
+
+export function isRankTitleType(val: unknown): val is RankTitleType {
+  return (
+    val === '称号を取得している' ||
+    val === '段位は四段以上' ||
+    val === '段位は三段以下'
+  );
 }
 
 export function sanitizeRankTitleType(val: unknown): RankTitleType {
@@ -357,11 +485,26 @@ export function sanitizeStaffRole(val: unknown): StaffRoleType {
   return '無し';
 }
 
+export function isCheckInStatus(val: unknown): val is CheckInStatus {
+  return val === 'CHECKED_IN' || val === 'ABSENT' || val === 'UNCHECKED';
+}
+
 export function sanitizeCheckInStatus(val: unknown): CheckInStatus {
   if (val === 'CHECKED_IN' || val === 'ABSENT' || val === 'UNCHECKED') {
     return val as CheckInStatus;
   }
   return 'UNCHECKED';
+}
+
+export function isProgressStatus(val: unknown): val is ProgressStatus {
+  return (
+    val === 'WAITING' ||
+    val === 'CALLED' ||
+    val === 'IN_STAND' ||
+    val === 'SHOOTING' ||
+    val === 'FINISHED' ||
+    val === 'COMPLETED'
+  );
 }
 
 export function sanitizeProgressStatus(val: unknown): ProgressStatus {
@@ -380,6 +523,12 @@ export function sanitizeProgressStatus(val: unknown): ProgressStatus {
     return val as ProgressStatus;
   }
   return 'WAITING';
+}
+
+export function isQualificationStatus(
+  val: unknown,
+): val is QualificationStatus {
+  return val === 'ACTIVE' || val === 'WITHDRAWN' || val === 'DISQUALIFIED';
 }
 
 export function sanitizeQualificationStatus(val: unknown): QualificationStatus {
