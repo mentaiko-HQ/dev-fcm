@@ -215,6 +215,7 @@ export default function AdminCheckManagementPage() {
               ? raw.stand3_arrows
               : [],
             isHayaHit: Boolean(raw.isHayaHit),
+            isSokuchu: Boolean(raw.isSokuchu),
             totalHits:
               typeof raw.totalHits === 'number'
                 ? raw.totalHits

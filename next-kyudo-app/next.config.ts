@@ -2,28 +2,24 @@
  * 【Next.js アプリケーション構成設定ファイル】
  *
  * 役割:
- * - Next.js (App Router) および Turbopack のビルド・実行動作の制御。
- * - プロジェクトルートの明示的固定による外部ロックファイル誤検知警告の防止。
- * - セキュリティヘッダーおよび画像ドメインの保護。
+ * - Next.js 15 (App Router) のビルド・実行動作の制御。
+ * - セキュリティヘッダーの付与によるクリックジャッキング・MIMEスニッフィング防御。
+ * - React Strict Mode による非推奨API・副作用の検知。
  *
  * フールプルーフ設計（操作ミス・環境差異の入口遮断）:
- * - `turbopack.root` にプロジェクトルート（`__dirname`）を明示指定し、
- *   ホームディレクトリ等に存在する意図しない package-lock.json の探索を遮断。
- * - TypeScript の型定義（NextConfig）に準拠し、未定義オプションをコンパイル時に検知。
+ * - Next.js 15 のスキーマに存在しないルート直下の `turbopack` キーを排除し、ビルド警告を未然に防止。
+ * - TypeScript の型定義（NextConfig）に準拠した厳格なプロパティ構成。
  *
  * フェイルセーフ設計（障害時の安全縮退）:
- * - 本番ビルド時のソースマップ生成制御および安全なエラーハンドリング。
+ * - `X-Frame-Options` を `SAMEORIGIN` に設定し、外部からの不正フレーム埋め込みを防ぎつつ、
+ *   同一ドメイン内での印刷プレビュー・帳票表示の描画ブロックを回避。
+ * - `X-Content-Type-Options: nosniff` によりブラウザによるMIMEタイプの誤認実行を防止。
+ * - `Referrer-Policy: strict-origin-when-cross-origin` により外部送信時の機密URL漏洩を抑止。
  */
 
 import type { NextConfig } from 'next';
-import path from 'path';
 
 const nextConfig: NextConfig = {
-  // Turbopack のプロジェクトルートを明示的に本ディレクトリへ固定
-  turbopack: {
-    root: path.resolve(__dirname),
-  },
-
   // React Strict Mode の有効化（フールプルーフ: 副作用や非推奨APIの早期検知）
   reactStrictMode: true,
 
@@ -35,7 +31,7 @@ const nextConfig: NextConfig = {
         headers: [
           {
             key: 'X-Frame-Options',
-            value: 'DENY',
+            value: 'SAMEORIGIN',
           },
           {
             key: 'X-Content-Type-Options',

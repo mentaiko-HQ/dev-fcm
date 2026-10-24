@@ -3,8 +3,13 @@
  * / パスに対応するページコンポーネント。
  * 組番号・立順の未設定（null）データに対応。
  *
- * 【フールプルーフ】バリデーションにより不適切なデータの混入を防止。
- * 【フェイルセーフ】データベース接続エラーや立ち順未設定時にもアプリがクラッシュしない安全なフォールバック設計。
+ * 【フールプルーフ】
+ * - TournamentConfig の必須プロパティ（date, venue）を完全網羅し型エラーを防止。
+ * - Participant の必須プロパティ（isSokuchu 等）を安全にマッピング。
+ * - バリデーションにより不適切なデータの混入を防止。
+ *
+ * 【フェイルセーフ】
+ * - データベース接続エラーや立ち順未設定時にもアプリがクラッシュしない安全なフォールバック設計。
  */
 
 'use client';
@@ -38,6 +43,8 @@ import { ShieldAlert, Users, Calendar, ArrowRight, Award } from 'lucide-react';
 const DEFAULT_TOURNAMENT_CONFIG: TournamentConfig = {
   matchId: 'match_2026_mentaiko',
   title: '第5回めんたいこ杯争奪弓道大会',
+  date: '2027-01-24',
+  venue: '福岡市総合体育館内 弓道場',
   totalStands: 3,
   totalArrows: 8,
   tieBreakerFormat: '射詰',
@@ -127,6 +134,8 @@ export default function PortalHomePage() {
             ...prev,
             ...data,
             title: typeof data.title === 'string' ? data.title : prev.title,
+            date: typeof data.date === 'string' ? data.date : prev.date,
+            venue: typeof data.venue === 'string' ? data.venue : prev.venue,
             isEntryEnabled:
               typeof data.isEntryEnabled === 'boolean'
                 ? data.isEntryEnabled
@@ -223,6 +232,7 @@ export default function PortalHomePage() {
                 ? raw.stand3_arrows
                 : [],
               isHayaHit: Boolean(raw.isHayaHit),
+              isSokuchu: Boolean(raw.isSokuchu),
               totalHits:
                 typeof raw.totalHits === 'number'
                   ? raw.totalHits
@@ -292,7 +302,7 @@ export default function PortalHomePage() {
               </span>
             </div>
             <h1 className="text-xl md:text-2xl font-black tracking-tight text-slate-900 pt-1">
-              {tournamentConfig.title} - 選手・応援ポータル
+              {tournamentConfig.title} 選手・応援ポータル
             </h1>
             <p className="text-xs text-slate-500 font-medium">
               午前一手（第1立・2射）と午後一手（第2立・2射）および午後四矢（第3立・4射）の合計8射制。
