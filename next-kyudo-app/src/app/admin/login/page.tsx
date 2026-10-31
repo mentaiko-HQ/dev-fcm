@@ -12,8 +12,8 @@
  * - 必須項目（メールアドレス、パスワード）の未入力時における送信ブロック。
  *
  * フェイルセーフ設計（障害時の安全縮退）:
- * - 【修正】認証処理の完了後（成功・失敗問わず）確実に isSubmitting を解除し、ボタンの永続的ロックを防止。
- * - 通信切断や認証例外の捕捉と、操作者への分かりやすい日本語エラー通知。
+ * - 【強制遷移】Next.jsルーターのキャッシュや状態監視の不発を防ぐため、ログイン成功時は window.location.href によるハードリダイレクトを実行。
+ * - 認証処理の完了後（成功・失敗問わず）確実に isSubmitting を解除し、ボタンの永続的ロックを防止。
  */
 
 'use client';
@@ -48,7 +48,6 @@ export default function AdminLoginPage() {
           router.replace('/admin');
         } else {
           setIsCheckingSession(false);
-          // 管理者権限がないのにログインしている状態（一般参加者セッションなど）の場合のエラー表示
           if (status.isAuthenticated && !status.isAdmin) {
             setErrorMessage('このアカウントには管理者権限がありません。');
           }
@@ -72,14 +71,14 @@ export default function AdminLoginPage() {
 
     try {
       await loginWithEmailPassword(email, password);
-      // 成功時は subscribeAdminSession が isAdmin を再評価し、自動的に /admin へ遷移する
+      // フェイルセーフ: 認証状態監視(onAuthStateChanged)の不発や、Next.jsルーターのキャッシュ詰まりを防止するため、
+      // ブラウザネイティブの強制リダイレクト（フルページロード）で管理画面へ遷移させる。
+      window.location.href = '/admin';
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : 'ログインに失敗しました。';
       setErrorMessage(message);
-    } finally {
-      // フェイルセーフ: 成功・失敗にかかわらずボタンのロックを確実に解除
-      setIsSubmitting(false);
+      setIsSubmitting(false); // 失敗時のみロック解除（成功時は遷移するため不要）
     }
   };
 
@@ -94,7 +93,6 @@ export default function AdminLoginPage() {
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between p-4 md:p-8">
-      {/* 上部ヘッダー */}
       <header className="max-w-md w-full mx-auto flex items-center justify-between py-4 border-b border-slate-800">
         <div className="flex items-center gap-2.5">
           <div className="p-2 bg-slate-900 border border-slate-800 text-white rounded-xl">
@@ -111,7 +109,6 @@ export default function AdminLoginPage() {
         </div>
       </header>
 
-      {/* ログインフォームカード */}
       <div className="max-w-md w-full mx-auto my-8">
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 md:p-8 shadow-2xl space-y-6">
           <div className="space-y-1.5 text-center">
@@ -127,7 +124,6 @@ export default function AdminLoginPage() {
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-4 text-xs">
-            {/* メールアドレス入力 */}
             <div className="space-y-1.5">
               <label className="block font-bold text-slate-300">
                 運営用ID (メールアドレス)
@@ -150,7 +146,6 @@ export default function AdminLoginPage() {
               </div>
             </div>
 
-            {/* パスワード入力 */}
             <div className="space-y-1.5">
               <label className="block font-bold text-slate-300">
                 パスワード
@@ -173,7 +168,6 @@ export default function AdminLoginPage() {
               </div>
             </div>
 
-            {/* エラー表示 */}
             {errorMessage && (
               <div className="p-3 bg-red-950/50 border border-red-800/80 rounded-xl text-xs text-red-300 font-bold flex items-center gap-2">
                 <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
@@ -181,7 +175,6 @@ export default function AdminLoginPage() {
               </div>
             )}
 
-            {/* ログインボタン */}
             <Button
               type="submit"
               disabled={isSubmitting}
@@ -203,7 +196,6 @@ export default function AdminLoginPage() {
         </div>
       </div>
 
-      {/* フッター */}
       <footer className="max-w-md w-full mx-auto text-center py-4 border-t border-slate-800/80 text-[11px] text-slate-500">
         © 2026 めんたいこ杯弓道大会 運営委員会 All Rights Reserved.
       </footer>
