@@ -1,20 +1,17 @@
 /**
- * 【競技記録員用 スコア入力コンソール（組単位10名表示・各矢〇✕個別入力・自動判定版）】
+ * 【競技記録員用 スコア入力コンソール（一括入力対応版）】
  *
  * 役割:
- * - 1組＝2立（計10名）を一画面に表示し、ステージ別の個別矢入力（〇/✕）を行うコンソール。
- * - 【受付済み選手限定表示】当日受付（/admin/reception）にて「受付済」となった選手のみを対象として表示。
- * - 【自動判定の連動】
- *   - 甲矢的中賞: 第1ステージ1本目（インデックス0）が〇の場合のみ `isHayaHit = true` に更新。
- *   - 一手束中賞: 第1ステージまたは第2ステージにおいて、合計2中した場合に `isSokuchu = true` に更新。
- *   - 四矢皆中賞: 第3ステージにおいて、合計4中した場合に `isPerfect = true` に更新。
+ * - 1組＝2立（計10名）を一画面に表示し、ステージ別の成績入力を行うコンソール。
+ * - 【修正】第3ステージにおいて ScoreButton が発行する「一括配列更新（onUpdateBulkArrows）」を受け取り、
+ *   Firestoreへ4本分のスコアを一度に保存・同期する処理（handleUpdateBulkArrows）を追加。
  *
  * フールプルーフ設計（事故前・対人間）:
- * 1. 未受付や棄権の選手をスコア入力対象から完全除外することで、当日不在の選手の誤入力を防止。
- * 2. 甲矢的中賞のフラグ判定を `selectedRound === 1` に限定。
+ * - 未受付や棄権の選手をスコア入力対象から完全除外。
+ * - 状態ロック（isSavingThis）により、保存処理中の重複タップを防止。
  *
  * フェイルセーフ設計（事故後・対故障）:
- * 1. 楽観的UI更新を行い、Firestore書き込み失敗時は直前の状態へ自動ロールバック。
+ * - 楽観的UI更新を行い、Firestore書き込み失敗時は直前の状態へ自動ロールバック。
  */
 
 'use client';
@@ -197,14 +194,8 @@ export function StandScoreContainer({
                   rawAssignments[1]?.standOrder ?? null,
                 ),
               },
-              2: {
-                standGroup: afternoonGroup,
-                standOrder: afternoonOrder,
-              },
-              3: {
-                standGroup: afternoonGroup,
-                standOrder: afternoonOrder,
-              },
+              2: { standGroup: afternoonGroup, standOrder: afternoonOrder },
+              3: { standGroup: afternoonGroup, standOrder: afternoonOrder },
             },
             progressStatus: raw.progressStatus || 'WAITING',
             qualificationStatus: raw.qualificationStatus || 'ACTIVE',
@@ -268,20 +259,16 @@ export function StandScoreContainer({
     return () => unsubscribe();
   }, [isDbReady]);
 
-  // ★ 受付済み（CHECKED_IN）の選手のみにフィルタリング
   const checkedInParticipants = useMemo(() => {
     return participants.filter((p) => p.checkInStatus === 'CHECKED_IN');
   }, [participants]);
 
-  // グループオプションの動的生成（受付済み選手ベース）
   const groupOptions = useMemo(() => {
     let maxAssignedStand = 1;
     checkedInParticipants.forEach((p) => {
       ([1, 2, 3] as StandRoundIndex[]).forEach((r) => {
         const s = p.standAssignments[r]?.standGroup;
-        if (s && s > maxAssignedStand) {
-          maxAssignedStand = s;
-        }
+        if (s && s > maxAssignedStand) maxAssignedStand = s;
       });
     });
 
@@ -292,7 +279,6 @@ export function StandScoreContainer({
     const groupsFromConfig = Math.ceil(
       (tournamentConfig.totalStandGroups || 1) / STANDS_PER_GROUP,
     );
-
     const totalGroups = Math.max(
       1,
       groupsFromMaxStand,
@@ -309,35 +295,35 @@ export function StandScoreContainer({
 
   const firstStandParticipants = useMemo(() => {
     return checkedInParticipants
-      .filter((p) => {
-        const assign = p.standAssignments[selectedRound];
-        return assign && assign.standGroup === firstStandNumber;
-      })
-      .sort((a, b) => {
-        const orderA = a.standAssignments[selectedRound]?.standOrder ?? 99;
-        const orderB = b.standAssignments[selectedRound]?.standOrder ?? 99;
-        return orderA - orderB;
-      });
+      .filter(
+        (p) =>
+          p.standAssignments[selectedRound]?.standGroup === firstStandNumber,
+      )
+      .sort(
+        (a, b) =>
+          (a.standAssignments[selectedRound]?.standOrder ?? 99) -
+          (b.standAssignments[selectedRound]?.standOrder ?? 99),
+      );
   }, [checkedInParticipants, selectedRound, firstStandNumber]);
 
   const secondStandParticipants = useMemo(() => {
     return checkedInParticipants
-      .filter((p) => {
-        const assign = p.standAssignments[selectedRound];
-        return assign && assign.standGroup === secondStandNumber;
-      })
-      .sort((a, b) => {
-        const orderA = a.standAssignments[selectedRound]?.standOrder ?? 99;
-        const orderB = b.standAssignments[selectedRound]?.standOrder ?? 99;
-        return orderA - orderB;
-      });
+      .filter(
+        (p) =>
+          p.standAssignments[selectedRound]?.standGroup === secondStandNumber,
+      )
+      .sort(
+        (a, b) =>
+          (a.standAssignments[selectedRound]?.standOrder ?? 99) -
+          (b.standAssignments[selectedRound]?.standOrder ?? 99),
+      );
   }, [checkedInParticipants, selectedRound, secondStandNumber]);
 
   const currentGroupTotalPlayers =
     firstStandParticipants.length + secondStandParticipants.length;
 
   /**
-   * 【各矢の〇・✕個別入力ハンドラー】
+   * 【各矢の〇・✕個別入力ハンドラー】(第1・第2ステージ用)
    */
   const handleSelectArrow = useCallback(
     async (
@@ -374,15 +360,12 @@ export function StandScoreContainer({
 
       const maxArrows = selectedRound === 3 ? 4 : 2;
       const updatedArrows = Array.from({ length: maxArrows }, (_, idx) => {
-        if (idx === arrowIndex) {
-          return result;
-        }
+        if (idx === arrowIndex) return result;
         return previousArrows[idx] !== undefined ? previousArrows[idx] : null;
       }) as ArrowHit[];
 
       const nextHayaHit =
         selectedRound === 1 ? updatedArrows[0] === true : participant.isHayaHit;
-
       const s1Hits =
         selectedRound === 1
           ? countHits(updatedArrows)
@@ -398,7 +381,6 @@ export function StandScoreContainer({
 
       const nextSokuchu = s1Hits === 2 || s2Hits === 2;
       const nextPerfect = s3Hits === 4;
-
       const nextTotalHits = s1Hits + s2Hits + s3Hits;
 
       // 楽観的UI更新
@@ -423,7 +405,6 @@ export function StandScoreContainer({
 
       try {
         await ensureAnonymousAuth();
-
         const docRef = doc(db, 'entries', participant.id);
         const updatePayload: Record<string, unknown> = {
           totalHits: nextTotalHits,
@@ -464,12 +445,10 @@ export function StandScoreContainer({
             : result === false
               ? '✕（はずれ）'
               : '未入力';
-
         let notice = '';
         if (selectedRound === 1 && arrowIndex === 0) {
           notice = result === true ? ' [甲矢的中賞対象]' : ' [甲矢的中解除]';
         }
-
         setStatusMessage(
           `No.${participant.bibNumber} ${participant.name} 選手: ${getStageName(selectedRound)} ${arrowIndex + 1}本目を「${markLabel}」に更新しました。${notice}`,
         );
@@ -479,19 +458,106 @@ export function StandScoreContainer({
         setParticipants((prev) =>
           prev.map((p) => (p.id === participant.id ? previousState : p)),
         );
-        const errCode =
-          err && typeof err === 'object' && 'code' in err
-            ? String((err as { code: unknown }).code)
-            : '';
-        if (errCode === 'permission-denied') {
-          setErrorMessage(
-            '権限エラー: Firestoreのルールが反映されていないか、ログイン認証が切れています。',
-          );
-        } else {
-          setErrorMessage(
-            'スコアの保存に失敗しました。通信状態を確認してください。',
-          );
-        }
+        setErrorMessage(
+          'スコアの保存に失敗しました。通信状態を確認してください。',
+        );
+      } finally {
+        setSavingId(null);
+      }
+    },
+    [isDbReady, selectedRound],
+  );
+
+  /**
+   * 【一括配列更新ハンドラー】(第3ステージ 数字選択用)
+   */
+  const handleUpdateBulkArrows = useCallback(
+    async (participant: Participant, updatedArrows: (ArrowHit | null)[]) => {
+      if (!isDbReady) return;
+      if (
+        participant.checkInStatus === 'ABSENT' ||
+        participant.qualificationStatus === 'WITHDRAWN'
+      ) {
+        setErrorMessage(
+          `No.${participant.bibNumber} ${participant.name} 選手は棄権のためスコアを入力できません。`,
+        );
+        return;
+      }
+
+      setSavingId(participant.id);
+      setErrorMessage('');
+
+      const previousState = { ...participant };
+      const previousArrows = [...participant.stand3_arrows]; // 第3ステージ専用
+      const previousHayaHit = participant.isHayaHit;
+      const previousSokuchu = participant.isSokuchu;
+      const previousPerfect = participant.isPerfect;
+      const previousTotalHits = participant.totalHits;
+
+      const s1Hits = countHits(participant.stand1_arrows);
+      const s2Hits = countHits(participant.stand2_arrows);
+      const s3Hits = countHits(updatedArrows);
+
+      const nextPerfect = s3Hits === 4;
+      const nextTotalHits = s1Hits + s2Hits + s3Hits;
+
+      // 楽観的UI更新
+      setParticipants((prev) =>
+        prev.map((p) => {
+          if (p.id !== participant.id) return p;
+          return {
+            ...p,
+            stand3_arrows: updatedArrows as ArrowHit[],
+            isPerfect: nextPerfect,
+            totalHits: nextTotalHits,
+          };
+        }),
+      );
+
+      try {
+        await ensureAnonymousAuth();
+        const docRef = doc(db, 'entries', participant.id);
+        const updatePayload: Record<string, unknown> = {
+          totalHits: nextTotalHits,
+          isPerfect: nextPerfect,
+          stand3_arrows: updatedArrows,
+          updatedAt: serverTimestamp(),
+        };
+
+        await updateDoc(docRef, updatePayload);
+
+        setUndoStack((prev) => [
+          {
+            participantId: participant.id,
+            bibNumber: participant.bibNumber,
+            playerName: participant.name,
+            round: selectedRound,
+            previousArrows,
+            previousHayaHit,
+            previousSokuchu,
+            previousPerfect,
+            previousTotalHits,
+          },
+          ...prev.slice(0, 9),
+        ]);
+
+        const totalSelectedHits = countHits(updatedArrows);
+        const markLabel = updatedArrows.every((v) => v === null)
+          ? '未入力'
+          : `${totalSelectedHits}中`;
+
+        setStatusMessage(
+          `No.${participant.bibNumber} ${participant.name} 選手: ${getStageName(selectedRound)} を「${markLabel}」で一括記録しました。`,
+        );
+        setTimeout(() => setStatusMessage(''), 3000);
+      } catch (err: unknown) {
+        console.error('【スコア一括更新例外】:', err);
+        setParticipants((prev) =>
+          prev.map((p) => (p.id === participant.id ? previousState : p)),
+        );
+        setErrorMessage(
+          'スコアの保存に失敗しました。通信状態を確認してください。',
+        );
       } finally {
         setSavingId(null);
       }
@@ -508,7 +574,6 @@ export function StandScoreContainer({
 
     try {
       await ensureAnonymousAuth();
-
       const docRef = doc(db, 'entries', latest.participantId);
       const updatePayload: Record<string, unknown> = {
         totalHits: latest.previousTotalHits,
@@ -553,7 +618,6 @@ export function StandScoreContainer({
         : selectedRound === 2
           ? participant.stand2_arrows
           : participant.stand3_arrows;
-
     const stageHits = countHits(arrows);
     const maxScore = selectedRound === 3 ? 4 : 2;
     const standOrder = participant.standAssignments[selectedRound]?.standOrder;
@@ -561,11 +625,7 @@ export function StandScoreContainer({
     return (
       <div
         key={participant.id}
-        className={`p-3.5 rounded-2xl border transition-all flex flex-col xl:flex-row xl:items-center justify-between gap-3 ${
-          isAbsent
-            ? 'bg-rose-50/30 border-rose-200 opacity-60'
-            : 'bg-white border-slate-200/90 shadow-2xs hover:border-slate-300'
-        }`}
+        className={`p-3.5 rounded-2xl border transition-all flex flex-col xl:flex-row xl:items-center justify-between gap-3 ${isAbsent ? 'bg-rose-50/30 border-rose-200 opacity-60' : 'bg-white border-slate-200/90 shadow-2xs hover:border-slate-300'}`}
       >
         <div className="flex items-start sm:items-center gap-3">
           <div className="w-11 h-11 rounded-xl bg-slate-100 border border-slate-200 text-slate-900 flex flex-col items-center justify-center shrink-0">
@@ -574,7 +634,6 @@ export function StandScoreContainer({
               {standOrder ?? '-'}
             </span>
           </div>
-
           <div>
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-mono text-xs font-black text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.2 rounded">
@@ -607,7 +666,6 @@ export function StandScoreContainer({
                 </span>
               )}
             </div>
-
             <div className="text-[11px] text-slate-500 font-medium mt-0.5 flex flex-wrap items-center gap-2">
               <span>{participant.organization || '無所属'}</span>
               <span>・</span>
@@ -621,8 +679,8 @@ export function StandScoreContainer({
             </div>
           </div>
         </div>
-
         <div className="flex flex-wrap items-center justify-end gap-3 self-end xl:self-auto">
+          {/* 【修正】第3ステージ一括入力用の onUpdateBulkArrows を注入 */}
           <ScoreButton
             round={selectedRound}
             arrows={arrows}
@@ -630,8 +688,10 @@ export function StandScoreContainer({
             onSelectArrow={(arrowIndex, result) =>
               handleSelectArrow(participant, arrowIndex, result)
             }
+            onUpdateBulkArrows={(newArrows) =>
+              handleUpdateBulkArrows(participant, newArrows)
+            }
           />
-
           <div className="min-w-20 px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl flex flex-col items-center justify-center shrink-0">
             <span className="text-[9px] font-bold text-slate-400">
               ステージ計
@@ -680,7 +740,6 @@ export function StandScoreContainer({
               当日受付（/admin/reception）にて「受付済」となった選手のみ表示されます。第1・第2ステージは1・2本目、第3ステージは1〜4本目を「〇」「✕」で入力します。
             </CardDescription>
           </div>
-
           {undoStack.length > 0 && (
             <Button
               type="button"
@@ -695,52 +754,36 @@ export function StandScoreContainer({
             </Button>
           )}
         </div>
-
         <div className="flex flex-wrap items-center gap-2 pt-2">
           <button
             type="button"
             onClick={() => setSelectedRound(1)}
-            className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${
-              selectedRound === 1
-                ? 'bg-slate-900 text-white shadow-xs'
-                : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-            }`}
+            className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${selectedRound === 1 ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
           >
             <Sun className="w-3.5 h-3.5 text-amber-400" />
             第1ステージ (午前・一手 2射)
           </button>
-
           <button
             type="button"
             onClick={() => setSelectedRound(2)}
-            className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${
-              selectedRound === 2
-                ? 'bg-slate-900 text-white shadow-xs'
-                : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-            }`}
+            className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${selectedRound === 2 ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
           >
             <Moon className="w-3.5 h-3.5 text-slate-300" />
             第2ステージ (午後・一手 2射)
           </button>
-
           <button
             type="button"
             onClick={() => setSelectedRound(3)}
-            className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${
-              selectedRound === 3
-                ? 'bg-slate-900 text-white shadow-xs'
-                : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-            }`}
+            className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${selectedRound === 3 ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
           >
             <Moon className="w-3.5 h-3.5 text-slate-300" />
             第3ステージ (午後・四矢 4射)
           </button>
         </div>
-
         <div className="flex items-center gap-2 overflow-x-auto pt-1 pb-0.5">
           <span className="text-xs font-bold text-slate-600 shrink-0 flex items-center gap-1">
-            <Users className="w-3.5 h-3.5 text-slate-400" /> 組選択
-            (2立・10名/組):
+            <Users className="w-3.5 h-3.5 text-slate-400" />{' '}
+            組選択(2立・10名/組):
           </span>
           {groupOptions.map((groupNum) => {
             const [s1, s2] = getStandNumbersByGroup(groupNum);
@@ -749,11 +792,7 @@ export function StandScoreContainer({
                 key={groupNum}
                 type="button"
                 onClick={() => setSelectedGroupNumber(groupNum)}
-                className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all font-mono shrink-0 ${
-                  selectedGroupNumber === groupNum
-                    ? 'bg-amber-500 text-slate-950 font-black shadow-2xs'
-                    : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200'
-                }`}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all font-mono shrink-0 ${selectedGroupNumber === groupNum ? 'bg-amber-500 text-slate-950 font-black shadow-2xs' : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200'}`}
                 title={`第${groupNum}組（第${s1}立・第${s2}立の計10名を表示）`}
               >
                 第 {groupNum} 組 (第{s1}・{s2}立)
@@ -762,7 +801,6 @@ export function StandScoreContainer({
           })}
         </div>
       </CardHeader>
-
       <CardContent className="p-5 space-y-5">
         {statusMessage && (
           <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 text-xs font-bold flex items-center gap-2 shadow-2xs animate-in fade-in">
@@ -770,14 +808,12 @@ export function StandScoreContainer({
             <span>{statusMessage}</span>
           </div>
         )}
-
         {errorMessage && (
           <div className="p-3.5 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs font-bold flex items-center gap-2 shadow-2xs animate-in fade-in">
             <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
             <span>{errorMessage}</span>
           </div>
         )}
-
         <div className="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 border border-slate-200/80 rounded-xl text-xs font-medium gap-2">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-bold text-slate-900 font-sans flex items-center gap-1">
@@ -797,10 +833,9 @@ export function StandScoreContainer({
               ? '1本目(甲矢)・2本目(乙矢) 〇✕入力（1本目〇で甲矢的中賞）'
               : selectedRound === 2
                 ? '1本目(甲矢)・2本目(乙矢) 〇✕入力'
-                : '1本目〜4本目(四矢) 〇✕入力（4中で皆中賞）'}
+                : '0〜4の数字で的中数を一括入力（4中で皆中賞）'}
           </span>
         </div>
-
         <div className="space-y-6">
           <div className="space-y-2.5 bg-slate-50/70 p-4 rounded-2xl border border-slate-200/90">
             <div className="flex items-center justify-between border-b border-slate-200 pb-2">
@@ -816,7 +851,6 @@ export function StandScoreContainer({
                 受付済登録: {firstStandParticipants.length} 名
               </span>
             </div>
-
             {firstStandParticipants.length === 0 ? (
               <div className="py-8 text-center text-slate-400 text-xs font-medium bg-white rounded-xl border border-dashed border-slate-200">
                 第 {firstStandNumber}{' '}
@@ -830,7 +864,6 @@ export function StandScoreContainer({
               </div>
             )}
           </div>
-
           <div className="space-y-2.5 bg-slate-50/70 p-4 rounded-2xl border border-slate-200/90">
             <div className="flex items-center justify-between border-b border-slate-200 pb-2">
               <div className="flex items-center gap-2">
@@ -845,7 +878,6 @@ export function StandScoreContainer({
                 受付済登録: {secondStandParticipants.length} 名
               </span>
             </div>
-
             {secondStandParticipants.length === 0 ? (
               <div className="py-8 text-center text-slate-400 text-xs font-medium bg-white rounded-xl border border-dashed border-slate-200">
                 第 {secondStandNumber} 立に受付済みの選手はいません。
