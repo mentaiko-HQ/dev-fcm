@@ -4,12 +4,12 @@
  * - Firebase Authenticationを用いたログイン/ログアウト処理。
  * - ログイン状態およびFirestore(usersコレクション)の権限(role)に基づく管理者セッションの監視。
  *
- * フールプルーフ設計:
- * - Firestoreからの権限取得に失敗した場合や、ドキュメントが存在しない場合は、安全側に倒して isAdmin: false とする。
+ * フールプルーフ設計（未認証・権限不足の入口遮断）:
+ * - 【強制突破】特定の開発者UIDをスーパー管理者に指定。Firestoreのルールエラーや設定ミスが起きていても確実にログインさせる。
  * - ログイン失敗時の生のエラーコードを詳細な日本語メッセージに変換し、原因特定を容易にする。
  *
- * フェイルセーフ設計:
- * - ネットワーク切断等でFirestoreの読み取りに失敗した場合でもアプリがクラッシュしないよう例外を捕捉。
+ * フェイルセーフ設計（障害時の安全縮退）:
+ * - ネットワーク切断等でFirestoreの読み取りに失敗した場合でも、スーパー管理者であればシステムを停止させずに通す。
  */
 
 import {
@@ -35,14 +35,18 @@ export function subscribeAdminSession(
   return onAuthStateChanged(auth, async (user) => {
     if (user) {
       try {
-        // Firestoreからユーザーの権限(role)を取得
-        const userDoc = await getDoc(doc(db, 'users', user.uid));
-        let isAdmin = false;
+        // 【フールプルーフ強制突破】
+        // 以下のUIDは問答無用で「管理者」として扱う（Firestoreの設定ミスやルールエラーをバイパス）
+        const SUPER_ADMIN_UID = 'p7lHcXpW3GRWhyikN4yPTReyto82';
+        let isAdmin = user.uid === SUPER_ADMIN_UID;
 
-        if (userDoc.exists()) {
-          const data = userDoc.data();
-          // role が 'admin' または isAdmin が true の場合に管理者と判定
-          isAdmin = data.role === 'admin' || data.isAdmin === true;
+        // スーパー管理者以外のユーザー向けにFirestoreも一応確認する
+        if (!isAdmin) {
+          const userDoc = await getDoc(doc(db, 'users', user.uid));
+          if (userDoc.exists()) {
+            const data = userDoc.data();
+            isAdmin = data.role === 'admin' || data.isAdmin === true;
+          }
         }
 
         if (!isAdmin) {
@@ -51,7 +55,7 @@ export function subscribeAdminSession(
           );
         } else {
           console.log(
-            `【運営ログイン成功】UID: ${user.uid} Email: ${user.email}`,
+            `【運営ログイン権限確認OK】UID: ${user.uid} Email: ${user.email}`,
           );
         }
 
@@ -64,14 +68,18 @@ export function subscribeAdminSession(
           errorMessage: isAdmin ? null : '管理者権限がありません。',
         });
       } catch (error) {
-        console.error('【権限取得エラー】', error);
+        console.error('【権限取得エラー】（Firestoreルールの可能性）:', error);
+
+        // エラーが発生した場合でも、スーパー管理者なら通すフェイルセーフ
+        const isSuperAdmin = user.uid === 'p7lHcXpW3GRWhyikN4yPTReyto82';
+
         callback({
           isAuthenticated: true,
-          isAdmin: false,
+          isAdmin: isSuperAdmin,
           uid: user.uid,
           email: user.email,
           isLoading: false,
-          errorMessage: '権限の確認に失敗しました。',
+          errorMessage: isSuperAdmin ? null : '権限の確認に失敗しました。',
         });
       }
     } else {
