@@ -7,11 +7,10 @@
  * - /admin/login 以外のすべての管理ページに対して、認証済みセッションを検証。
  * - 未ログイン端末を検知した場合、即座に /admin/login へ安全にリダイレクト。
  *
- * フールプルーフ設計（未認証実行の入口遮断）:
+ * フールプルーフ設計（未認証実行の入口遮断・無限ループ防止）:
+ * - 【修正】/admin/login に直接アクセスした場合は、認証確認のuseEffectとスピナーを完全にバイパスし即時描画。
  * - 認証検証中（session.isLoading）は全画面スピナーを表示し、非認証状態での画面チラつき・不正アクセスを防止。
  * - 未認証状態ではレンダリングを遮断（return null）。
- * - /admin/login 自身は除外（isLoginPage判定）し、リダイレクト無限ループを防止。
- * - 初期値に isAdmin: false を安全側デフォルトとして明示的に指定。
  *
  * フェイルセーフ設計（障害時の安全縮退）:
  * - 認証監視例外発生時も安全側に倒してログイン画面へ誘導。
@@ -33,28 +32,28 @@ export default function AdminLayout({
   const router = useRouter();
   const pathname = usePathname();
 
-  // フールプルーフ: 初期状態は未認証・非管理者として安全側に設定
+  // 現在のパスがログインページであるか判定
+  const isLoginPage = pathname === '/admin/login';
+
+  // 初期状態は未認証・非管理者として安全側に設定
   const [session, setSession] = useState<SessionStatus>({
     isAuthenticated: false,
     isAdmin: false,
     uid: null,
     email: null,
-    isLoading: true,
+    isLoading: true, // 監視前はロード中
     errorMessage: null,
   });
 
-  const isLoginPage = pathname === '/admin/login';
-
   useEffect(() => {
+    // フールプルーフ: ログインページにいる場合は監視自体をスキップ（無限ループ防止）
+    if (isLoginPage) return;
+
     const unsubscribe = subscribeAdminSession((status) => {
       setSession(status);
 
-      // フールプルーフ: ログインページ以外で未認証または非管理者が確定した時点で即時リダイレクト
-      if (
-        !status.isLoading &&
-        (!status.isAuthenticated || !status.isAdmin) &&
-        !isLoginPage
-      ) {
+      // ロード完了後、未認証または非管理者権限であればログインページへ強制リダイレクト
+      if (!status.isLoading && (!status.isAuthenticated || !status.isAdmin)) {
         router.replace('/admin/login');
       }
     });
@@ -62,12 +61,16 @@ export default function AdminLayout({
     return () => unsubscribe();
   }, [router, isLoginPage]);
 
-  // ログインページ自身は認証ガードをバイパス
+  // -------------------------------------------------------------
+  // レンダリング制御
+  // -------------------------------------------------------------
+
+  // 1. ログインページ自身はすべてのガードをバイパスして即座に画面描画
   if (isLoginPage) {
     return <>{children}</>;
   }
 
-  // 認証検証中の待機画面
+  // 2. 認証検証中の待機画面
   if (session.isLoading) {
     return (
       <div className="min-h-screen bg-[#F8FAFC] flex flex-col items-center justify-center p-4 text-slate-500 w-full">
@@ -79,12 +82,12 @@ export default function AdminLayout({
     );
   }
 
-  // 未認証または非管理者状態（リダイレクト完了までの安全側遮断）
+  // 3. 未認証または非管理者状態（リダイレクト完了までの安全側遮断）
   if (!session.isAuthenticated || !session.isAdmin) {
     return null;
   }
 
-  // 認証済み運営画面表示（全画面幅100%展開）
+  // 4. 認証済み運営画面表示（全画面幅100%展開）
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-slate-900 flex flex-col w-full">
       {/* 運営端末グローバルステータスバー（全幅展開） */}

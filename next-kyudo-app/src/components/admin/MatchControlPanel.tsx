@@ -4,22 +4,16 @@
  * 役割:
  * 1. 試合進行（現在立・現在組）の切り替えおよび安全な進退操作（次立へ進行 / 前立へ戻る）。
  * 2. 【選手数無制限・動的組数追従】:
- *    - 大会設定の固定値（4組・6組など）による制限を完全撤廃。
- *    - 登録選手総数（Math.ceil(participants.length / 5)）および全選手に割り当てられた最大組番号から
- *      総組数（dynamicTotalStandGroups）をリアルタイムに自動算出。
- *    - 18名や20名の枠を超えて何名（50名、100名、200名など）登録されても、システムが自動追従して全組の進行と2立前呼出を実行可能。
+ *    - 登録選手総数および全選手に割り当てられた最大組番号から総組数をリアルタイムに自動算出。
  * 3. 2立前自動招集呼出（FCMプッシュ通知）の対象組・対象選手プレビューと手動発報。
- * 4. matches/{matchId}/call_logs コレクションのリアルタイム監視によるFCM送信ログ可視化。
- * 5. 開発・動作確認用「個人戦初期データ生成（シード投入）」機能の完全維持。
+ * 4. FCM送信ログ可視化。
  *
  * フールプルーフ設計（事故前・対人間）:
- * - currentStandGroup と currentStandNumber、totalStandGroups と maxStandNumber を同時更新し、旧仕様との後方互換性を保証。
- * - 動的に算出された最終組（dynamicTotalStandGroups）を超える組への進行、または第1組未満への後退をUIおよびバリデーションで遮断。
+ * - 【修正】シードデータ投入処理に「既にデータが存在する場合はブロックする」ガードを追加し、本番データへのテストデータ混入事故を防止。
  * - 進行操作・呼出実行時に確認ダイアログ（confirm）と実行中排他ロック（isProcessing）を適用し、連打・誤操作を防止。
  *
  * フェイルセーフ設計（事故後・対故障）:
- * - 通信遮断や外部API障害発生時でも、entries コレクションの progressStatus = 'CALLED' への更新と call_logs への記録を安全に完遂。
- * - 参加選手データが0件またはFirestoreドキュメントが未生成の状態でもクラッシュせず、初期設定を安全に生成して稼働を継続。
+ * - 参加選手データが0件またはFirestoreドキュメントが未生成の状態でもクラッシュせず稼働を継続。
  */
 
 'use client';
@@ -91,25 +85,18 @@ export function MatchControlPanel({
 }: MatchControlPanelProps) {
   const isDbReady = isFirebaseConfigured && isFirestoreAvailable(db);
 
-  // 試合進行ステート
   const [matchState, setMatchState] = useState<MatchState>(DEFAULT_MATCH_STATE);
-
-  // 参加者一覧およびユーザーFCMトークンマップ
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [userTokensMap, setUserTokensMap] = useState<Record<string, string>>(
     {},
   );
-
-  // 呼出ログ一覧
   const [callLogs, setCallLogs] = useState<CallNotificationLog[]>([]);
 
-  // 処理中・メッセージステート
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [isSeeding, setIsSeeding] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string>('');
 
-  // 1. matches/{matchId} ドキュメントのリアルタイム購読（新旧プロパティ完全互換）
   useEffect(() => {
     if (!isDbReady) return;
 
@@ -119,17 +106,12 @@ export function MatchControlPanel({
       (snapshot) => {
         if (snapshot.exists()) {
           const data = snapshot.data();
-
-          // currentStandGroup または currentStandNumber の双方を安全に判定
           const rawGroup = data.currentStandGroup ?? data.currentStandNumber;
           const safeGroup =
             typeof rawGroup === 'number' && rawGroup > 0 ? rawGroup : 1;
-
-          // totalStandGroups または maxStandNumber の双方を安全に判定
           const rawTotal = data.totalStandGroups ?? data.maxStandNumber;
           const safeTotal =
             typeof rawTotal === 'number' && rawTotal > 0 ? rawTotal : 4;
-
           const rawRound = Number(data.currentRound);
           const safeRound: StandRoundIndex =
             rawRound === 1 || rawRound === 2 || rawRound === 3 ? rawRound : 1;
@@ -143,7 +125,6 @@ export function MatchControlPanel({
             status: data.status || '進行中',
           });
         } else {
-          // 初期ドキュメントが存在しない場合は互換フィールドを含めて作成
           setDoc(
             matchDocRef,
             {
@@ -166,11 +147,9 @@ export function MatchControlPanel({
         setErrorMessage('試合進行データの購読に失敗しました。');
       },
     );
-
     return () => unsubscribe();
   }, [isDbReady, matchId]);
 
-  // 2. entries コレクションのリアルタイム購読（全件・無制限取得）
   useEffect(() => {
     if (!isDbReady) return;
 
@@ -182,7 +161,6 @@ export function MatchControlPanel({
         snapshot.forEach((docSnap) => {
           const raw = docSnap.data();
           const rawAssignments = raw.standAssignments || {};
-
           const afternoonGroup = sanitizeStandGroup(
             rawAssignments[2]?.standGroup ??
               rawAssignments[3]?.standGroup ??
@@ -223,14 +201,8 @@ export function MatchControlPanel({
                   rawAssignments[1]?.standOrder ?? null,
                 ),
               },
-              2: {
-                standGroup: afternoonGroup,
-                standOrder: afternoonOrder,
-              },
-              3: {
-                standGroup: afternoonGroup,
-                standOrder: afternoonOrder,
-              },
+              2: { standGroup: afternoonGroup, standOrder: afternoonOrder },
+              3: { standGroup: afternoonGroup, standOrder: afternoonOrder },
             },
             progressStatus: raw.progressStatus || 'WAITING',
             qualificationStatus: raw.qualificationStatus || 'ACTIVE',
@@ -280,18 +252,14 @@ export function MatchControlPanel({
             qrSentError: raw.qrSentError || null,
           });
         });
-
         setParticipants(loaded);
       },
-      (error) => {
-        console.error('【MatchControlPanel】entries購読エラー:', error);
-      },
+      (error) =>
+        console.error('【MatchControlPanel】entries購読エラー:', error),
     );
-
     return () => unsubscribe();
   }, [isDbReady]);
 
-  // 3. users コレクションのリアルタイム購読（FCMトークン紐付け）
   useEffect(() => {
     if (!isDbReady) return;
 
@@ -302,21 +270,17 @@ export function MatchControlPanel({
         const tokens: Record<string, string> = {};
         snapshot.forEach((docSnap) => {
           const data = docSnap.data();
-          if (data.participantId && data.fcmToken) {
-            tokens[data.participantId] = String(data.fcmToken).trim();
+          if (data.selectedEntryId && data.fcmToken) {
+            tokens[data.selectedEntryId] = String(data.fcmToken).trim();
           }
         });
         setUserTokensMap(tokens);
       },
-      (error) => {
-        console.error('【MatchControlPanel】users購読エラー:', error);
-      },
+      (error) => console.error('【MatchControlPanel】users購読エラー:', error),
     );
-
     return () => unsubscribe();
   }, [isDbReady]);
 
-  // 4. matches/{matchId}/call_logs コレクションのリアルタイム購読（FCMログ可視化）
   useEffect(() => {
     if (!isDbReady) return;
 
@@ -325,7 +289,6 @@ export function MatchControlPanel({
       orderBy('createdAt', 'desc'),
       limit(25),
     );
-
     const unsubscribe = onSnapshot(
       logsQuery,
       (snapshot) => {
@@ -352,16 +315,12 @@ export function MatchControlPanel({
         });
         setCallLogs(list);
       },
-      (error) => {
-        console.error('【MatchControlPanel】call_logs購読エラー:', error);
-      },
+      (error) =>
+        console.error('【MatchControlPanel】call_logs購読エラー:', error),
     );
-
     return () => unsubscribe();
   }, [isDbReady, matchId]);
 
-  // 【選手数無制限・動的組数追従ロジック】
-  // 登録選手総数（Math.ceil(選手数 / 5)）および割当済みの最大組番号から、必要な総組数を自動算出
   const dynamicTotalStandGroups = useMemo(() => {
     let maxAssignedGroup = 1;
     participants.forEach((p) => {
@@ -370,7 +329,6 @@ export function MatchControlPanel({
         if (g && g > maxAssignedGroup) maxAssignedGroup = g;
       });
     });
-
     const calculatedByCount = Math.ceil(participants.length / 5);
     return Math.max(
       1,
@@ -380,13 +338,11 @@ export function MatchControlPanel({
     );
   }, [participants, matchState.totalStandGroups]);
 
-  // 2立前の呼出対象組番号（現在進行組 + 2。動的総組数以内で算出）
   const targetCallGroup = useMemo(() => {
     const candidate = matchState.currentStandGroup + 2;
     return candidate <= dynamicTotalStandGroups ? candidate : null;
   }, [matchState.currentStandGroup, dynamicTotalStandGroups]);
 
-  // 呼出対象組の選手リスト（棄権選手を除外）
   const targetCallParticipants = useMemo(() => {
     if (!targetCallGroup) return [];
     return participants.filter((p) => {
@@ -400,16 +356,23 @@ export function MatchControlPanel({
     });
   }, [participants, matchState.currentRound, targetCallGroup]);
 
-  // 呼出対象組でFCMトークン登録済みの人数
   const tokenRegisteredCount = useMemo(() => {
     return targetCallParticipants.filter((p) => Boolean(userTokensMap[p.id]))
       .length;
   }, [targetCallParticipants, userTokensMap]);
 
-  // 【初期シードデータ投入ハンドラー】
+  // 【修正】初期シードデータ投入ハンドラー（フールプルーフ実装）
   const handleSeedFirestore = async () => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
       setStatusMessage('Firebase環境変数が設定されていません。');
+      return;
+    }
+
+    // フールプルーフ: 本番環境での誤操作（既存データの破壊）を防止
+    if (participants.length > 0) {
+      alert(
+        'エラー：既に選手データが登録されています。テストデータを投入する場合は、Firebase Consoleから既存データを削除してください。',
+      );
       return;
     }
 
@@ -623,17 +586,14 @@ export function MatchControlPanel({
     }
   };
 
-  // 【次立へ進む】動的総組数を上限としてバリデーション判定
   const handleAdvanceStand = async () => {
     if (!isDbReady || isProcessing) return;
-
     if (matchState.currentStandGroup >= dynamicTotalStandGroups) {
       setStatusMessage(
         `最終組（第${dynamicTotalStandGroups}組）に達しているため進められません。次の立へ切り替えてください。`,
       );
       return;
     }
-
     const nextGroup = matchState.currentStandGroup + 1;
     const confirmed = window.confirm(
       `第 ${matchState.currentStandGroup} 組から 第 ${nextGroup} 組 へ進行を進めますか？`,
@@ -653,7 +613,6 @@ export function MatchControlPanel({
         maxStandNumber: dynamicTotalStandGroups,
         updatedAt: serverTimestamp(),
       });
-
       setStatusMessage(`第 ${nextGroup} 組を開始しました。`);
       setTimeout(() => setStatusMessage(''), 3000);
     } catch (err) {
@@ -664,15 +623,12 @@ export function MatchControlPanel({
     }
   };
 
-  // 【1立戻す】
   const handleRevertStand = async () => {
     if (!isDbReady || isProcessing) return;
-
     if (matchState.currentStandGroup <= 1) {
       setStatusMessage('これ以上前の組に戻ることはできません。');
       return;
     }
-
     const prevGroup = matchState.currentStandGroup - 1;
     const confirmed = window.confirm(
       `第 ${matchState.currentStandGroup} 組から 第 ${prevGroup} 組 へ戻しますか？`,
@@ -690,7 +646,6 @@ export function MatchControlPanel({
         currentStandNumber: prevGroup,
         updatedAt: serverTimestamp(),
       });
-
       setStatusMessage(`第 ${prevGroup} 組へ戻しました。`);
       setTimeout(() => setStatusMessage(''), 3000);
     } catch (err) {
@@ -701,11 +656,9 @@ export function MatchControlPanel({
     }
   };
 
-  // 【立（ラウンド）切り替え】
   const handleChangeRound = async (newRound: StandRoundIndex) => {
     if (!isDbReady || isProcessing || matchState.currentRound === newRound)
       return;
-
     const confirmed = window.confirm(
       `立を「${STAND_CONFIGS[newRound].name}」へ切り替えますか？\n進行組は 第1組 にリセットされます。`,
     );
@@ -725,7 +678,6 @@ export function MatchControlPanel({
         maxStandNumber: dynamicTotalStandGroups,
         updatedAt: serverTimestamp(),
       });
-
       setStatusMessage(
         `立を「${STAND_CONFIGS[newRound].name}」に切り替え、第1組を開始しました。`,
       );
@@ -738,15 +690,12 @@ export function MatchControlPanel({
     }
   };
 
-  // 【呼出通知実行】
   const handleExecuteCall = async () => {
     if (!isDbReady || isProcessing) return;
-
     if (!targetCallGroup) {
       setErrorMessage('呼出対象となる「2立後」の組が存在しません。');
       return;
     }
-
     if (targetCallParticipants.length === 0) {
       setErrorMessage(
         `第 ${targetCallGroup} 組に対象となる出場選手が存在しません。`,
@@ -766,12 +715,10 @@ export function MatchControlPanel({
     const now = Date.now();
     const titleText = `【呼出】出番が近づいています (2立前)`;
     const bodyText = `${STAND_CONFIGS[matchState.currentRound].name} 第${targetCallGroup}組の選手は招集所へお集まりください。`;
-
     const targetTokens = targetCallParticipants
       .map((p) => userTokensMap[p.id])
       .filter((token): token is string => Boolean(token));
 
-    // 1. 対象選手の進捗ステータスを CALLED に更新
     try {
       const updatePromises = targetCallParticipants.map((p) => {
         const docRef = doc(db, 'entries', p.id);
@@ -785,7 +732,6 @@ export function MatchControlPanel({
       console.warn('【entries進捗更新警告】:', dbErr);
     }
 
-    // 2. call_logs へ監査記録
     try {
       const logsCollectionRef = collection(db, 'matches', matchId, 'call_logs');
       await addDoc(logsCollectionRef, {
@@ -818,7 +764,6 @@ export function MatchControlPanel({
 
   return (
     <div className="w-full bg-white border border-slate-200/80 rounded-2xl p-5 shadow-sm space-y-5">
-      {/* ヘッダー部 */}
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center border-b border-slate-100 pb-4 gap-3">
         <div>
           <div className="flex items-center gap-2 mb-1">
@@ -843,7 +788,6 @@ export function MatchControlPanel({
             を自動編成し、2立前招集通知を発報します
           </p>
         </div>
-
         <div className="flex items-center gap-2 self-start sm:self-auto">
           <Button
             onClick={handleSeedFirestore}
@@ -858,59 +802,42 @@ export function MatchControlPanel({
         </div>
       </div>
 
-      {/* 立（ラウンド）切り替えタブ */}
       <div className="flex flex-wrap items-center gap-2">
         <button
           type="button"
           disabled={isProcessing}
           onClick={() => handleChangeRound(1)}
-          className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${
-            matchState.currentRound === 1
-              ? 'bg-slate-900 text-white shadow-xs'
-              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-          }`}
+          className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${matchState.currentRound === 1 ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
         >
-          <Sun className="w-3.5 h-3.5 text-amber-400" />
-          第1ステージ (午前・一手)
+          <Sun className="w-3.5 h-3.5 text-amber-400" /> 第1ステージ
+          (午前・一手)
         </button>
-
         <button
           type="button"
           disabled={isProcessing}
           onClick={() => handleChangeRound(2)}
-          className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${
-            matchState.currentRound === 2
-              ? 'bg-slate-900 text-white shadow-xs'
-              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-          }`}
+          className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${matchState.currentRound === 2 ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
         >
-          <Moon className="w-3.5 h-3.5 text-slate-300" />
-          第2ステージ (午後・一手)
+          <Moon className="w-3.5 h-3.5 text-slate-300" /> 第2ステージ
+          (午後・一手)
         </button>
-
         <button
           type="button"
           disabled={isProcessing}
           onClick={() => handleChangeRound(3)}
-          className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${
-            matchState.currentRound === 3
-              ? 'bg-slate-900 text-white shadow-xs'
-              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-          }`}
+          className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${matchState.currentRound === 3 ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
         >
-          <Moon className="w-3.5 h-3.5 text-slate-300" />
-          第3ステージ (午後・四矢)
+          <Moon className="w-3.5 h-3.5 text-slate-300" /> 第3ステージ
+          (午後・四矢)
         </button>
       </div>
 
-      {/* 状態メッセージ表示 */}
       {statusMessage && (
         <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 text-xs font-bold flex items-center gap-2">
           <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
           <span>{statusMessage}</span>
         </div>
       )}
-
       {errorMessage && (
         <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs font-bold flex items-center gap-2">
           <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
@@ -918,9 +845,7 @@ export function MatchControlPanel({
         </div>
       )}
 
-      {/* 2カラム メイン進行・呼出カード */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {/* 左: 現在進行中の組 */}
         <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl flex flex-col justify-between space-y-3">
           <div>
             <div className="flex items-center justify-between">
@@ -945,7 +870,6 @@ export function MatchControlPanel({
               行射中・リアルタイムスコア入力受付中
             </span>
           </div>
-
           <div className="flex items-center gap-2 pt-2">
             <Button
               onClick={handleRevertStand}
@@ -977,7 +901,6 @@ export function MatchControlPanel({
           </div>
         </div>
 
-        {/* 右: 2立前 呼出・招集対象 */}
         <div className="p-4 bg-amber-50/70 border border-amber-200 rounded-xl flex flex-col justify-between space-y-3">
           <div>
             <div className="flex items-center justify-between">
@@ -1008,7 +931,6 @@ export function MatchControlPanel({
                 : '現在の立の全組呼出が完了しています'}
             </span>
           </div>
-
           <div className="pt-2">
             <Button
               onClick={handleExecuteCall}
@@ -1032,7 +954,6 @@ export function MatchControlPanel({
         </div>
       </div>
 
-      {/* FCM呼出ログのリアルタイム可視化テーブル */}
       <div className="space-y-2 pt-2">
         <div className="flex items-center justify-between">
           <h4 className="text-xs font-bold text-slate-800 flex items-center gap-1.5 uppercase tracking-wider">
@@ -1043,7 +964,6 @@ export function MatchControlPanel({
             件数: {callLogs.length}
           </span>
         </div>
-
         <div className="w-full bg-slate-50/50 border border-slate-200 rounded-xl overflow-hidden shadow-2xs">
           {callLogs.length === 0 ? (
             <div className="py-6 text-center text-slate-400 text-xs font-medium">

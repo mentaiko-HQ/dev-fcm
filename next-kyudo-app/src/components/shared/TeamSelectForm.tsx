@@ -5,12 +5,12 @@
  * - 匿名認証でUIDを確保し、FCMトークンと選択したentryIdをFirestore (usersコレクション) に紐付け保存。
  *
  * フールプルーフ設計:
+ * - ハードコードされたサンプルデータの動的生成処理を完全に排除。Firestore上の実データのみを厳格に表示する。
  * - 選手未選択、または処理中(isSubmitting)はボタンを非活性(disabled)にして二重送信を防止。
- * - 通知権限拒否時や通信エラー時に、具体的な日本語エラーメッセージをUI表示。
  *
  * フェイルセーフ設計:
- * - 初期ロード時に既存データがあるか確認し、選択済み選手を自動選択してUIに復元（リロード時の紐付け維持）。
- * - Firestoreへの保存は { merge: true } を使用し、既存データを破壊せず(fcmToken, selectedEntryId)のみを安全に更新。
+ * - 取得データが0件の場合（entries.length === 0）、プルダウンを非活性化し専用の警告メッセージを表示。
+ * - Firestoreへの保存は { merge: true } を使用し、既存データを破壊せず安全に更新。
  */
 
 'use client';
@@ -58,6 +58,8 @@ export function TeamSelectForm() {
         const q = query(entriesRef, orderBy('bibNumber', 'asc'));
         const querySnapshot = await getDocs(q);
 
+        // Firestoreから取得した「実データ」のみをマッピング
+        // ※ ここに存在していたサンプルデータ（team_Aなど）の動的追加処理を削除済
         const loadedEntries = querySnapshot.docs.map((doc) => {
           const data = doc.data();
           return {
@@ -192,6 +194,8 @@ export function TeamSelectForm() {
             </option>
           ))}
         </select>
+
+        {/* データが0件の場合の警告表示 */}
         {entries.length === 0 && (
           <p className="text-[10px] text-amber-600 font-bold mt-1">
             ※登録されている選手データがありません
@@ -199,7 +203,6 @@ export function TeamSelectForm() {
         )}
       </div>
 
-      {/* メッセージ表示エリア */}
       {message && (
         <div
           className={`p-3 rounded-xl flex items-start gap-2 text-xs font-bold animate-in fade-in ${
@@ -219,7 +222,6 @@ export function TeamSelectForm() {
         </div>
       )}
 
-      {/* 登録ボタン */}
       <Button
         onClick={handleSubscribe}
         disabled={!selectedEntryId || isSubmitting || entries.length === 0}
