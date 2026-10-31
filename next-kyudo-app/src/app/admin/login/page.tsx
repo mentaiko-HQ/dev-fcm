@@ -8,10 +8,11 @@
  *
  * フールプルーフ設計（操作ミス・不正入力の入口遮断）:
  * - 単なる認証済みではなく、確実に「管理者権限 (isAdmin)」を持つ場合のみ /admin へ自動遷移させ、無限ループを防止。
- * - 【修正】ブラウザのパスワードマネージャー警告解消のため autoComplete 属性を明示。
+ * - ブラウザのパスワードマネージャー警告解消のため autoComplete 属性を明示。
  * - 必須項目（メールアドレス、パスワード）の未入力時における送信ブロック。
  *
  * フェイルセーフ設計（障害時の安全縮退）:
+ * - 【修正】認証処理の完了後（成功・失敗問わず）確実に isSubmitting を解除し、ボタンの永続的ロックを防止。
  * - 通信切断や認証例外の捕捉と、操作者への分かりやすい日本語エラー通知。
  */
 
@@ -71,12 +72,13 @@ export default function AdminLoginPage() {
 
     try {
       await loginWithEmailPassword(email, password);
-      // loginWithEmailPassword 成功後、subscribeAdminSession が isAdmin を再評価し、
-      // 権限があれば自動的に /admin へ遷移します。ここでは明示的な router.replace はしません。
+      // 成功時は subscribeAdminSession が isAdmin を再評価し、自動的に /admin へ遷移する
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : 'ログインに失敗しました。';
       setErrorMessage(message);
+    } finally {
+      // フェイルセーフ: 成功・失敗にかかわらずボタンのロックを確実に解除
       setIsSubmitting(false);
     }
   };
