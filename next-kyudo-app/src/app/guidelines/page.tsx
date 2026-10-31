@@ -37,6 +37,8 @@ import {
   Users,
   AlertTriangle,
   Clock,
+  Building2,
+  User,
 } from 'lucide-react';
 
 // フェイルセーフ: Firestore未接続またはドキュメント不在時の安全側初期データ
@@ -146,18 +148,40 @@ export default function GuidelinesPage() {
     <main className="min-h-screen bg-slate-100 p-4 md:p-8 flex flex-col items-center gap-6">
       <div className="w-full max-w-4xl bg-white border border-slate-200 rounded-lg shadow-sm p-6 md:p-8 space-y-8">
         {/* ヘッダー・大会名 */}
-        <div className="border-b border-slate-200 pb-4">
+        <div className="border-b border-slate-200 pb-5">
           <div className="flex items-center gap-2 mb-1.5">
             <span className="text-xs font-bold bg-red-600 text-white px-2.5 py-0.5 rounded">
               大会要項・参加同意事項
             </span>
           </div>
-          <h1 className="text-2xl md:text-3xl font-black text-slate-900">
+          <h1 className="text-2xl md:text-3xl font-black text-slate-900 mb-2">
             第5回めんたいこ杯争奪弓道大会
           </h1>
-          <p className="text-xs text-slate-500 mt-1">
+          <p className="text-xs font-bold text-slate-600 mb-4">
             主催: めんたいこ杯争奪弓道大会実行委員会
           </p>
+
+          {/* 協賛情報エリア */}
+          <div className="flex flex-col sm:flex-row gap-4 bg-slate-50 p-4 rounded-lg border border-slate-200 text-xs">
+            <div className="flex-1 space-y-1.5">
+              <span className="font-bold text-slate-500 flex items-center gap-1">
+                <Building2 className="w-4 h-4 text-slate-400" /> 協賛企業
+              </span>
+              <ul className="text-slate-800 font-semibold space-y-0.5 ml-5">
+                <li>本家相良弓矢製作所</li>
+                <li>有限会社しらみず弓道具店</li>
+                <li>有限会社征矢弓具製作所</li>
+              </ul>
+            </div>
+            <div className="flex-1 space-y-1.5 sm:border-l sm:border-slate-200 sm:pl-4 pt-4 sm:pt-0 border-t border-slate-200 sm:border-t-0">
+              <span className="font-bold text-slate-500 flex items-center gap-1">
+                <User className="w-4 h-4 text-slate-400" /> 個人協賛
+              </span>
+              <ul className="text-slate-800 font-semibold space-y-0.5 ml-5">
+                <li>米農家 緒方充</li>
+              </ul>
+            </div>
+          </div>
         </div>
 
         {/* 期間ステータスバナー（フールプルーフ表示） */}
