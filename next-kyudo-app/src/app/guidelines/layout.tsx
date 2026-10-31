@@ -8,7 +8,9 @@ import React from 'react';
 
 // ブラウザタブに表示されるタイトルを上書き
 export const metadata: Metadata = {
-  title: '５め杯【大会要項・参加同意事項】',
+  title: {
+    absolute: '大会要項・参加同意事項 | ５め杯',
+  },
 };
 
 export default function GuidelinesLayout({

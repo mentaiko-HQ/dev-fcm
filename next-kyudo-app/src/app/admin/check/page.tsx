@@ -6,25 +6,17 @@
  * 1. エントリー詳細の照会（ゼッケン番号、選手氏名、所属、所作、段位、サポート希望、担当者情報）。
  * 2. 参加費納付（isPaid）の承認・取り消しと Firestore への即時反映（楽観的UI更新）。
  * 3. 午前（第1立）および午後（第2・3立）の立順（立番号・射位）インライン編集。
- * 4. 【選手数無制限・立番号自動算出対応（UI表示は「立」に完全統一）】:
- *    - 登録された参加選手数（participants.length）に基づき、5人立での必要立数（Math.max(1, Math.ceil(participants.length / 5))）を動的自動計算。
- *    - 18名の制限を完全に排除し、選手数が何名（50名、100名、200名等）であっても立番号（第1立、第2立...）を自動追従。
- * 5. 【立順設定・保存・送信の段階的連動（フールプルーフ）】:
- *    - 午前・午後の立番号および射位がすべて選択された時点で「保存」ボタンがアクティブ化。
- *    - 保存ボタンが押下され、Firestore への書き込みが完了した後に「メール送信」ボタンがアクティブ化。
- *    - 編集後に保存されていない状態（未保存/Dirty）ではメール送信を遮断し、誤送信を未然に防止。
- * 6. 立順重複（同一立・同一射位の衝突）およびゼッケン重複のリアルタイム検知・保存ブロック。
+ * 4. 【選手数無制限・立番号自動算出対応】: 登録選手数に基づき必要立数を自動計算。
+ * 5. 【立順設定・保存・送信の連動】: 立順が揃って保存されて初めてメール送信を許可。
+ * 6. 立順重複およびゼッケン重複のリアルタイム検知・保存ブロック。
  * 7. メール送信ボタンによる一体型QRカード添付メールの配信（個別送信・一括送信）。
- * 8. サマリー統計カード（総エントリー、入金済、立順未割当、QR未送信）のリアルタイム集計表示。
+ * 8. サマリー統計カードのリアルタイム集計表示。
  *
- * フールプルーフ設計（事故前・対人間）:
- * - 午前午後の立順が揃っていない段階では保存ボタンを非活性化。
- * - 変更後に未保存のままメール送信ボタンを押す操作を入口で遮断。
- * - 重複した立ち順の選手は保存をブロックし、該当セルを赤色警告表示。
+ * フールプルーフ設計:
+ * - 【修正】APIエンドポイントを環境変数 NEXT_PUBLIC_API_BASE_URL から動的に取得。ハードコードによる本番環境での通信エラーを防止。
  *
- * フェイルセーフ設計（事故後・対故障）:
- * - Firestore 書き込み失敗時は直前の確定状態へ安全にロールバック。
- * - メールAPIリクエストに 15秒 のタイムアウト（AbortController）を設定し、UI膠着を回避。
+ * フェイルセーフ設計:
+ * - メールAPIリクエストに 15秒 のタイムアウトを設定し、UI膠着を回避。
  */
 
 'use client';
@@ -80,18 +72,18 @@ import {
   Save,
   Filter,
   Check,
-  Infinity as InfinityIcon,
 } from 'lucide-react';
 
 const API_TIMEOUT_MS = 15000;
+
+// 【フールプルーフ】APIのベースURLを環境変数から取得。未設定時はローカルをフォールバック。
+const API_BASE_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL || 'http://127.0.0.1:8000';
 
 function getNowTimestamp(): number {
   return Date.now();
 }
 
-/**
- * 立ち順の比較用ハッシュキーを生成するヘルパー関数
- */
 function createAssignmentKey(
   assignments: Record<StandRoundIndex, StandAssignment>,
 ): string {
@@ -108,13 +100,10 @@ export default function AdminCheckManagementPage() {
   const router = useRouter();
   const isDbReady = isFirebaseConfigured && isFirestoreAvailable(db);
 
-  // 画面編集用参加者リスト
   const [participants, setParticipants] = useState<Participant[]>([]);
-  // Firestoreに確定保存されている立順ハッシュマップ (participantId -> string)
   const [savedAssignmentsMap, setSavedAssignmentsMap] = useState<
     Record<string, string>
   >({});
-
   const [isLoading, setIsLoading] = useState<boolean>(() => isDbReady);
   const [savingId, setSavingId] = useState<string | null>(null);
   const [processingQrId, setProcessingQrId] = useState<string | null>(null);
@@ -124,7 +113,6 @@ export default function AdminCheckManagementPage() {
     !isDbReady ? 'Firebaseデータベースに接続されていません。' : '',
   );
 
-  // 検索・フィルターステート
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [filterPaid, setFilterPaid] = useState<'ALL' | 'PAID' | 'UNPaid'>(
     'ALL',
@@ -134,11 +122,8 @@ export default function AdminCheckManagementPage() {
     'ALL' | 'ASSIGNED' | 'UNASSIGNED'
   >('ALL');
 
-  // 1. Firestore entries コレクションのリアルタイム購読（全件・無制限）
   useEffect(() => {
-    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
-      return;
-    }
+    if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
     const q = query(collection(db, 'entries'), orderBy('bibNumber', 'asc'));
     const unsubscribe = onSnapshot(
@@ -174,14 +159,8 @@ export default function AdminCheckManagementPage() {
                 rawAssignments[1]?.standOrder ?? null,
               ),
             },
-            2: {
-              standGroup: afternoonGroup,
-              standOrder: afternoonOrder,
-            },
-            3: {
-              standGroup: afternoonGroup,
-              standOrder: afternoonOrder,
-            },
+            2: { standGroup: afternoonGroup, standOrder: afternoonOrder },
+            3: { standGroup: afternoonGroup, standOrder: afternoonOrder },
           };
 
           const participantItem: Participant = {
@@ -274,12 +253,11 @@ export default function AdminCheckManagementPage() {
     return () => unsubscribe();
   }, []);
 
-  // 【動的立数算出】登録参加選手数に基づき5人立での必要立数を自動計算
-  const calculatedTotalStands = useMemo(() => {
-    return calculateTotalStands(participants.length);
-  }, [participants.length]);
+  const calculatedTotalStands = useMemo(
+    () => calculateTotalStands(participants.length),
+    [participants.length],
+  );
 
-  // 既に割当済みの最大立番号も考慮した総立数（フェイルセーフ）
   const totalStands = useMemo(() => {
     let maxStand = 1;
     participants.forEach((p) => {
@@ -291,7 +269,6 @@ export default function AdminCheckManagementPage() {
     return Math.max(calculatedTotalStands, maxStand);
   }, [calculatedTotalStands, participants]);
 
-  // ゼッケン重複チェック
   const duplicateBibNumbers = useMemo(() => {
     const counts = new Map<number, number>();
     participants.forEach((p) => {
@@ -299,14 +276,11 @@ export default function AdminCheckManagementPage() {
     });
     const duplicates = new Set<number>();
     counts.forEach((count, bib) => {
-      if (count > 1) {
-        duplicates.add(bib);
-      }
+      if (count > 1) duplicates.add(bib);
     });
     return duplicates;
   }, [participants]);
 
-  // 立順重複チェック（午前・午後）
   const {
     duplicateMorningPlayerIds,
     duplicateAfternoonPlayerIds,
@@ -370,7 +344,6 @@ export default function AdminCheckManagementPage() {
     };
   }, [participants]);
 
-  // サマリー集計
   const stats = useMemo(() => {
     const total = participants.length;
     const paidCount = participants.filter((p) => p.isPaid).length;
@@ -392,7 +365,6 @@ export default function AdminCheckManagementPage() {
     return { total, paidCount, qrSentCount, unassignedCount };
   }, [participants]);
 
-  // フィルタリング処理
   const filteredParticipants = useMemo(() => {
     return participants.filter((p) => {
       const matchesSearch =
@@ -433,7 +405,6 @@ export default function AdminCheckManagementPage() {
     });
   }, [participants, searchTerm, filterPaid, filterQr, filterStand]);
 
-  // 一括送信対象の判定（入金済、立順完全設定済、保存完了済み、未送信）
   const pendingQrParticipants = useMemo(() => {
     return participants.filter((p) => {
       const m = p.standAssignments[1];
@@ -456,7 +427,6 @@ export default function AdminCheckManagementPage() {
     });
   }, [participants, savedAssignmentsMap]);
 
-  // 入金承認トグル
   const handleTogglePayment = async (participant: Participant) => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -487,9 +457,7 @@ export default function AdminCheckManagementPage() {
       });
 
       setStatusMessage(
-        `ゼッケンNo.${participant.bibNumber} ${participant.name} 選手の入金を「${
-          newPaidStatus ? '承認済' : '未納'
-        }」に更新しました。`,
+        `ゼッケンNo.${participant.bibNumber} ${participant.name} 選手の入金を「${newPaidStatus ? '承認済' : '未納'}」に更新しました。`,
       );
       setTimeout(() => setStatusMessage(''), 2500);
     } catch (err) {
@@ -509,7 +477,6 @@ export default function AdminCheckManagementPage() {
     }
   };
 
-  // 立順変更入力ハンドラー
   const handleAssignmentChange = (
     id: string,
     period: 'morning' | 'afternoon',
@@ -540,18 +507,13 @@ export default function AdminCheckManagementPage() {
           const updated = { ...cur, [field]: val };
           return {
             ...p,
-            standAssignments: {
-              ...p.standAssignments,
-              2: updated,
-              3: updated,
-            },
+            standAssignments: { ...p.standAssignments, 2: updated, 3: updated },
           };
         }
       }),
     );
   };
 
-  // 立順保存処理
   const handleSaveParticipantSettings = async (participant: Participant) => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -607,10 +569,7 @@ export default function AdminCheckManagementPage() {
       });
 
       const newKey = createAssignmentKey(normalizedAssignments);
-      setSavedAssignmentsMap((prev) => ({
-        ...prev,
-        [participant.id]: newKey,
-      }));
+      setSavedAssignmentsMap((prev) => ({ ...prev, [participant.id]: newKey }));
 
       setStatusMessage(
         `ゼッケンNo.${participant.bibNumber} ${participant.name} 選手の立順設定を保存しました。メール送信が可能になりました。`,
@@ -624,7 +583,6 @@ export default function AdminCheckManagementPage() {
     }
   };
 
-  // 個別QRコード送信処理
   const handleSendSingleQr = async (participant: Participant) => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -690,8 +648,9 @@ export default function AdminCheckManagementPage() {
         checkinPayload: qrPayload,
       });
 
+      // 【修正】API_BASE_URL を利用する
       const response = await fetch(
-        'http://127.0.0.1:8000/api/v1/email/send-qr-single',
+        `${API_BASE_URL}/api/v1/email/send-qr-single`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -765,7 +724,6 @@ export default function AdminCheckManagementPage() {
     }
   };
 
-  // 一括QRコード送信処理
   const handleBatchSendQr = async () => {
     if (pendingQrParticipants.length === 0) return;
 
@@ -822,31 +780,29 @@ export default function AdminCheckManagementPage() {
           checkinPayload: qrPayload,
         });
 
-        const res = await fetch(
-          'http://127.0.0.1:8000/api/v1/email/send-qr-single',
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            signal: controller.signal,
-            body: JSON.stringify({
-              tournamentTitle: '第5回めんたいこ杯争奪弓道大会',
-              participantId: participant.id,
-              bibNumber: participant.bibNumber,
-              name: participant.name,
-              nameKana: participant.nameKana || '',
-              email: targetEmail,
-              organization: participant.organization || '無所属',
-              shosa: participant.shosa || '肌脱ぎ',
-              rankTitle: participant.rankTitle || '段位は三段以下',
-              stand1Group: m.standGroup,
-              stand1Order: m.standOrder,
-              stand2Group: a.standGroup,
-              stand2Order: a.standOrder,
-              checkinPayload: qrPayload,
-              qrCardBase64: cardResult.dataUrl,
-            }),
-          },
-        );
+        // 【修正】API_BASE_URL を利用する
+        const res = await fetch(`${API_BASE_URL}/api/v1/email/send-qr-single`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            tournamentTitle: '第5回めんたいこ杯争奪弓道大会',
+            participantId: participant.id,
+            bibNumber: participant.bibNumber,
+            name: participant.name,
+            nameKana: participant.nameKana || '',
+            email: targetEmail,
+            organization: participant.organization || '無所属',
+            shosa: participant.shosa || '肌脱ぎ',
+            rankTitle: participant.rankTitle || '段位は三段以下',
+            stand1Group: m.standGroup,
+            stand1Order: m.standOrder,
+            stand2Group: a.standGroup,
+            stand2Order: a.standOrder,
+            checkinPayload: qrPayload,
+            qrCardBase64: cardResult.dataUrl,
+          }),
+        });
 
         clearTimeout(timeoutId);
 
@@ -896,7 +852,6 @@ export default function AdminCheckManagementPage() {
 
   return (
     <main className="min-h-screen bg-[#F8FAFC] text-slate-900 p-4 sm:p-6 lg:p-8 space-y-6 w-full">
-      {/* ページヘッダー */}
       <div className="w-full flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white border border-slate-200/80 p-6 rounded-2xl shadow-sm">
         <div className="space-y-1">
           <div className="flex items-center gap-2">
@@ -948,7 +903,6 @@ export default function AdminCheckManagementPage() {
         </div>
       </div>
 
-      {/* サマリーステータスカード群 */}
       <div className="w-full grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-2xs space-y-1">
           <span className="text-xs font-bold text-slate-500 flex items-center gap-1.5">
@@ -998,7 +952,6 @@ export default function AdminCheckManagementPage() {
         </div>
       </div>
 
-      {/* ステータスメッセージバナー */}
       {statusMessage && (
         <div className="w-full p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 text-xs font-bold flex items-center gap-2">
           <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
@@ -1013,7 +966,6 @@ export default function AdminCheckManagementPage() {
         </div>
       )}
 
-      {/* ゼッケン番号重複警告 */}
       {duplicateBibNumbers.size > 0 && (
         <div className="w-full p-4 bg-red-50 border border-red-200 rounded-xl text-red-900 text-xs flex items-start gap-2.5">
           <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
@@ -1029,7 +981,6 @@ export default function AdminCheckManagementPage() {
         </div>
       )}
 
-      {/* 立順重複警告 */}
       {(duplicateMorningSlotLabels.length > 0 ||
         duplicateAfternoonSlotLabels.length > 0) && (
         <div className="w-full p-4 bg-red-50 border border-red-200 rounded-xl text-red-900 text-xs flex items-start gap-2.5">
@@ -1057,7 +1008,6 @@ export default function AdminCheckManagementPage() {
         </div>
       )}
 
-      {/* 検索・フィルターツールバー */}
       <div className="w-full flex flex-col md:flex-row md:items-center justify-between gap-3 bg-white p-4 rounded-2xl border border-slate-200/80 shadow-xs">
         <div className="relative flex-1 max-w-lg">
           <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -1120,7 +1070,6 @@ export default function AdminCheckManagementPage() {
         </div>
       </div>
 
-      {/* エントリー照会・設定テーブル */}
       <div className="w-full bg-white border border-slate-200/80 rounded-2xl overflow-hidden shadow-sm">
         <Table className="w-full text-xs">
           <TableHeader className="bg-slate-50/90 text-slate-700 border-b border-slate-200">
@@ -1217,7 +1166,6 @@ export default function AdminCheckManagementPage() {
                         : ''
                     }`}
                   >
-                    {/* ゼッケン番号 */}
                     <TableCell className="font-mono font-black text-sm text-slate-900 align-top pt-4">
                       No.{p.bibNumber}
                       {isBibDuplicate && (
@@ -1227,7 +1175,6 @@ export default function AdminCheckManagementPage() {
                       )}
                     </TableCell>
 
-                    {/* 選手情報 */}
                     <TableCell className="align-top pt-4">
                       <div className="font-bold text-slate-900 text-sm">
                         {p.name}
@@ -1248,7 +1195,6 @@ export default function AdminCheckManagementPage() {
                       )}
                     </TableCell>
 
-                    {/* 申込担当者情報 */}
                     <TableCell className="align-top pt-4 max-w-[200px]">
                       <div className="font-bold text-slate-800 text-xs">
                         {p.representativeName || '未登録'} 様
@@ -1264,7 +1210,6 @@ export default function AdminCheckManagementPage() {
                       </div>
                     </TableCell>
 
-                    {/* 入金承認 */}
                     <TableCell className="text-center align-top pt-4">
                       <button
                         type="button"
@@ -1297,10 +1242,8 @@ export default function AdminCheckManagementPage() {
                       )}
                     </TableCell>
 
-                    {/* 立順入力フォーム（何立でも無制限に入力・編成可能） */}
                     <TableCell className="align-top pt-3">
                       <div className="space-y-2">
-                        {/* 午前 */}
                         <div
                           className={`flex items-center gap-2 p-2 rounded-lg border transition-colors ${
                             isMorningDuplicate
@@ -1380,7 +1323,6 @@ export default function AdminCheckManagementPage() {
                           )}
                         </div>
 
-                        {/* 午後 */}
                         <div
                           className={`flex items-center gap-2 p-2 rounded-lg border transition-colors ${
                             isAfternoonDuplicate
@@ -1462,7 +1404,6 @@ export default function AdminCheckManagementPage() {
                       </div>
                     </TableCell>
 
-                    {/* 立順保存ボタン */}
                     <TableCell className="text-center align-top pt-4">
                       <div className="flex flex-col items-center gap-1">
                         <Button
@@ -1515,7 +1456,6 @@ export default function AdminCheckManagementPage() {
                       </div>
                     </TableCell>
 
-                    {/* メール送信ボタン */}
                     <TableCell className="text-center align-top pt-4">
                       <div className="flex flex-col items-center gap-1.5">
                         <Button
@@ -1588,10 +1528,7 @@ export default function AdminCheckManagementPage() {
                             {p.qrSentAt
                               ? new Date(p.qrSentAt).toLocaleTimeString(
                                   'ja-JP',
-                                  {
-                                    hour: '2-digit',
-                                    minute: '2-digit',
-                                  },
+                                  { hour: '2-digit', minute: '2-digit' },
                                 )
                               : '完了'}
                             )
