@@ -7,9 +7,9 @@
  * - ログイン完了後の `/admin` ダッシュボードへの自動遷移。
  *
  * フールプルーフ設計（操作ミス・不正入力の入口遮断）:
+ * - 【修正】単なる認証済み（選手用の匿名ログイン等）ではなく、確実に「管理者権限 (isAdmin)」を持つ場合のみ /admin へ自動遷移させ、無限ループを防止。
  * - 必須項目（メールアドレス、パスワード）の未入力時における送信ブロック。
  * - 多重送信・連打防止（isSubmitting によるボタン非活性化とスピナー表示）。
- * - 既にログイン済みの場合は即座に `/admin` へ自動リダイレクト。
  *
  * フェイルセーフ設計（障害時の安全縮退）:
  * - 通信切断や認証例外の捕捉と、操作者への分かりやすい日本語エラー通知。
@@ -39,11 +39,13 @@ export default function AdminLoginPage() {
   const [errorMessage, setErrorMessage] = useState<string>('');
   const [isCheckingSession, setIsCheckingSession] = useState<boolean>(true);
 
-  // 既にログイン済みの場合は /admin へ自動遷移
+  // 既に管理者としてログイン済みの場合は /admin へ自動遷移
   useEffect(() => {
     const unsubscribe = subscribeAdminSession((status) => {
       if (!status.isLoading) {
-        if (status.isAuthenticated) {
+        // フールプルーフ修正: isAdmin (管理者権限) が true の場合のみ自動遷移
+        // これにより、一般選手の匿名セッションが残っていても無限ループせずログイン画面に留まる
+        if (status.isAuthenticated && status.isAdmin) {
           router.replace('/admin');
         } else {
           setIsCheckingSession(false);
@@ -66,6 +68,7 @@ export default function AdminLoginPage() {
     setErrorMessage('');
 
     try {
+      // loginWithEmailPassword を呼ぶと、既存の匿名セッションは自動でログアウトされ、管理者としてログインします
       await loginWithEmailPassword(email, password);
       router.replace('/admin');
     } catch (err: unknown) {
