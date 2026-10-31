@@ -15,6 +15,7 @@
 - Resend SDK の TypedDict 定義差分を typing.cast で安全に吸収し、Pylance 型エラーを解消。
 
 フェイルセーフ設計:
+- 【修正】CORS設定 (ALLOWED_ORIGINS) にVercelの本番ドメインとワイルドカードを追加し、本番環境からの通信拒否(ERR_CONNECTION_REFUSED / Failed to fetch)を防止。
 - Resend APIキー未設定時は success=False かつ isSimulation=True とし、UI側に設定不備を明示して安全に縮退。
 - サーバーOS上に日本語フォントが存在しない場合でもデフォルトフォント (ImageFont.load_default) へ安全にフォールバック。
 - Resend API通信時の例外を捕捉し、スタックトレース付きエラーログを記録してクライアントへ安全なJSONレスポンスを返却。
@@ -76,10 +77,14 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS設定
+# 【修正】CORS設定 (Vercel本番ドメインの追加とフールプルーフのワイルドカード)
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://5th.mentaikotrophy-hq.com",
+    "https://www.5th.mentaikotrophy-hq.com",
+    # VercelのプレビューURL等からのアクセスも許可する場合はワイルドカードも有効
+    "*"
 ]
 
 app.add_middleware(
