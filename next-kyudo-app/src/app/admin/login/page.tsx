@@ -7,9 +7,9 @@
  * - ログイン完了後の `/admin` ダッシュボードへの自動遷移。
  *
  * フールプルーフ設計（操作ミス・不正入力の入口遮断）:
- * - 【修正】単なる認証済み（選手用の匿名ログイン等）ではなく、確実に「管理者権限 (isAdmin)」を持つ場合のみ /admin へ自動遷移させ、無限ループを防止。
+ * - 単なる認証済みではなく、確実に「管理者権限 (isAdmin)」を持つ場合のみ /admin へ自動遷移させ、無限ループを防止。
+ * - 【修正】ブラウザのパスワードマネージャー警告解消のため autoComplete 属性を明示。
  * - 必須項目（メールアドレス、パスワード）の未入力時における送信ブロック。
- * - 多重送信・連打防止（isSubmitting によるボタン非活性化とスピナー表示）。
  *
  * フェイルセーフ設計（障害時の安全縮退）:
  * - 通信切断や認証例外の捕捉と、操作者への分かりやすい日本語エラー通知。
@@ -43,12 +43,14 @@ export default function AdminLoginPage() {
   useEffect(() => {
     const unsubscribe = subscribeAdminSession((status) => {
       if (!status.isLoading) {
-        // フールプルーフ修正: isAdmin (管理者権限) が true の場合のみ自動遷移
-        // これにより、一般選手の匿名セッションが残っていても無限ループせずログイン画面に留まる
         if (status.isAuthenticated && status.isAdmin) {
           router.replace('/admin');
         } else {
           setIsCheckingSession(false);
+          // 管理者権限がないのにログインしている状態（一般参加者セッションなど）の場合のエラー表示
+          if (status.isAuthenticated && !status.isAdmin) {
+            setErrorMessage('このアカウントには管理者権限がありません。');
+          }
         }
       }
     });
@@ -68,14 +70,13 @@ export default function AdminLoginPage() {
     setErrorMessage('');
 
     try {
-      // loginWithEmailPassword を呼ぶと、既存の匿名セッションは自動でログアウトされ、管理者としてログインします
       await loginWithEmailPassword(email, password);
-      router.replace('/admin');
+      // loginWithEmailPassword 成功後、subscribeAdminSession が isAdmin を再評価し、
+      // 権限があれば自動的に /admin へ遷移します。ここでは明示的な router.replace はしません。
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : 'ログインに失敗しました。';
       setErrorMessage(message);
-    } finally {
       setIsSubmitting(false);
     }
   };
@@ -135,6 +136,7 @@ export default function AdminLoginPage() {
                   type="email"
                   required
                   disabled={isSubmitting}
+                  autoComplete="username"
                   value={email}
                   onChange={(e) => {
                     setEmail(e.target.value);
@@ -157,6 +159,7 @@ export default function AdminLoginPage() {
                   type="password"
                   required
                   disabled={isSubmitting}
+                  autoComplete="current-password"
                   value={password}
                   onChange={(e) => {
                     setPassword(e.target.value);
