@@ -10,6 +10,7 @@
  *
  * フェイルセーフ設計（障害時の安全縮退）:
  * - ネットワーク切断等でFirestoreの読み取りに失敗した場合でも、スーパー管理者であればシステムを停止させずに通す。
+ * - 【修正】コンポーネント連携エラー解消のため、ログアウト関数名を logoutAdmin に統一。
  */
 
 import {
@@ -122,10 +123,14 @@ export async function loginWithEmailPassword(email: string, pass: string) {
   }
 }
 
-export async function logout() {
+// 修正: エラーとなっていた関数名を logout から logoutAdmin へ変更
+export async function logoutAdmin(): Promise<void> {
+  if (!auth) return;
   try {
     await signOut(auth);
+    console.info('【運営ログアウト完了】');
   } catch (error) {
     console.error('【ログアウトエラー】:', error);
+    throw error;
   }
 }
