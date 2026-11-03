@@ -8,7 +8,7 @@
  * フールプルーフ設計（データ保護）:
  * - isValidEntryUpdate(): フロントエンドから送られてくる更新データのキー（affectedKeys）が、
  *   事前に許可されたリスト（hasOnly）に完全に一致する場合のみ update を許可。
- *   ※ ここに 'isSokuchu' を追加することで、束中賞フラグの保存エラーを解消。
+ *   ※ 'isSokuchu' に加え、午前/午後の立順キー（stand1Group等）も網羅し既存機能を完全保護。
  */
 
 rules_version = '2';
@@ -42,18 +42,21 @@ service cloud.firestore {
              (!('groupNumber' in data) || data.groupNumber == null || (data.groupNumber is int && data.groupNumber >= 1));
     }
 
-    // 5. エントリー更新バリデーション
+    // 5. エントリー更新バリデーション（既存機能をすべて維持するホワイトリスト）
     function isValidEntryUpdate() {
       return request.resource.data.diff(resource.data).affectedKeys()
         .hasOnly([
-          'name', 'nameKana', 'organization', 'shosa', 'rankTitle',
+          'name', 'nameKana', 'email', 'organization', 'teamId', 'teamName',
+          'shosa', 'rankTitle',
           'needsSupport', 'staffRole', 'staffDutyShift', 'notes',
           'isPaid', 'paidAt', 'bibNumber', 'standAssignments',
           'standNumber', 'groupNumber', 'standGroup', 'standOrder',
+          'stand1Group', 'stand1Order', 'stand2Group', 'stand2Order',
           'checkInStatus', 'checkInAt', 'checkInMethod',
           'qualificationStatus', 'progressStatus',
           'stand1_arrows', 'stand2_arrows', 'stand3_arrows',
-          'isHayaHit', 'isSokuchu', 'totalHits', 'totalShots', 'isPerfect', // ★ 'isSokuchu' を追加してエラーを解消
+          'stage1Shots', 'stage2Shots', 'stage3Shots',
+          'isHayaHit', 'isSokuchu', 'totalHits', 'totalShots', 'isPerfect',
           'enkinRank', 'finalRank',
           'qrSentStatus', 'qrSentAt', 'qrSentError', 'updatedAt'
         ]) && isValidStandStructure();
@@ -78,7 +81,7 @@ service cloud.firestore {
     match /entries/{entryId} {
       allow read: if true;
       allow create: if true;
-      allow update: if isValidEntryUpdate(); // 更新許可リストに従う
+      allow update: if isValidEntryUpdate() || isSuperAdmin();
       allow delete: if isOperator() || isSuperAdmin();
     }
 
