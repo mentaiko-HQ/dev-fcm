@@ -1,23 +1,18 @@
 /**
- * 【参加者・観客向け リアルタイム成績速報＆立順閲覧ページ】
+ * 【参加者・観客向け リアルタイム成績速報＆立順閲覧ページ（スマートフォン縦画面・カードUI対応版）】
  * /results パスに対応するページコンポーネント。
  *
  * 役割:
- * 1. ページ上部の不要なヘッダー枠および5つのサマリーメーターカード群を排除し、
- *    スマートフォンで開いた瞬間に「ステージ切替タブ」「組選択・検索」「立順・成績一覧」がファーストビューに入るよう最適化。
- * 2. StandScoreContainer.tsx と完全に同一の組・立構造ロジックを採用:
+ * 1. スマートフォン縦画面での閲覧に特化し、ステージ別表示・総合成績表示ともに横スクロール不要のカードレイアウトを採用。
+ * 2. 総合成績タブから不要な「立ちG (組) ・ 立ち (午前 / 午後)」表示を排除し、
+ *    「順位」「ゼッケン・選手名・所属チーム・特別賞」「第1〜第3ステージ内訳」「通算的中(8射)」を1枚の縦型カード内に完結。
+ * 3. StandScoreContainer.tsx と同一の組・立構造ロジックを採用:
  *    - STANDS_PER_GROUP = 2, PLAYERS_PER_STAND = 5 (1組 = 2立 = 10名)
- *    - 第1組 = 第1立(前半立)・第2立(後半立)、第2組 = 第3立(前半立)・第4立(後半立)...
- * 3. 4つのタブ設置:
- *    - 第1ステージ (午前・一手 2射)
- *    - 第2ステージ (午後・一手 2射)
- *    - 第3ステージ (午後・四矢 4射)
- *    - 総合成績 (全8射・順位・特別賞一覧)
- * 4. 第1立から昇順に参加選手を「立ちG(組)、立ち(前半/後半)・射位、選手名、所属チーム、確定成績」で表示。
- * 5. Firestore `entries` コレクションを `onSnapshot` でリアルタイム監視し、記録員が確定した瞬間に即座に反映。
+ *    - 第1組 = 第1立・第2立、第2組 = 第3立・第4立... として全組を第1立から昇順で一覧表示。
+ * 4. Firestore `entries` コレクションを `onSnapshot` でリアルタイム監視し、記録員が確定した瞬間に即座に反映。
  *
  * フールプルーフ設計（事故前・対人間）:
- * - 組選択ボタン「第1組 (第1・2立)」「第2組 (第3・4立)...」と「すべての組」を切り替え可能にし、会場スマホでの見失いを防止。
+ * - 横スクロールバーを完全に排除し、スマートフォンの親指による上下スクロールのみで全情報（順位・内訳・総的中）を視認可能に設計。
  * - 第3ステージは一括数値入力（0〜4中）と個別〇✕表示の双方に対応し、未入力状態（「行射前」）と「0中」を明確に区別。
  *
  * フェイルセーフ設計（事故後・対故障）:
@@ -54,26 +49,11 @@ import {
   sanitizeRankTitleType,
 } from '@/types';
 import { Button } from '@/components/ui/button';
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card';
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
   Target,
   Sun,
   Moon,
-  Users,
   Trophy,
   Search,
   AlertCircle,
@@ -109,17 +89,6 @@ function getStandNumbersByGroup(groupNumber: number): [number, number] {
   const firstStand = (safeGroup - 1) * STANDS_PER_GROUP + 1;
   const secondStand = safeGroup * STANDS_PER_GROUP;
   return [firstStand, secondStand];
-}
-
-/**
- * 立番号 (1, 2, 3, 4...) から所属する組番号 (立ちG: 1, 2...) を算出する
- * 例: 第1立・第2立 -> 第1組, 第3立・第4立 -> 第2組
- */
-function getGroupNumberByStand(
-  standNumber: number | null | undefined,
-): number | null {
-  if (!standNumber || standNumber <= 0) return null;
-  return Math.ceil(standNumber / STANDS_PER_GROUP);
 }
 
 /**
@@ -303,10 +272,6 @@ export default function ResultsPage() {
 
   // タブ状態: 1(第1ステージ), 2(第2ステージ), 3(第3ステージ), 'OVERALL'(総合成績)
   const [selectedTab, setSelectedTab] = useState<ResultTabKey>(1);
-  // 組選択状態: 'ALL'(全組を第1立から昇順表示) または 組番号(1, 2, 3...)
-  const [selectedGroupFilter, setSelectedGroupFilter] = useState<
-    number | 'ALL'
-  >('ALL');
   // 検索キーワード
   const [searchTerm, setSearchTerm] = useState<string>('');
 
@@ -465,7 +430,7 @@ export default function ResultsPage() {
     });
   }, [participants]);
 
-  // 組（第1組＝第1・2立、第2組＝第3・4立...）の選択肢配列を計算
+  // 全ての組番号（第1組, 第2組...）を昇順で算出
   const groupOptions = useMemo(() => {
     let maxAssignedStand = 1;
     activeParticipants.forEach((p) => {
@@ -500,12 +465,6 @@ export default function ResultsPage() {
   // 現在選択されているステージ番号 (1 | 2 | 3)
   const currentRound: StandRoundIndex =
     selectedTab === 'OVERALL' ? 1 : selectedTab;
-
-  // 表示する組番号の配列（'ALL' の場合は第1組から昇順すべて、個別選択時はその組のみ）
-  const visibleGroupNumbers = useMemo(() => {
-    if (selectedGroupFilter === 'ALL') return groupOptions;
-    return [selectedGroupFilter];
-  }, [selectedGroupFilter, groupOptions]);
 
   // 総合成績タブ用のランキングデータ（全8射・同中タイ順位・特別賞対応）
   const overallRankedParticipants = useMemo(() => {
@@ -653,10 +612,6 @@ export default function ResultsPage() {
                 立ちG: 第{groupNumber}組 / 第{standNumber}立 (
                 {getStandOrderLabel(standOrder)})
               </span>
-              <span className="text-slate-300">|</span>
-              <span className="font-bold text-slate-800 font-mono text-[11px]">
-                通算: {participant.totalHits} / 8中
-              </span>
             </div>
           </div>
         </div>
@@ -705,7 +660,7 @@ export default function ResultsPage() {
         </div>
       )}
 
-      {/* メインカードコンテナ (StandScoreContainer.tsx と完全統一されたUI構造) */}
+      {/* メインカードコンテナ */}
       <Card className="w-full shadow-sm border border-slate-200/80 rounded-2xl bg-white overflow-hidden">
         <CardHeader className="bg-white border-b border-slate-100 p-5 space-y-3">
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
@@ -733,9 +688,6 @@ export default function ResultsPage() {
                 <Target className="w-5 h-5 text-amber-500" />
                 ステージ別 立ち順・リアルタイム成績一覧
               </CardTitle>
-              <CardDescription className="text-slate-500 text-xs mt-0.5 font-medium">
-                1組＝2立（計10名）編成です。タブでステージを切り替え、組ボタンまたは検索ボックスから選手を絞り込めます。
-              </CardDescription>
             </div>
 
             {/* 選手名・チーム名検索ボックス */}
@@ -814,56 +766,15 @@ export default function ResultsPage() {
               総合成績
             </button>
           </div>
-
-          {/* 組選択バー (StandScoreContainerと完全同一の「第1組 (第1・2立)」ピルボタン + 「すべての組」) */}
-          {selectedTab !== 'OVERALL' && (
-            <div className="flex items-center gap-2 overflow-x-auto pt-1 pb-0.5">
-              <span className="text-xs font-bold text-slate-600 shrink-0 flex items-center gap-1">
-                <Users className="w-3.5 h-3.5 text-slate-400" />
-                組選択(2立・10名/組):
-              </span>
-
-              <button
-                type="button"
-                onClick={() => setSelectedGroupFilter('ALL')}
-                className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all font-mono shrink-0 ${
-                  selectedGroupFilter === 'ALL'
-                    ? 'bg-amber-500 text-slate-950 font-black shadow-2xs'
-                    : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200'
-                }`}
-              >
-                すべての組 (第1立から昇順)
-              </button>
-
-              {groupOptions.map((groupNum) => {
-                const [s1, s2] = getStandNumbersByGroup(groupNum);
-                return (
-                  <button
-                    key={groupNum}
-                    type="button"
-                    onClick={() => setSelectedGroupFilter(groupNum)}
-                    className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all font-mono shrink-0 ${
-                      selectedGroupFilter === groupNum
-                        ? 'bg-amber-500 text-slate-950 font-black shadow-2xs'
-                        : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200'
-                    }`}
-                    title={`第${groupNum}組（第${s1}立・第${s2}立の計10名を表示）`}
-                  >
-                    第 {groupNum} 組 (第{s1}・{s2}立)
-                  </button>
-                );
-              })}
-            </div>
-          )}
         </CardHeader>
 
-        <CardContent className="p-5 space-y-6">
+        <CardContent className="p-4 sm:p-5 space-y-6">
           {selectedTab !== 'OVERALL' ? (
             /* ==========================================
-               第1・第2・第3ステージ：組（2立）および前半立・後半立の昇順表示
+               第1・第2・第3ステージ：すべての組・立を第1立から昇順表示
                ========================================== */
             <>
-              {visibleGroupNumbers.map((groupNumber) => {
+              {groupOptions.map((groupNumber) => {
                 const [firstStandNumber, secondStandNumber] =
                   getStandNumbersByGroup(groupNumber);
 
@@ -894,7 +805,6 @@ export default function ResultsPage() {
                 const groupTotalPlayers =
                   firstStandPlayers.length + secondStandPlayers.length;
 
-                // 検索中でその組に該当者が0名の場合はスキップ
                 if (searchTerm.trim() !== '' && groupTotalPlayers === 0) {
                   return null;
                 }
@@ -914,10 +824,6 @@ export default function ResultsPage() {
                         <span className="text-slate-950 font-mono font-black bg-amber-100 border border-amber-300 px-2.5 py-0.5 rounded">
                           立ちG: 第 {groupNumber} 組
                         </span>
-                        <span className="text-slate-600 text-[11px] font-mono">
-                          （第 {firstStandNumber} 立・第 {secondStandNumber} 立
-                          / 登録: {groupTotalPlayers} 名）
-                        </span>
                       </div>
                       <span className="text-[11px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md self-start sm:self-auto">
                         {currentRound === 1
@@ -931,16 +837,8 @@ export default function ResultsPage() {
                     {/* 前半立（第 2N-1 立）セクション */}
                     <div className="space-y-2.5 bg-slate-50/70 p-4 rounded-2xl border border-slate-200/90">
                       <div className="flex items-center justify-between border-b border-slate-200 pb-2">
-                        <div className="flex items-center gap-2">
-                          <span className="px-2.5 py-0.5 rounded-md bg-slate-900 text-white font-mono text-xs font-black">
-                            第 {firstStandNumber} 立
-                          </span>
-                          <span className="text-xs text-slate-500 font-bold">
-                            （第 {groupNumber} 組 前半立・最大5名）
-                          </span>
-                        </div>
-                        <span className="text-xs font-mono font-bold text-slate-600">
-                          登録: {firstStandPlayers.length} 名
+                        <span className="px-2.5 py-0.5 rounded-md bg-slate-900 text-white font-mono text-xs font-black">
+                          第 {firstStandNumber} 立
                         </span>
                       </div>
 
@@ -964,16 +862,8 @@ export default function ResultsPage() {
                     {/* 後半立（第 2N 立）セクション */}
                     <div className="space-y-2.5 bg-slate-50/70 p-4 rounded-2xl border border-slate-200/90">
                       <div className="flex items-center justify-between border-b border-slate-200 pb-2">
-                        <div className="flex items-center gap-2">
-                          <span className="px-2.5 py-0.5 rounded-md bg-slate-800 text-amber-400 font-mono text-xs font-black">
-                            第 {secondStandNumber} 立
-                          </span>
-                          <span className="text-xs text-slate-500 font-bold">
-                            （第 {groupNumber} 組 後半立・最大5名）
-                          </span>
-                        </div>
-                        <span className="text-xs font-mono font-bold text-slate-600">
-                          登録: {secondStandPlayers.length} 名
+                        <span className="px-2.5 py-0.5 rounded-md bg-slate-800 text-amber-400 font-mono text-xs font-black">
+                          第 {secondStandNumber} 立
                         </span>
                       </div>
 
@@ -999,15 +889,15 @@ export default function ResultsPage() {
             </>
           ) : (
             /* ==========================================
-               総合成績タブ：全8射合計的中ランキング・各ステージ内訳テーブル
+               総合成績タブ：スマートフォン縦画面向け カードリスト表示（横スクロール不要）
                ========================================== */
-            <div className="w-full border border-slate-200/80 rounded-2xl overflow-hidden">
-              <div className="bg-slate-900 text-white px-5 py-3.5 flex flex-wrap items-center justify-between gap-2">
+            <div className="space-y-3">
+              {/* 総合成績ヘッダーバー */}
+              <div className="bg-slate-900 text-white px-4 py-3 rounded-2xl flex flex-wrap items-center justify-between gap-2 shadow-2xs">
                 <div className="flex items-center gap-2">
-                  <Trophy className="w-4 h-4 text-amber-400" />
-                  <span className="font-black text-sm">
-                    総合成績ランキング（第1ステージ2射 ＋ 第2ステージ2射 ＋
-                    第3ステージ4射 ＝ 全8射）
+                  <Trophy className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span className="font-black text-xs sm:text-sm">
+                    総合成績ランキング（全8射）
                   </span>
                 </div>
                 <span className="text-xs font-mono text-slate-300">
@@ -1015,221 +905,204 @@ export default function ResultsPage() {
                 </span>
               </div>
 
-              <div className="w-full overflow-x-auto">
-                <Table className="w-full min-w-[820px] text-xs">
-                  <TableHeader className="bg-slate-50/90 text-slate-700 border-b border-slate-200">
-                    <TableRow>
-                      <TableHead className="w-20 font-bold text-slate-900 text-center">
-                        順位
-                      </TableHead>
-                      <TableHead className="font-bold text-slate-900">
-                        選手名 / 特別賞
-                      </TableHead>
-                      <TableHead className="font-bold text-slate-900">
-                        所属チーム
-                      </TableHead>
-                      <TableHead className="font-bold text-slate-900">
-                        立ちG (組) ・ 立ち (午前 / 午後)
-                      </TableHead>
-                      <TableHead className="font-bold text-slate-900 text-center w-24">
-                        第1 (午前2射)
-                      </TableHead>
-                      <TableHead className="font-bold text-slate-900 text-center w-24">
-                        第2 (午後2射)
-                      </TableHead>
-                      <TableHead className="font-bold text-slate-900 text-center w-24">
-                        第3 (午後4射)
-                      </TableHead>
-                      <TableHead className="font-bold text-slate-900 text-center w-28">
-                        通算的中
-                      </TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody className="divide-y divide-slate-100">
-                    {overallRankedParticipants.length === 0 ? (
-                      <TableRow>
-                        <TableCell
-                          colSpan={8}
-                          className="py-12 text-center text-slate-400 font-medium"
-                        >
-                          該当する選手データはありません。
-                        </TableCell>
-                      </TableRow>
-                    ) : (
-                      overallRankedParticipants.map((item, idx) => {
-                        const { participant: p } = item;
-                        const isAbsent =
-                          p.checkInStatus === 'ABSENT' ||
-                          p.qualificationStatus === 'WITHDRAWN';
+              {overallRankedParticipants.length === 0 ? (
+                <div className="py-12 text-center text-slate-400 text-xs font-medium bg-slate-50 rounded-2xl border border-dashed border-slate-200">
+                  該当する選手データはありません。
+                </div>
+              ) : (
+                <div className="space-y-2.5">
+                  {overallRankedParticipants.map((item, idx) => {
+                    const { participant: p } = item;
+                    const isAbsent =
+                      p.checkInStatus === 'ABSENT' ||
+                      p.qualificationStatus === 'WITHDRAWN';
 
-                        const amStand = p.standAssignments[1]?.standGroup;
-                        const amGroup = getGroupNumberByStand(amStand);
-                        const amOrder = p.standAssignments[1]?.standOrder;
+                    const rank =
+                      p.finalRank ??
+                      (idx > 0 &&
+                      overallRankedParticipants[idx - 1].effectiveTotal ===
+                        item.effectiveTotal
+                        ? overallRankedParticipants.findIndex(
+                            (r) => r.effectiveTotal === item.effectiveTotal,
+                          ) + 1
+                        : idx + 1);
 
-                        const pmStand = p.standAssignments[2]?.standGroup;
-                        const pmGroup = getGroupNumberByStand(pmStand);
-                        const pmOrder = p.standAssignments[2]?.standOrder;
-
-                        const rank =
-                          p.finalRank ??
-                          (idx > 0 &&
-                          overallRankedParticipants[idx - 1].effectiveTotal ===
-                            item.effectiveTotal
-                            ? overallRankedParticipants.findIndex(
-                                (r) => r.effectiveTotal === item.effectiveTotal,
-                              ) + 1
-                            : idx + 1);
-
-                        return (
-                          <TableRow
-                            key={p.id}
-                            className={`hover:bg-slate-50/70 transition-colors ${
+                    return (
+                      <div
+                        key={p.id}
+                        className={`p-3.5 sm:p-4 rounded-2xl border transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                          isAbsent
+                            ? 'bg-rose-50/30 border-rose-200 opacity-65'
+                            : item.hasAnyRecord && rank <= 3
+                              ? 'bg-amber-50/30 border-amber-300/80 shadow-2xs'
+                              : 'bg-white border-slate-200/90 shadow-2xs hover:border-slate-300'
+                        }`}
+                      >
+                        {/* 上段（スマホ）/ 左側（PC）：順位バッジ ＋ 選手名・所属チーム・特別賞 */}
+                        <div className="flex items-start sm:items-center gap-3 min-w-0">
+                          {/* 順位ボックス */}
+                          <div
+                            className={`w-12 h-12 rounded-xl flex flex-col items-center justify-center shrink-0 font-mono ${
                               isAbsent
-                                ? 'bg-rose-50/40 opacity-70'
-                                : item.hasAnyRecord && rank <= 3
-                                  ? 'bg-amber-50/30'
-                                  : ''
+                                ? 'bg-rose-100 text-rose-800 border border-rose-200'
+                                : !item.hasAnyRecord
+                                  ? 'bg-slate-100 text-slate-400 border border-slate-200'
+                                  : rank === 1
+                                    ? 'bg-amber-400 text-slate-950 shadow-2xs'
+                                    : rank === 2
+                                      ? 'bg-slate-300 text-slate-900'
+                                      : rank === 3
+                                        ? 'bg-amber-700 text-white'
+                                        : 'bg-slate-100 text-slate-800 border border-slate-200'
                             }`}
                           >
-                            {/* 1. 順位 */}
-                            <TableCell className="text-center align-middle py-3.5">
-                              {isAbsent ? (
-                                <span className="text-[11px] font-bold text-rose-700">
+                            <span className="text-[9px] font-bold leading-none opacity-75">
+                              RANK
+                            </span>
+                            <span className="text-base font-black leading-tight mt-0.5">
+                              {isAbsent
+                                ? '棄権'
+                                : item.hasAnyRecord
+                                  ? `${rank}位`
+                                  : '-'}
+                            </span>
+                          </div>
+
+                          {/* 選手名・ゼッケン・所属チーム・特別賞バッジ */}
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-mono text-xs font-black text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
+                                No.{p.bibNumber}
+                              </span>
+                              <h4 className="text-base font-black text-slate-900 truncate">
+                                {p.name}
+                              </h4>
+                              {isAbsent && (
+                                <span className="text-[10px] font-bold text-rose-700 bg-rose-50 border border-rose-200 px-1.5 py-0.5 rounded">
                                   棄権
                                 </span>
-                              ) : item.hasAnyRecord ? (
-                                <span
-                                  className={`inline-flex items-center justify-center w-8 h-8 rounded-xl font-mono font-black text-sm ${
-                                    rank === 1
-                                      ? 'bg-amber-400 text-slate-950 shadow-2xs'
-                                      : rank === 2
-                                        ? 'bg-slate-300 text-slate-900'
-                                        : rank === 3
-                                          ? 'bg-amber-700 text-white'
-                                          : 'bg-slate-100 text-slate-700'
-                                  }`}
-                                >
-                                  {rank}
-                                </span>
-                              ) : (
-                                <span className="text-slate-400 font-mono">
-                                  -
+                              )}
+                              {p.isHayaHit && (
+                                <span className="inline-flex items-center gap-0.5 text-[10px] font-black text-emerald-800 bg-emerald-50 border border-emerald-300 px-2 py-0.5 rounded-full">
+                                  <Sparkles className="w-2.5 h-2.5 text-emerald-600" />
+                                  甲矢的中賞
                                 </span>
                               )}
-                            </TableCell>
-
-                            {/* 2. 選手名 / ゼッケン / 特別賞バッジ */}
-                            <TableCell className="align-middle py-3.5">
-                              <div className="flex items-center gap-1.5 flex-wrap">
-                                <span className="font-mono text-xs font-black text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.2 rounded">
-                                  No.{p.bibNumber}
+                              {p.isSokuchu && (
+                                <span className="inline-flex items-center gap-0.5 text-[10px] font-black text-blue-800 bg-blue-50 border border-blue-300 px-2 py-0.5 rounded-full">
+                                  <Target className="w-2.5 h-2.5 text-blue-600" />
+                                  一手束中賞
                                 </span>
-                                <span className="font-black text-slate-900 text-sm">
-                                  {p.name}
+                              )}
+                              {p.isPerfect && (
+                                <span className="inline-flex items-center gap-0.5 text-[10px] font-black text-amber-900 bg-amber-100 border border-amber-300 px-2 py-0.5 rounded-full">
+                                  <Award className="w-2.5 h-2.5 text-amber-700" />
+                                  四矢皆中賞
                                 </span>
-                                {p.isHayaHit && (
-                                  <span className="text-[10px] font-black text-emerald-800 bg-emerald-50 border border-emerald-300 px-2 py-0.5 rounded-full">
-                                    甲矢的中賞
-                                  </span>
-                                )}
-                                {p.isSokuchu && (
-                                  <span className="text-[10px] font-black text-blue-800 bg-blue-50 border border-blue-300 px-2 py-0.5 rounded-full">
-                                    一手束中賞
-                                  </span>
-                                )}
-                                {p.isPerfect && (
-                                  <span className="text-[10px] font-black text-amber-900 bg-amber-100 border border-amber-300 px-2 py-0.5 rounded-full">
-                                    四矢皆中賞
-                                  </span>
-                                )}
-                              </div>
-                            </TableCell>
+                              )}
+                            </div>
 
-                            {/* 3. 所属チーム */}
-                            <TableCell className="align-middle py-3.5 font-bold text-slate-700">
-                              {p.organization || '無所属'}
-                            </TableCell>
+                            <div className="text-xs text-slate-600 font-bold mt-1 truncate">
+                              所属チーム: {p.organization || '無所属'}
+                            </div>
+                          </div>
+                        </div>
 
-                            {/* 4. 立ちG・立ち・射位 */}
-                            <TableCell className="align-middle py-3.5 font-mono text-[11px] text-slate-600">
-                              <div>
-                                午前:{' '}
-                                {amGroup && amStand
-                                  ? `第${amGroup}組・第${amStand}立 (${getStandOrderLabel(amOrder)})`
-                                  : '未設定'}
-                              </div>
-                              <div>
-                                午後:{' '}
-                                {pmGroup && pmStand
-                                  ? `第${pmGroup}組・第${pmStand}立 (${getStandOrderLabel(pmOrder)})`
-                                  : '未設定'}
-                              </div>
-                            </TableCell>
-
-                            {/* 5. 第1ステージ */}
-                            <TableCell className="text-center align-middle py-3.5 font-mono">
+                        {/* 下段（スマホ）/ 右側（PC）：第1〜第3ステージ内訳 ＋ 通算的中ボックス（1行に収まる4グリッド構成） */}
+                        <div className="grid grid-cols-4 gap-1.5 sm:flex sm:items-center sm:gap-2 pt-2.5 sm:pt-0 border-t sm:border-t-0 border-slate-100 w-full sm:w-auto">
+                          {/* 第1ステージ (午前2射) */}
+                          <div className="px-2 py-1.5 sm:min-w-[68px] rounded-xl bg-slate-50 border border-slate-200/80 flex flex-col items-center justify-center">
+                            <span className="text-[9px] font-bold text-slate-400">
+                              第1(2射)
+                            </span>
+                            <span className="text-xs sm:text-sm font-black font-mono text-slate-800 mt-0.5">
                               {item.s1Done ? (
-                                <span className="font-black text-slate-900">
+                                <>
                                   {item.s1Hits}
                                   <span className="text-[10px] font-normal text-slate-400">
                                     /2
                                   </span>
-                                </span>
+                                </>
                               ) : (
                                 <span className="text-slate-300">-</span>
                               )}
-                            </TableCell>
+                            </span>
+                          </div>
 
-                            {/* 6. 第2ステージ */}
-                            <TableCell className="text-center align-middle py-3.5 font-mono">
+                          {/* 第2ステージ (午後2射) */}
+                          <div className="px-2 py-1.5 sm:min-w-[68px] rounded-xl bg-slate-50 border border-slate-200/80 flex flex-col items-center justify-center">
+                            <span className="text-[9px] font-bold text-slate-400">
+                              第2(2射)
+                            </span>
+                            <span className="text-xs sm:text-sm font-black font-mono text-slate-800 mt-0.5">
                               {item.s2Done ? (
-                                <span className="font-black text-slate-900">
+                                <>
                                   {item.s2Hits}
                                   <span className="text-[10px] font-normal text-slate-400">
                                     /2
                                   </span>
-                                </span>
+                                </>
                               ) : (
                                 <span className="text-slate-300">-</span>
                               )}
-                            </TableCell>
+                            </span>
+                          </div>
 
-                            {/* 7. 第3ステージ */}
-                            <TableCell className="text-center align-middle py-3.5 font-mono">
+                          {/* 第3ステージ (午後4射) */}
+                          <div className="px-2 py-1.5 sm:min-w-[68px] rounded-xl bg-slate-50 border border-slate-200/80 flex flex-col items-center justify-center">
+                            <span className="text-[9px] font-bold text-slate-400">
+                              第3(4射)
+                            </span>
+                            <span className="text-xs sm:text-sm font-black font-mono text-slate-800 mt-0.5">
                               {item.s3Done ? (
-                                <span className="font-black text-slate-900">
+                                <>
                                   {item.s3Hits}
                                   <span className="text-[10px] font-normal text-slate-400">
                                     /4
                                   </span>
-                                </span>
+                                </>
                               ) : (
                                 <span className="text-slate-300">-</span>
                               )}
-                            </TableCell>
+                            </span>
+                          </div>
 
-                            {/* 8. 通算的中 */}
-                            <TableCell className="text-center align-middle py-3.5">
-                              {item.hasAnyRecord ? (
-                                <span className="inline-flex items-baseline justify-center px-3 py-1 rounded-xl bg-slate-900 text-white font-mono font-black text-sm">
-                                  {item.effectiveTotal}
-                                  <span className="text-[10px] font-normal text-slate-300 ml-0.5">
-                                    /8中
-                                  </span>
+                          {/* 通算的中 (全8射) */}
+                          <div
+                            className={`px-2.5 py-1.5 sm:min-w-[82px] rounded-xl border flex flex-col items-center justify-center ${
+                              item.hasAnyRecord
+                                ? 'bg-slate-900 border-slate-900 text-white'
+                                : 'bg-slate-100 border-slate-200 text-slate-400'
+                            }`}
+                          >
+                            <span
+                              className={`text-[9px] font-bold ${
+                                item.hasAnyRecord
+                                  ? 'text-amber-400'
+                                  : 'text-slate-400'
+                              }`}
+                            >
+                              通算的中
+                            </span>
+                            {item.hasAnyRecord ? (
+                              <span className="text-sm sm:text-base font-black font-mono leading-tight mt-0.5">
+                                {item.effectiveTotal}
+                                <span className="text-[10px] font-normal text-slate-300 ml-0.5">
+                                  /8中
                                 </span>
-                              ) : (
-                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-bold bg-slate-100 text-slate-400">
-                                  <Clock className="w-3 h-3" /> 行射前
-                                </span>
-                              )}
-                            </TableCell>
-                          </TableRow>
-                        );
-                      })
-                    )}
-                  </TableBody>
-                </Table>
-              </div>
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-0.5 text-[10px] font-bold text-slate-400 mt-0.5">
+                                <Clock className="w-2.5 h-2.5" /> 行射前
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
         </CardContent>
