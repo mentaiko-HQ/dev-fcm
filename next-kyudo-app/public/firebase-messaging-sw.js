@@ -1,47 +1,83 @@
 /**
- * 【FCM サービスワーカー (バックグラウンド通知受信)】
+ * 【FCM バックグラウンド通知受信 ＆ タップ遷移制御 Service Worker】
+ *
  * 役割:
- * - ブラウザを閉じている、または別のタブを開いている状態でもPush通知を受信する。
+ * - スマートフォンがスリープ中またはブラウザがバックグラウンドにある状態でFCM通知を受信・表示。
+ * - 通知バナーをタップした際、指定された遷移先（/standby または /results）へ確実にナビゲートする。
  *
  * フールプルーフ設計:
- * - Next.js の環境変数 (process.env) は Service Worker 内で参照できないため、
- *   意図的な未定義エラーを防ぐべく、公開鍵情報（Firebase Config）を直接記述します。
- *   ※ 運用時、下記の firebaseConfig は .env.local と同じ値に置き換えてください。
+ * - 既に同一オリジンのタブが開いている場合は新規タブを乱立させず、既存タブをフォーカスして遷移させる。
+ *
+ * フェイルセーフ設計:
+ * - ペイロード欠損時でもデフォルトのタイトル・遷移先 (/standby) へ安全にフォールバック。
  */
 
-importScripts(
-  'https://www.gstatic.com/firebasejs/11.4.0/firebase-app-compat.js',
-);
-importScripts(
-  'https://www.gstatic.com/firebasejs/11.4.0/firebase-messaging-compat.js',
-);
+self.addEventListener('push', function (event) {
+  if (!event.data) return;
 
-// TODO: 本番デプロイ時に .env.local の値で書き換える
-const firebaseConfig = {
-  apiKey: 'YOUR_API_KEY',
-  authDomain: 'YOUR_AUTH_DOMAIN',
-  projectId: 'YOUR_PROJECT_ID',
-  storageBucket: 'YOUR_STORAGE_BUCKET',
-  messagingSenderId: 'YOUR_MESSAGING_SENDER_ID',
-  appId: 'YOUR_APP_ID',
-};
+  try {
+    const payload = event.data.json();
+    // browserが自動でnotificationフィールドを表示する場合は二重表示を避けるためスキップ
+    if (payload.notification) {
+      return;
+    }
 
-firebase.initializeApp(firebaseConfig);
-const messaging = firebase.messaging();
+    const data = payload.data || {};
+    const title = data.title || '【招集呼出】第5回めんたいこ杯';
+    const options = {
+      body: data.body || '出番が近づいています。招集状況を確認してください。',
+      icon: '/favicon.ico',
+      badge: '/favicon.ico',
+      vibrate: [300, 150, 300, 150, 300],
+      requireInteraction: true,
+      data: {
+        url: data.click_action || data.url || '/standby',
+      },
+    };
 
-// バックグラウンドでの通知受け取り処理
-messaging.onBackgroundMessage(function (payload) {
-  console.log(
-    '[firebase-messaging-sw.js] バックグラウンド通知を受信しました:',
-    payload,
+    event.waitUntil(self.registration.showNotification(title, options));
+  } catch (err) {
+    console.error('【SW Push解析エラー】:', err);
+  }
+});
+
+self.addEventListener('notificationclick', function (event) {
+  event.notification.close();
+
+  const rawData = event.notification.data || {};
+  const fcmLink =
+    rawData.url ||
+    rawData.click_action ||
+    (rawData.FCM_MSG &&
+      rawData.FCM_MSG.notification &&
+      rawData.FCM_MSG.notification.click_action) ||
+    '/standby';
+
+  const targetUrl = new URL(fcmLink, self.location.origin).href;
+
+  event.waitUntil(
+    clients
+      .matchAll({ type: 'window', includeUncontrolled: true })
+      .then(function (clientList) {
+        for (let i = 0; i < clientList.length; i++) {
+          const client = clientList[i];
+          if (
+            client.url.startsWith(self.location.origin) &&
+            'focus' in client
+          ) {
+            client.focus();
+            if ('navigate' in client) {
+              return client.navigate(targetUrl);
+            }
+            return;
+          }
+        }
+        if (clients.openWindow) {
+          return clients.openWindow(targetUrl);
+        }
+      })
+      .catch(function (err) {
+        console.error('【SW 通知クリック遷移エラー】:', err);
+      }),
   );
-
-  const notificationTitle = payload.notification.title || '進行お知らせ';
-  const notificationOptions = {
-    body: payload.notification.body,
-    icon: '/favicon.ico',
-    requireInteraction: true, // 通知をユーザーがタップするまで表示し続ける
-  };
-
-  self.registration.showNotification(notificationTitle, notificationOptions);
 });

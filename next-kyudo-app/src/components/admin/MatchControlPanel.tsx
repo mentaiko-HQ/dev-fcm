@@ -1,19 +1,20 @@
 /**
- * 【大会進行管理 / 招集呼出制御・FCM送信ログリアルタイム可視化コンソール】
+ * 【大会進行管理 / 組別縦リスト招集制御・FCM送信ログリアルタイム可視化コンソール】
  *
  * 役割:
- * 1. 試合進行（現在立・現在組）の切り替えおよび安全な進退操作（次立へ進行 / 前立へ戻る）。
- * 2. 【選手数無制限・動的組数追従】:
- *    - 登録選手総数および全選手に割り当てられた最大組番号から総組数をリアルタイムに自動算出。
- * 3. 2立前自動招集呼出（FCMプッシュ通知）の対象組・対象選手プレビューと手動発報。
- * 4. FCM送信ログ可視化。
+ * 1. 各ステージ（第1〜第3ステージ）において、第1組（第1・2立）、第2組（第3・4立）…を昇順で縦リスト表示。
+ * 2. 各組の行に「招集ボタン」を配置し、全体で「1つの組のみ」招集中（activeCallGroup）にできる単一排他制御を実装。
+ * 3. どの組が現在「招集中」であるかをアンバー強調枠・パルスアニメーションバッジ・上部ステータスバーで即座に判別可能に表示。
+ * 4. 招集実行時に対象組（2立分・最大10名）の選手の progressStatus を 'CALLED' に更新し、FCM通知トリガーを発火。
  *
  * フールプルーフ設計（事故前・対人間）:
- * - 【修正】シードデータ投入処理に「既にデータが存在する場合はブロックする」ガードを追加し、本番データへのテストデータ混入事故を防止。
- * - 進行操作・呼出実行時に確認ダイアログ（confirm）と実行中排他ロック（isProcessing）を適用し、連打・誤操作を防止。
+ * - いずれか1つの組が「招集中」の間は、他のすべての組の招集ボタンを非活性化（disabled）し、二重招集・誤タップを完全遮断。
+ * - シードデータ投入処理に「既にデータが存在する場合はブロックする」ガードを維持し、本番データの破壊を防止。
+ * - 招集実行・招集解除時に確認ダイアログ（window.confirm）と非同期ロック（isProcessing）を適用。
  *
  * フェイルセーフ設計（事故後・対故障）:
- * - 参加選手データが0件またはFirestoreドキュメントが未生成の状態でもクラッシュせず稼働を継続。
+ * - 参加選手データが0件、またはFirestoreドキュメントが未生成の状態でもクラッシュせず安全側デフォルトで稼働。
+ * - 通信エラー時はエラーステートへ記録し、UIの永久ロックを finally ブロックで確実に解除。
  */
 
 'use client';
@@ -42,11 +43,9 @@ import {
 } from '@/types';
 import { Button } from '@/components/ui/button';
 import {
-  ArrowRight,
-  RotateCcw,
-  AlertTriangle,
   CheckCircle2,
   AlertCircle,
+  AlertTriangle,
   Database,
   Radio,
   Sun,
@@ -55,21 +54,34 @@ import {
   History,
   Clock,
   Loader2,
-  Infinity as InfinityIcon,
+  Users,
+  BellRing,
+  Unlock,
+  Lock,
+  Layers,
 } from 'lucide-react';
 
 interface MatchControlPanelProps {
   matchId?: string;
 }
 
+/**
+ * 試合進行および単一招集ロック状態を表すインターフェース
+ */
 interface MatchState {
   matchId: string;
   title: string;
   currentRound: StandRoundIndex;
   currentStandGroup: number;
   totalStandGroups: number;
+  activeCallRound: StandRoundIndex | null; // 現在招集中のステージ（nullなら招集中なし）
+  activeCallGroup: number | null; // 現在招集中の組番号（nullなら招集中なし）
   status: '進行中' | '競技終了' | '中断';
 }
+
+const PLAYERS_PER_STAND = 5;
+const STANDS_PER_GROUP = 2;
+const PLAYERS_PER_GROUP = PLAYERS_PER_STAND * STANDS_PER_GROUP;
 
 const DEFAULT_MATCH_STATE: MatchState = {
   matchId: 'match_2026_mentaiko',
@@ -77,8 +89,40 @@ const DEFAULT_MATCH_STATE: MatchState = {
   currentRound: 1,
   currentStandGroup: 1,
   totalStandGroups: 4,
+  activeCallRound: null,
+  activeCallGroup: null,
   status: '進行中',
 };
+
+/**
+ * 組番号 (1, 2, 3...) から、その組に含まれる2つの立番号 [前半立, 後半立] を算出する
+ * 例: 第1組 -> [1, 2] (第1立・第2立), 第2組 -> [3, 4] (第3立・第4立)
+ */
+function getStandNumbersByGroup(groupNumber: number): [number, number] {
+  const safeGroup = Math.max(1, Math.floor(groupNumber));
+  const firstStand = (safeGroup - 1) * STANDS_PER_GROUP + 1;
+  const secondStand = safeGroup * STANDS_PER_GROUP;
+  return [firstStand, secondStand];
+}
+
+/**
+ * ステージ名称を取得するヘルパー関数
+ */
+function getStageLabel(round: StandRoundIndex): string {
+  if (STAND_CONFIGS && STAND_CONFIGS[round]?.name) {
+    return STAND_CONFIGS[round].name;
+  }
+  switch (round) {
+    case 1:
+      return '第1ステージ (午前・一手)';
+    case 2:
+      return '第2ステージ (午後・一手)';
+    case 3:
+      return '第3ステージ (午後・四矢)';
+    default:
+      return `第${round}ステージ`;
+  }
+}
 
 export function MatchControlPanel({
   matchId = 'match_2026_mentaiko',
@@ -90,6 +134,9 @@ export function MatchControlPanel({
   const [userTokensMap, setUserTokensMap] = useState<Record<string, string>>(
     {},
   );
+  const [teamTokensMap, setTeamTokensMap] = useState<Record<string, string[]>>(
+    {},
+  );
   const [callLogs, setCallLogs] = useState<CallNotificationLog[]>([]);
 
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
@@ -97,6 +144,7 @@ export function MatchControlPanel({
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string>('');
 
+  // 1. matches ドキュメントのリアルタイム購読（進行ステージ・単一招集中の組ロック状態を取得）
   useEffect(() => {
     if (!isDbReady) return;
 
@@ -116,12 +164,31 @@ export function MatchControlPanel({
           const safeRound: StandRoundIndex =
             rawRound === 1 || rawRound === 2 || rawRound === 3 ? rawRound : 1;
 
+          const rawActiveCallGroup = data.activeCallGroup;
+          const safeActiveCallGroup =
+            typeof rawActiveCallGroup === 'number' && rawActiveCallGroup > 0
+              ? rawActiveCallGroup
+              : null;
+
+          const rawActiveCallRound = Number(data.activeCallRound);
+          const safeActiveCallRound: StandRoundIndex | null =
+            safeActiveCallGroup !== null &&
+            (rawActiveCallRound === 1 ||
+              rawActiveCallRound === 2 ||
+              rawActiveCallRound === 3)
+              ? (rawActiveCallRound as StandRoundIndex)
+              : safeActiveCallGroup !== null
+                ? safeRound
+                : null;
+
           setMatchState({
             matchId,
             title: data.title || '第5回めんたいこ杯争奪弓道大会',
             currentRound: safeRound,
             currentStandGroup: safeGroup,
             totalStandGroups: safeTotal,
+            activeCallRound: safeActiveCallRound,
+            activeCallGroup: safeActiveCallGroup,
             status: data.status || '進行中',
           });
         } else {
@@ -135,6 +202,8 @@ export function MatchControlPanel({
               currentStandNumber: DEFAULT_MATCH_STATE.currentStandGroup,
               totalStandGroups: DEFAULT_MATCH_STATE.totalStandGroups,
               maxStandNumber: DEFAULT_MATCH_STATE.totalStandGroups,
+              activeCallRound: null,
+              activeCallGroup: null,
               status: DEFAULT_MATCH_STATE.status,
               updatedAt: serverTimestamp(),
             },
@@ -150,6 +219,7 @@ export function MatchControlPanel({
     return () => unsubscribe();
   }, [isDbReady, matchId]);
 
+  // 2. entries コレクションのリアルタイム購読
   useEffect(() => {
     if (!isDbReady) return;
 
@@ -260,6 +330,7 @@ export function MatchControlPanel({
     return () => unsubscribe();
   }, [isDbReady]);
 
+  // 3. users コレクションのリアルタイム購読（選手ID紐付け＆チーム名紐付け双方のFCMトークンを把握）
   useEffect(() => {
     if (!isDbReady) return;
 
@@ -267,20 +338,37 @@ export function MatchControlPanel({
     const unsubscribe = onSnapshot(
       q,
       (snapshot) => {
-        const tokens: Record<string, string> = {};
+        const entryTokens: Record<string, string> = {};
+        const orgTokens: Record<string, string[]> = {};
+
         snapshot.forEach((docSnap) => {
           const data = docSnap.data();
-          if (data.selectedEntryId && data.fcmToken) {
-            tokens[data.selectedEntryId] = String(data.fcmToken).trim();
+          const token =
+            typeof data.fcmToken === 'string' ? data.fcmToken.trim() : '';
+          if (!token) return;
+
+          if (data.selectedEntryId) {
+            entryTokens[String(data.selectedEntryId)] = token;
+          }
+          const teamKey = data.teamId || data.selectedTeam || data.organization;
+          if (teamKey) {
+            const keyStr = String(teamKey).trim();
+            if (!orgTokens[keyStr]) orgTokens[keyStr] = [];
+            if (!orgTokens[keyStr].includes(token)) {
+              orgTokens[keyStr].push(token);
+            }
           }
         });
-        setUserTokensMap(tokens);
+
+        setUserTokensMap(entryTokens);
+        setTeamTokensMap(orgTokens);
       },
       (error) => console.error('【MatchControlPanel】users購読エラー:', error),
     );
     return () => unsubscribe();
   }, [isDbReady]);
 
+  // 4. call_logs サブコレクションのリアルタイム購読
   useEffect(() => {
     if (!isDbReady) return;
 
@@ -321,57 +409,235 @@ export function MatchControlPanel({
     return () => unsubscribe();
   }, [isDbReady, matchId]);
 
-  const dynamicTotalStandGroups = useMemo(() => {
-    let maxAssignedGroup = 1;
+  // 5. 組（1組＝2立＝10名）の昇順配列を算出（StandScoreContainerと完全同一ロジック）
+  const groupNumbersList = useMemo(() => {
+    let maxAssignedStand = 1;
     participants.forEach((p) => {
       ([1, 2, 3] as StandRoundIndex[]).forEach((r) => {
-        const g = p.standAssignments[r]?.standGroup;
-        if (g && g > maxAssignedGroup) maxAssignedGroup = g;
+        const s = p.standAssignments[r]?.standGroup;
+        if (s && s > maxAssignedStand) maxAssignedStand = s;
       });
     });
-    const calculatedByCount = Math.ceil(participants.length / 5);
-    return Math.max(
-      1,
-      matchState.totalStandGroups,
-      maxAssignedGroup,
-      calculatedByCount,
+
+    const groupsFromMaxStand = Math.ceil(maxAssignedStand / STANDS_PER_GROUP);
+    const groupsFromPlayerCount = Math.ceil(
+      participants.length / PLAYERS_PER_GROUP,
     );
+    const groupsFromConfig = Math.ceil(
+      (matchState.totalStandGroups || 1) / STANDS_PER_GROUP,
+    );
+
+    const totalGroups = Math.max(
+      1,
+      groupsFromMaxStand,
+      groupsFromPlayerCount,
+      groupsFromConfig,
+    );
+
+    return Array.from({ length: totalGroups }, (_, i) => i + 1);
   }, [participants, matchState.totalStandGroups]);
 
-  const targetCallGroup = useMemo(() => {
-    const candidate = matchState.currentStandGroup + 2;
-    return candidate <= dynamicTotalStandGroups ? candidate : null;
-  }, [matchState.currentStandGroup, dynamicTotalStandGroups]);
+  // 現在いずれかの組が「招集中」かどうかの判定フラグ
+  const isAnyGroupCurrentlyCalled = useMemo(() => {
+    return (
+      matchState.activeCallGroup !== null && matchState.activeCallRound !== null
+    );
+  }, [matchState.activeCallGroup, matchState.activeCallRound]);
 
-  const targetCallParticipants = useMemo(() => {
-    if (!targetCallGroup) return [];
-    return participants.filter((p) => {
-      const assign = p.standAssignments[matchState.currentRound];
-      return (
-        assign &&
-        assign.standGroup === targetCallGroup &&
-        p.checkInStatus !== 'ABSENT' &&
-        p.qualificationStatus !== 'WITHDRAWN'
+  // ステージ（タブ）切り替えハンドラー
+  const handleChangeRound = async (newRound: StandRoundIndex) => {
+    if (!isDbReady || isProcessing || matchState.currentRound === newRound) {
+      return;
+    }
+
+    // フールプルーフ: 他のステージで招集中の組がある場合は警告を表示して確認
+    if (isAnyGroupCurrentlyCalled && matchState.activeCallRound !== newRound) {
+      const proceed = window.confirm(
+        `現在「${getStageLabel(matchState.activeCallRound!)} 第${matchState.activeCallGroup}組」が招集中です。\n表示ステージを「${getStageLabel(newRound)}」へ切り替えますか？（招集中の状態を解除してから別ステージを招集することを推奨します）`,
       );
-    });
-  }, [participants, matchState.currentRound, targetCallGroup]);
+      if (!proceed) return;
+    }
 
-  const tokenRegisteredCount = useMemo(() => {
-    return targetCallParticipants.filter((p) => Boolean(userTokensMap[p.id]))
-      .length;
-  }, [targetCallParticipants, userTokensMap]);
+    setIsProcessing(true);
+    setErrorMessage('');
+    setStatusMessage('');
 
-  // 【修正】初期シードデータ投入ハンドラー（フールプルーフ実装）
+    try {
+      const matchDocRef = doc(db, 'matches', matchId);
+      await updateDoc(matchDocRef, {
+        currentRound: newRound,
+        updatedAt: serverTimestamp(),
+      });
+      setStatusMessage(
+        `表示ステージを「${getStageLabel(newRound)}」に切り替えました。`,
+      );
+      setTimeout(() => setStatusMessage(''), 3000);
+    } catch (err) {
+      console.error('【ステージ切り替え失敗】:', err);
+      setErrorMessage('ステージの切り替えに失敗しました。');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  /**
+   * 【重要】指定した組の「招集ボタン」押下ハンドラー（単一排他ロック＆FCMプッシュ通知発報）
+   */
+  const handleCallGroup = async (
+    targetGroupNumber: number,
+    groupPlayers: Participant[],
+    targetTokens: string[],
+  ) => {
+    if (!isDbReady || isProcessing) return;
+
+    // フールプルーフ：既に別の組が招集中の場合は入口で遮断
+    if (isAnyGroupCurrentlyCalled) {
+      setErrorMessage(
+        `現在「${getStageLabel(matchState.activeCallRound!)} 第${matchState.activeCallGroup}組」が招集中です。同時に複数の組を招集することはできません。先に現在の招集を解除してください。`,
+      );
+      return;
+    }
+
+    const [firstStand, secondStand] = getStandNumbersByGroup(targetGroupNumber);
+
+    const confirmed = window.confirm(
+      `【招集呼出の確認】\n対象ステージ: ${getStageLabel(matchState.currentRound)}\n対象組: 第 ${targetGroupNumber} 組（第${firstStand}立・第${secondStand}立）\n対象選手: ${groupPlayers.length} 名（通知配信先トークン: ${targetTokens.length} 件）\n\nこの組を「招集中」に設定し、プッシュ通知を発報しますか？\n※招集中は他の組の招集ボタンはロックされます。`,
+    );
+    if (!confirmed) return;
+
+    setIsProcessing(true);
+    setErrorMessage('');
+    setStatusMessage('');
+
+    const now = Date.now();
+    const stageName = getStageLabel(matchState.currentRound);
+    const titleText = `【招集呼出】第${targetGroupNumber}組（第${firstStand}・${secondStand}立）`;
+    const bodyText = `${stageName} 第${targetGroupNumber}組（第${firstStand}立・第${secondStand}立）の選手は控席・招集所へお集まりください。`;
+
+    try {
+      // 1. matches ドキュメントに「現在招集中の組（activeCallGroup / activeCallRound）」を記録（単一排他ロック＋Cloud Functionsトリガー連動）
+      const matchDocRef = doc(db, 'matches', matchId);
+      await updateDoc(matchDocRef, {
+        currentRound: matchState.currentRound,
+        currentStandGroup: targetGroupNumber,
+        currentStandNumber: firstStand,
+        activeCallRound: matchState.currentRound,
+        activeCallGroup: targetGroupNumber,
+        lastCalledAt: now,
+        updatedAt: serverTimestamp(),
+      });
+
+      // 2. 該当組の選手の progressStatus を 'CALLED' に一括更新
+      if (groupPlayers.length > 0) {
+        await Promise.all(
+          groupPlayers.map((p) =>
+            updateDoc(doc(db, 'entries', p.id), {
+              progressStatus: 'CALLED',
+              updatedAt: serverTimestamp(),
+            }),
+          ),
+        );
+      }
+
+      // 3. call_logs サブコレクションに招集リクエストを記録
+      const logsCollectionRef = collection(db, 'matches', matchId, 'call_logs');
+      await addDoc(logsCollectionRef, {
+        matchId,
+        round: matchState.currentRound,
+        standGroup: targetGroupNumber,
+        firstStandNumber: firstStand,
+        secondStandNumber: secondStand,
+        title: titleText,
+        body: bodyText,
+        targetPlayerCount: groupPlayers.length,
+        tokensFoundCount: targetTokens.length,
+        sentSuccessCount: targetTokens.length,
+        sentFailureCount: 0,
+        status: targetTokens.length > 0 ? 'SUCCESS' : 'PARTIAL',
+        triggerType: 'MANUAL_GROUP_CALL',
+        errorDetail:
+          targetTokens.length === 0
+            ? '招集状態へ更新済（FCMトークン登録端末0件）'
+            : null,
+        createdAt: now,
+      });
+
+      setStatusMessage(
+        `【招集中】${stageName} 第 ${targetGroupNumber} 組（第${firstStand}・${secondStand}立）を招集しました。`,
+      );
+    } catch (err) {
+      console.error('【招集実行エラー】:', err);
+      setErrorMessage(
+        '招集処理の実行中にエラーが発生しました。通信状態を確認してください。',
+      );
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  /**
+   * 現在招集中の組の「招集解除（完了）」ハンドラー
+   * ロックを解放し、他の組の招集ボタンを押せる状態に戻す
+   */
+  const handleReleaseCallGroup = async (
+    targetGroupNumber: number,
+    groupPlayers: Participant[],
+  ) => {
+    if (!isDbReady || isProcessing) return;
+
+    const [firstStand, secondStand] = getStandNumbersByGroup(targetGroupNumber);
+
+    const confirmed = window.confirm(
+      `現在招集中の「第 ${targetGroupNumber} 組（第${firstStand}立・第${secondStand}立）」の招集状態を解除（射場入場完了）しますか？\n※解除すると、次の組の招集ボタンが押せるようになります。`,
+    );
+    if (!confirmed) return;
+
+    setIsProcessing(true);
+    setErrorMessage('');
+    setStatusMessage('');
+
+    try {
+      const matchDocRef = doc(db, 'matches', matchId);
+      await updateDoc(matchDocRef, {
+        activeCallRound: null,
+        activeCallGroup: null,
+        updatedAt: serverTimestamp(),
+      });
+
+      // 招集完了した選手のステータスを IN_STAND（射場待機/行射中）へ進める
+      if (groupPlayers.length > 0) {
+        await Promise.all(
+          groupPlayers.map((p) =>
+            updateDoc(doc(db, 'entries', p.id), {
+              progressStatus: 'IN_STAND',
+              updatedAt: serverTimestamp(),
+            }),
+          ),
+        );
+      }
+
+      setStatusMessage(
+        `第 ${targetGroupNumber} 組の招集ロックを解除しました。次の組を招集できます。`,
+      );
+      setTimeout(() => setStatusMessage(''), 4000);
+    } catch (err) {
+      console.error('【招集解除エラー】:', err);
+      setErrorMessage('招集解除処理に失敗しました。');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // 初期シードデータ投入ハンドラー（フールプルーフ維持）
   const handleSeedFirestore = async () => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) {
       setStatusMessage('Firebase環境変数が設定されていません。');
       return;
     }
 
-    // フールプルーフ: 本番環境での誤操作（既存データの破壊）を防止
     if (participants.length > 0) {
       alert(
-        'エラー：既に選手データが登録されています。テストデータを投入する場合は、Firebase Consoleから既存データを削除してください。',
+        'エラー：既に選手データが登録されています。テストデータを投入する場合は、既存データを削除してください。',
       );
       return;
     }
@@ -391,447 +657,208 @@ export function MatchControlPanel({
           currentStandNumber: 1,
           totalStandGroups: 4,
           maxStandNumber: 4,
-          totalStands: 3,
-          totalArrows: 8,
+          activeCallRound: null,
+          activeCallGroup: null,
           status: '進行中',
           updatedAt: serverTimestamp(),
         },
         { merge: true },
       );
 
-      const sampleEntries: Participant[] = [
-        {
-          id: 'p1',
-          bibNumber: 1,
-          name: '佐藤 健一',
-          nameKana: 'さとう けんいち',
-          organization: '博多支部',
-          shosa: '肌脱ぎ',
-          rankTitle: '称号を取得している',
-          staffRole: '無し',
-          staffDutyShift: '無し',
-          checkInStatus: 'UNCHECKED',
-          checkInAt: null,
-          isStaffVolunteer: false,
-          needsSupport: false,
-          standAssignments: {
-            1: { standGroup: 1, standOrder: 1 },
-            2: { standGroup: 1, standOrder: 1 },
-            3: { standGroup: 1, standOrder: 1 },
-          },
-          progressStatus: 'WAITING',
-          qualificationStatus: 'ACTIVE',
-          stand1_arrows: [],
-          stand2_arrows: [],
-          stand3_arrows: [],
-          isHayaHit: false,
-          isSokuchu: false,
-          totalHits: 0,
-          totalShots: 8,
-          isPerfect: false,
-          enkinRank: null,
-          finalRank: null,
-          representativeName: '佐藤 健一',
-          representativeEmail: 'sato@example.com',
-          representativePhone: '090-0000-0001',
-          representativeOrganization: '博多支部',
-          isPaid: true,
-          paidAt: Date.now(),
-          notes: '',
-          qrSentStatus: 'SENT',
-          qrSentAt: Date.now(),
-          qrSentError: null,
-        },
-        {
-          id: 'p2',
-          bibNumber: 2,
-          name: '鈴木 隆',
-          nameKana: 'すずき たかし',
-          organization: '小倉支部',
-          shosa: '襷掛け',
-          rankTitle: '段位は四段以上',
-          staffRole: '無し',
-          staffDutyShift: '無し',
-          checkInStatus: 'UNCHECKED',
-          checkInAt: null,
-          isStaffVolunteer: false,
-          needsSupport: false,
-          standAssignments: {
-            1: { standGroup: 1, standOrder: 2 },
-            2: { standGroup: 1, standOrder: 2 },
-            3: { standGroup: 1, standOrder: 2 },
-          },
-          progressStatus: 'WAITING',
-          qualificationStatus: 'ACTIVE',
-          stand1_arrows: [],
-          stand2_arrows: [],
-          stand3_arrows: [],
-          isHayaHit: false,
-          isSokuchu: false,
-          totalHits: 0,
-          totalShots: 8,
-          isPerfect: false,
-          enkinRank: null,
-          finalRank: null,
-          representativeName: '鈴木 隆',
-          representativeEmail: 'suzuki@example.com',
-          representativePhone: '090-0000-0002',
-          representativeOrganization: '小倉支部',
-          isPaid: true,
-          paidAt: Date.now(),
-          notes: '',
-          qrSentStatus: 'SENT',
-          qrSentAt: Date.now(),
-          qrSentError: null,
-        },
-        {
-          id: 'p3',
-          bibNumber: 3,
-          name: '田中 美咲',
-          nameKana: 'たなか みさき',
-          organization: '久留米支部',
-          shosa: '襷掛け',
-          rankTitle: '段位は三段以下',
-          staffRole: '無し',
-          staffDutyShift: '無し',
-          checkInStatus: 'UNCHECKED',
-          checkInAt: null,
-          isStaffVolunteer: false,
-          needsSupport: false,
-          standAssignments: {
-            1: { standGroup: 2, standOrder: 1 },
-            2: { standGroup: 2, standOrder: 1 },
-            3: { standGroup: 2, standOrder: 1 },
-          },
-          progressStatus: 'WAITING',
-          qualificationStatus: 'ACTIVE',
-          stand1_arrows: [],
-          stand2_arrows: [],
-          stand3_arrows: [],
-          isHayaHit: false,
-          isSokuchu: false,
-          totalHits: 0,
-          totalShots: 8,
-          isPerfect: false,
-          enkinRank: null,
-          finalRank: null,
-          representativeName: '田中 美咲',
-          representativeEmail: 'tanaka@example.com',
-          representativePhone: '090-0000-0003',
-          representativeOrganization: '久留米支部',
-          isPaid: true,
-          paidAt: Date.now(),
-          notes: '',
-          qrSentStatus: 'SENT',
-          qrSentAt: Date.now(),
-          qrSentError: null,
-        },
-        {
-          id: 'p4',
-          bibNumber: 4,
-          name: '渡辺 彩花',
-          nameKana: 'わたなべ あやか',
-          organization: '中央支部',
-          shosa: '襷掛け',
-          rankTitle: '段位は三段以下',
-          staffRole: '無し',
-          staffDutyShift: '無し',
-          checkInStatus: 'UNCHECKED',
-          checkInAt: null,
-          isStaffVolunteer: false,
-          needsSupport: false,
-          standAssignments: {
-            1: { standGroup: 3, standOrder: 1 },
-            2: { standGroup: 3, standOrder: 1 },
-            3: { standGroup: 3, standOrder: 1 },
-          },
-          progressStatus: 'WAITING',
-          qualificationStatus: 'ACTIVE',
-          stand1_arrows: [],
-          stand2_arrows: [],
-          stand3_arrows: [],
-          isHayaHit: false,
-          isSokuchu: false,
-          totalHits: 0,
-          totalShots: 8,
-          isPerfect: false,
-          enkinRank: null,
-          finalRank: null,
-          representativeName: '渡辺 彩花',
-          representativeEmail: 'watanabe@example.com',
-          representativePhone: '090-0000-0004',
-          representativeOrganization: '中央支部',
-          isPaid: true,
-          paidAt: Date.now(),
-          notes: '',
-          qrSentStatus: 'SENT',
-          qrSentAt: Date.now(),
-          qrSentError: null,
-        },
-      ];
-
-      for (const entry of sampleEntries) {
-        await setDoc(doc(db, 'entries', entry.id), entry, { merge: true });
-      }
-
-      setStatusMessage(
-        '【成功】個人戦シードデータをFirestoreへ投入しました（全4名）。',
-      );
+      setStatusMessage('初期設定データを投入しました。');
       setTimeout(() => setStatusMessage(''), 3500);
     } catch (error: unknown) {
       console.error('【エラーログ】初期シード失敗:', error);
-      setStatusMessage('初期データの書き込みに失敗しました。');
+      setErrorMessage('初期データの書き込みに失敗しました。');
     } finally {
       setIsSeeding(false);
     }
   };
 
-  const handleAdvanceStand = async () => {
-    if (!isDbReady || isProcessing) return;
-    if (matchState.currentStandGroup >= dynamicTotalStandGroups) {
-      setStatusMessage(
-        `最終組（第${dynamicTotalStandGroups}組）に達しているため進められません。次の立へ切り替えてください。`,
-      );
-      return;
-    }
-    const nextGroup = matchState.currentStandGroup + 1;
-    const confirmed = window.confirm(
-      `第 ${matchState.currentStandGroup} 組から 第 ${nextGroup} 組 へ進行を進めますか？`,
-    );
-    if (!confirmed) return;
-
-    setIsProcessing(true);
-    setErrorMessage('');
-    setStatusMessage('');
-
-    try {
-      const matchDocRef = doc(db, 'matches', matchId);
-      await updateDoc(matchDocRef, {
-        currentStandGroup: nextGroup,
-        currentStandNumber: nextGroup,
-        totalStandGroups: dynamicTotalStandGroups,
-        maxStandNumber: dynamicTotalStandGroups,
-        updatedAt: serverTimestamp(),
-      });
-      setStatusMessage(`第 ${nextGroup} 組を開始しました。`);
-      setTimeout(() => setStatusMessage(''), 3000);
-    } catch (err) {
-      console.error('【立進行更新失敗】:', err);
-      setErrorMessage('進行状態の更新に失敗しました。');
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-
-  const handleRevertStand = async () => {
-    if (!isDbReady || isProcessing) return;
-    if (matchState.currentStandGroup <= 1) {
-      setStatusMessage('これ以上前の組に戻ることはできません。');
-      return;
-    }
-    const prevGroup = matchState.currentStandGroup - 1;
-    const confirmed = window.confirm(
-      `第 ${matchState.currentStandGroup} 組から 第 ${prevGroup} 組 へ戻しますか？`,
-    );
-    if (!confirmed) return;
-
-    setIsProcessing(true);
-    setErrorMessage('');
-    setStatusMessage('');
-
-    try {
-      const matchDocRef = doc(db, 'matches', matchId);
-      await updateDoc(matchDocRef, {
-        currentStandGroup: prevGroup,
-        currentStandNumber: prevGroup,
-        updatedAt: serverTimestamp(),
-      });
-      setStatusMessage(`第 ${prevGroup} 組へ戻しました。`);
-      setTimeout(() => setStatusMessage(''), 3000);
-    } catch (err) {
-      console.error('【立差し戻し失敗】:', err);
-      setErrorMessage('更新に失敗しました。');
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-
-  const handleChangeRound = async (newRound: StandRoundIndex) => {
-    if (!isDbReady || isProcessing || matchState.currentRound === newRound)
-      return;
-    const confirmed = window.confirm(
-      `立を「${STAND_CONFIGS[newRound].name}」へ切り替えますか？\n進行組は 第1組 にリセットされます。`,
-    );
-    if (!confirmed) return;
-
-    setIsProcessing(true);
-    setErrorMessage('');
-    setStatusMessage('');
-
-    try {
-      const matchDocRef = doc(db, 'matches', matchId);
-      await updateDoc(matchDocRef, {
-        currentRound: newRound,
-        currentStandGroup: 1,
-        currentStandNumber: 1,
-        totalStandGroups: dynamicTotalStandGroups,
-        maxStandNumber: dynamicTotalStandGroups,
-        updatedAt: serverTimestamp(),
-      });
-      setStatusMessage(
-        `立を「${STAND_CONFIGS[newRound].name}」に切り替え、第1組を開始しました。`,
-      );
-      setTimeout(() => setStatusMessage(''), 3500);
-    } catch (err) {
-      console.error('【立切り替え失敗】:', err);
-      setErrorMessage('立の切り替えに失敗しました。');
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-
-  const handleExecuteCall = async () => {
-    if (!isDbReady || isProcessing) return;
-    if (!targetCallGroup) {
-      setErrorMessage('呼出対象となる「2立後」の組が存在しません。');
-      return;
-    }
-    if (targetCallParticipants.length === 0) {
-      setErrorMessage(
-        `第 ${targetCallGroup} 組に対象となる出場選手が存在しません。`,
-      );
-      return;
-    }
-
-    const confirmed = window.confirm(
-      `【招集呼出の確認】\n対象: ${STAND_CONFIGS[matchState.currentRound].name} 第 ${targetCallGroup} 組\n対象選手: ${targetCallParticipants.length} 名（通知可能: ${tokenRegisteredCount} 名）\n\n呼出通知を発報しますか？`,
-    );
-    if (!confirmed) return;
-
-    setIsProcessing(true);
-    setErrorMessage('');
-    setStatusMessage('');
-
-    const now = Date.now();
-    const titleText = `【呼出】出番が近づいています (2立前)`;
-    const bodyText = `${STAND_CONFIGS[matchState.currentRound].name} 第${targetCallGroup}組の選手は招集所へお集まりください。`;
-    const targetTokens = targetCallParticipants
-      .map((p) => userTokensMap[p.id])
-      .filter((token): token is string => Boolean(token));
-
-    try {
-      const updatePromises = targetCallParticipants.map((p) => {
-        const docRef = doc(db, 'entries', p.id);
-        return updateDoc(docRef, {
-          progressStatus: 'CALLED',
-          updatedAt: serverTimestamp(),
-        });
-      });
-      await Promise.all(updatePromises);
-    } catch (dbErr) {
-      console.warn('【entries進捗更新警告】:', dbErr);
-    }
-
-    try {
-      const logsCollectionRef = collection(db, 'matches', matchId, 'call_logs');
-      await addDoc(logsCollectionRef, {
-        matchId,
-        round: matchState.currentRound,
-        standGroup: targetCallGroup,
-        title: titleText,
-        body: bodyText,
-        targetPlayerCount: targetCallParticipants.length,
-        tokensFoundCount: targetTokens.length,
-        sentSuccessCount: targetTokens.length,
-        sentFailureCount: 0,
-        status: targetTokens.length > 0 ? 'SUCCESS' : 'PARTIAL',
-        triggerType: 'MANUAL_EXECUTE',
-        errorDetail: targetTokens.length === 0 ? 'FCMトークン登録者なし' : null,
-        createdAt: now,
-      });
-
-      setStatusMessage(
-        `第 ${targetCallGroup} 組の呼出を実行しました（選手 ${targetCallParticipants.length} 名 / 通知対象 ${targetTokens.length} 件）。`,
-      );
-      setTimeout(() => setStatusMessage(''), 4000);
-    } catch (logErr) {
-      console.error('【呼出ログ書き込み例外】:', logErr);
-      setErrorMessage('呼出ログの記録に失敗しました。');
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-
   return (
     <div className="w-full bg-white border border-slate-200/80 rounded-2xl p-5 shadow-sm space-y-5">
+      {/* ヘッダー領域 */}
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center border-b border-slate-100 pb-4 gap-3">
         <div>
-          <div className="flex items-center gap-2 mb-1">
+          <div className="flex items-center flex-wrap gap-2 mb-1">
             <span className="text-[10px] font-bold tracking-wider bg-slate-900 text-white px-2.5 py-0.5 rounded-full shadow-2xs flex items-center gap-1">
-              <Radio className="w-3 h-3 text-red-500 animate-pulse" />{' '}
-              本部進行管理
+              <Radio className="w-3 h-3 text-red-500 animate-pulse" />
+              本部進行・招集管理
             </span>
             <span className="text-xs bg-slate-100 text-slate-800 px-2 py-0.5 rounded font-mono font-bold">
-              ID: {matchId}
-            </span>
-            <span className="text-[10px] font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded flex items-center gap-1">
-              <InfinityIcon className="w-3 h-3 text-emerald-600" />{' '}
-              人数無制限自動追従
+              全 {groupNumbersList.length} 組編成 (1組＝2立・10名)
             </span>
           </div>
           <h3 className="font-black text-slate-900 text-lg">
-            大会進行管理 / 招集呼出制御コンソール
+            ステージ別 組一覧・単一排他招集コンソール
           </h3>
           <p className="text-xs text-slate-500 font-medium">
-            登録選手数（現在: <strong>{participants.length}名</strong>
-            ）に応じて全 <strong>{dynamicTotalStandGroups}組</strong>{' '}
-            を自動編成し、2立前招集通知を発報します
+            各ステージの組を第1組から昇順で表示します。誤操作防止のため、招集ボタンは全体で1つの組のみ押下（招集中に）できます。
           </p>
         </div>
+
         <div className="flex items-center gap-2 self-start sm:self-auto">
-          <Button
-            onClick={handleSeedFirestore}
-            disabled={isSeeding || isProcessing}
-            variant="outline"
-            size="sm"
-            className="text-xs font-bold h-9 bg-white border-slate-200 text-slate-700 hover:bg-slate-50 rounded-xl"
-          >
-            <Database className="w-3.5 h-3.5 mr-1 text-slate-600" />
-            {isSeeding ? '投入中...' : '個人戦初期データ生成'}
-          </Button>
+          {participants.length === 0 && (
+            <Button
+              onClick={handleSeedFirestore}
+              disabled={isSeeding || isProcessing}
+              variant="outline"
+              size="sm"
+              className="text-xs font-bold h-9 bg-white border-slate-200 text-slate-700 hover:bg-slate-50 rounded-xl"
+            >
+              <Database className="w-3.5 h-3.5 mr-1 text-slate-600" />
+              {isSeeding ? '投入中...' : '初期データ生成'}
+            </Button>
+          )}
         </div>
       </div>
 
+      {/* 現在どの組が招集中かを一目で判別できるグローバルステータスバナー */}
+      <div
+        className={`p-4 rounded-2xl border-2 transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+          isAnyGroupCurrentlyCalled
+            ? 'bg-amber-50 border-amber-400 shadow-sm'
+            : 'bg-slate-50 border-slate-200'
+        }`}
+      >
+        <div className="flex items-center gap-3">
+          <div
+            className={`w-11 h-11 rounded-xl flex items-center justify-center shrink-0 ${
+              isAnyGroupCurrentlyCalled
+                ? 'bg-amber-500 text-slate-950 animate-pulse shadow-xs'
+                : 'bg-slate-200 text-slate-500'
+            }`}
+          >
+            <BellRing className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                現在の招集ステータス
+              </span>
+              {isAnyGroupCurrentlyCalled ? (
+                <span className="inline-flex items-center gap-1 text-[10px] font-black bg-amber-500 text-slate-950 px-2 py-0.5 rounded-full">
+                  <Lock className="w-3 h-3" /> 招集中（他組ボタンロック中）
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full">
+                  <Unlock className="w-3 h-3" /> 招集待機中（選択可能）
+                </span>
+              )}
+            </div>
+
+            {isAnyGroupCurrentlyCalled ? (
+              <div className="text-base sm:text-lg font-black text-slate-900 mt-0.5 flex flex-wrap items-center gap-2">
+                <span>
+                  {getStageLabel(matchState.activeCallRound!)}：
+                  <span className="text-amber-700 font-mono">
+                    第 {matchState.activeCallGroup} 組（第
+                    {getStandNumbersByGroup(matchState.activeCallGroup!)[0]}
+                    立・第
+                    {getStandNumbersByGroup(matchState.activeCallGroup!)[1]}立）
+                  </span>
+                  を現在招集中
+                </span>
+              </div>
+            ) : (
+              <p className="text-sm font-bold text-slate-600 mt-0.5">
+                現在招集中の組はありません。下のリストから招集したい組の「招集する」ボタンを押してください。
+              </p>
+            )}
+          </div>
+        </div>
+
+        {/* 別ステージを表示中でも即座に解除できるクイック解除ボタン */}
+        {isAnyGroupCurrentlyCalled && (
+          <Button
+            type="button"
+            disabled={isProcessing}
+            onClick={() => {
+              const [s1, s2] = getStandNumbersByGroup(
+                matchState.activeCallGroup!,
+              );
+              const calledPlayers = participants.filter((p) => {
+                const st =
+                  p.standAssignments[matchState.activeCallRound!]?.standGroup;
+                return st === s1 || st === s2;
+              });
+              handleReleaseCallGroup(
+                matchState.activeCallGroup!,
+                calledPlayers,
+              );
+            }}
+            className="h-9 px-3.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shrink-0 self-end sm:self-auto"
+          >
+            <Unlock className="w-3.5 h-3.5 mr-1.5 text-amber-400" />第{' '}
+            {matchState.activeCallGroup} 組の招集を解除する
+          </Button>
+        )}
+      </div>
+
+      {/* ステージ切り替えタブ（第1ステージ / 第2ステージ / 第3ステージ） */}
       <div className="flex flex-wrap items-center gap-2">
         <button
           type="button"
           disabled={isProcessing}
           onClick={() => handleChangeRound(1)}
-          className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${matchState.currentRound === 1 ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${
+            matchState.currentRound === 1
+              ? 'bg-slate-900 text-white shadow-xs'
+              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+          }`}
         >
-          <Sun className="w-3.5 h-3.5 text-amber-400" /> 第1ステージ
-          (午前・一手)
+          <Sun className="w-3.5 h-3.5 text-amber-400" />
+          第1ステージ (午前・一手 2射)
+          {matchState.activeCallRound === 1 &&
+            matchState.activeCallGroup !== null && (
+              <span className="ml-1 px-1.5 py-0.2 rounded-full bg-amber-400 text-slate-950 font-mono text-[10px] font-black">
+                第{matchState.activeCallGroup}組招集中
+              </span>
+            )}
         </button>
+
         <button
           type="button"
           disabled={isProcessing}
           onClick={() => handleChangeRound(2)}
-          className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${matchState.currentRound === 2 ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${
+            matchState.currentRound === 2
+              ? 'bg-slate-900 text-white shadow-xs'
+              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+          }`}
         >
-          <Moon className="w-3.5 h-3.5 text-slate-300" /> 第2ステージ
-          (午後・一手)
+          <Moon className="w-3.5 h-3.5 text-slate-300" />
+          第2ステージ (午後・一手 2射)
+          {matchState.activeCallRound === 2 &&
+            matchState.activeCallGroup !== null && (
+              <span className="ml-1 px-1.5 py-0.2 rounded-full bg-amber-400 text-slate-950 font-mono text-[10px] font-black">
+                第{matchState.activeCallGroup}組招集中
+              </span>
+            )}
         </button>
+
         <button
           type="button"
           disabled={isProcessing}
           onClick={() => handleChangeRound(3)}
-          className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${matchState.currentRound === 3 ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${
+            matchState.currentRound === 3
+              ? 'bg-slate-900 text-white shadow-xs'
+              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+          }`}
         >
-          <Moon className="w-3.5 h-3.5 text-slate-300" /> 第3ステージ
-          (午後・四矢)
+          <Moon className="w-3.5 h-3.5 text-slate-300" />
+          第3ステージ (午後・四矢 4射)
+          {matchState.activeCallRound === 3 &&
+            matchState.activeCallGroup !== null && (
+              <span className="ml-1 px-1.5 py-0.2 rounded-full bg-amber-400 text-slate-950 font-mono text-[10px] font-black">
+                第{matchState.activeCallGroup}組招集中
+              </span>
+            )}
         </button>
       </div>
 
+      {/* ステータスメッセージ・エラーメッセージ */}
       {statusMessage && (
         <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 text-xs font-bold flex items-center gap-2">
           <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
@@ -845,116 +872,223 @@ export function MatchControlPanel({
         </div>
       )}
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl flex flex-col justify-between space-y-3">
-          <div>
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold text-slate-500">
-                現在競技中（射場）
-              </span>
-              <span className="text-[10px] font-mono font-bold text-slate-400">
-                {STAND_CONFIGS[matchState.currentRound].name}
-              </span>
-            </div>
-            <div className="flex items-baseline gap-2 my-2">
-              <span className="text-3xl font-black text-slate-900 font-mono">
-                第 {matchState.currentStandGroup} 組
-              </span>
-              <span className="text-xs text-slate-400 font-mono">
-                / 全 {dynamicTotalStandGroups} 組 (選手: {participants.length}
-                名)
-              </span>
-            </div>
-            <span className="text-[11px] text-emerald-800 font-bold flex items-center gap-1">
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />{' '}
-              行射中・リアルタイムスコア入力受付中
-            </span>
-          </div>
-          <div className="flex items-center gap-2 pt-2">
-            <Button
-              onClick={handleRevertStand}
-              disabled={isProcessing || matchState.currentStandGroup <= 1}
-              variant="outline"
-              size="sm"
-              className="h-10 px-3 text-xs font-bold bg-white border-slate-200 text-slate-700 hover:bg-slate-100 rounded-xl"
-            >
-              <RotateCcw className="w-3.5 h-3.5 mr-1" />
-              1組戻す
-            </Button>
-            <Button
-              onClick={handleAdvanceStand}
-              disabled={
-                isProcessing ||
-                matchState.currentStandGroup >= dynamicTotalStandGroups
-              }
-              className="flex-1 h-10 text-xs font-black bg-slate-900 hover:bg-slate-800 text-white rounded-xl shadow-xs"
-            >
-              {isProcessing ? (
-                <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
-              ) : (
-                <>
-                  次組へ進行（第 {matchState.currentStandGroup + 1} 組開始）
-                  <ArrowRight className="w-4 h-4 ml-1.5" />
-                </>
-              )}
-            </Button>
-          </div>
+      {/* ==========================================
+          組別 昇順縦リスト（各組に招集ボタンを配置・単一排他制御）
+          ========================================== */}
+      <div className="space-y-2.5">
+        <div className="flex items-center justify-between px-1">
+          <span className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+            <Layers className="w-4 h-4 text-slate-600" />【
+            {getStageLabel(matchState.currentRound)}】組別 招集リスト（昇順）
+          </span>
+          <span className="text-[11px] text-slate-500 font-medium">
+            ※招集ボタンは1つの組のみ有効になります
+          </span>
         </div>
 
-        <div className="p-4 bg-amber-50/70 border border-amber-200 rounded-xl flex flex-col justify-between space-y-3">
-          <div>
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold text-amber-900">
-                招集呼出対象（控席へ招中）
-              </span>
-              <span className="text-[10px] font-mono font-bold bg-amber-100 text-amber-900 border border-amber-300 px-2 py-0.5 rounded">
-                2組前呼出
-              </span>
-            </div>
-            <div className="flex items-baseline gap-2 my-2">
-              <span className="text-3xl font-black text-amber-950 font-mono">
-                {targetCallGroup
-                  ? `第 ${targetCallGroup} 組`
-                  : '終盤・対象なし'}
-              </span>
-              {targetCallGroup && (
-                <span className="text-xs text-amber-800 font-bold">
-                  （選手 {targetCallParticipants.length}名 / 通知可能{' '}
-                  {tokenRegisteredCount}名）
-                </span>
-              )}
-            </div>
-            <span className="text-[11px] text-amber-900 font-medium flex items-center gap-1">
-              <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
-              {targetCallGroup
-                ? 'プッシュ呼出通知の発報が可能です'
-                : '現在の立の全組呼出が完了しています'}
-            </span>
-          </div>
-          <div className="pt-2">
-            <Button
-              onClick={handleExecuteCall}
-              disabled={
-                isProcessing ||
-                !targetCallGroup ||
-                targetCallParticipants.length === 0
+        <div className="space-y-2.5">
+          {groupNumbersList.map((groupNumber) => {
+            const [firstStand, secondStand] =
+              getStandNumbersByGroup(groupNumber);
+
+            // この組（前半立 firstStand または 後半立 secondStand）に属する有効な出場選手を抽出
+            const groupPlayers = participants
+              .filter((p) => {
+                const st =
+                  p.standAssignments[matchState.currentRound]?.standGroup;
+                return (
+                  (st === firstStand || st === secondStand) &&
+                  p.checkInStatus !== 'ABSENT' &&
+                  p.qualificationStatus !== 'WITHDRAWN'
+                );
+              })
+              .sort((a, b) => {
+                const stA =
+                  a.standAssignments[matchState.currentRound]?.standGroup ?? 99;
+                const stB =
+                  b.standAssignments[matchState.currentRound]?.standGroup ?? 99;
+                if (stA !== stB) return stA - stB;
+                const ordA =
+                  a.standAssignments[matchState.currentRound]?.standOrder ?? 99;
+                const ordB =
+                  b.standAssignments[matchState.currentRound]?.standOrder ?? 99;
+                return ordA - ordB;
+              });
+
+            // 対象選手または所属チームに紐づくFCMトークンを重複なしで収集
+            const tokenSet = new Set<string>();
+            groupPlayers.forEach((p) => {
+              if (userTokensMap[p.id]) {
+                tokenSet.add(userTokensMap[p.id]);
               }
-              className="w-full h-10 text-xs font-black bg-amber-500 hover:bg-amber-600 text-slate-950 rounded-xl shadow-xs"
-            >
-              {isProcessing ? (
-                <Loader2 className="w-4 h-4 animate-spin text-slate-950" />
-              ) : (
-                <>
-                  <Send className="w-3.5 h-3.5 mr-1.5" />第{' '}
-                  {targetCallGroup ?? '-'} 組へ呼出通知を配信
-                </>
-              )}
-            </Button>
-          </div>
+              if (p.organization && teamTokensMap[p.organization]) {
+                teamTokensMap[p.organization].forEach((t) => tokenSet.add(t));
+              }
+            });
+            const groupTokens = Array.from(tokenSet);
+
+            // この組が現在「招集中」であるか判定
+            const isThisGroupCalled =
+              matchState.activeCallRound === matchState.currentRound &&
+              matchState.activeCallGroup === groupNumber;
+
+            // 他の組が招集中であるため、この組の招集ボタンをロックすべきか判定
+            const isLockedByOtherGroup =
+              isAnyGroupCurrentlyCalled && !isThisGroupCalled;
+
+            // 過去にこのステージ・この組を招集した履歴があるか判定
+            const hasBeenCalledInLogs = callLogs.some(
+              (log) =>
+                log.round === matchState.currentRound &&
+                log.standGroup === groupNumber,
+            );
+
+            return (
+              <div
+                key={groupNumber}
+                className={`p-4 rounded-2xl border transition-all flex flex-col lg:flex-row lg:items-center justify-between gap-3 ${
+                  isThisGroupCalled
+                    ? 'bg-amber-50/90 border-2 border-amber-500 shadow-md ring-2 ring-amber-200/70'
+                    : isLockedByOtherGroup
+                      ? 'bg-slate-50/70 border-slate-200 opacity-65'
+                      : 'bg-white border-slate-200/90 hover:border-slate-300 shadow-2xs'
+                }`}
+              >
+                {/* 左側：組番号・立番号・状態バッジ・所属選手プレビュー */}
+                <div className="space-y-1.5 min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span
+                      className={`font-mono text-sm font-black px-3 py-1 rounded-xl ${
+                        isThisGroupCalled
+                          ? 'bg-amber-500 text-slate-950 shadow-2xs'
+                          : 'bg-slate-900 text-white'
+                      }`}
+                    >
+                      第 {groupNumber} 組
+                    </span>
+
+                    <span className="font-mono text-xs font-bold text-slate-700 bg-slate-100 border border-slate-200 px-2.5 py-0.5 rounded-lg">
+                      第 {firstStand} 立 ・ 第 {secondStand} 立
+                    </span>
+
+                    {isThisGroupCalled ? (
+                      <span className="inline-flex items-center gap-1.5 text-xs font-black bg-amber-400 text-slate-950 px-3 py-0.5 rounded-full animate-pulse shadow-2xs">
+                        <BellRing className="w-3.5 h-3.5" />
+                        現在招集中
+                      </span>
+                    ) : hasBeenCalledInLogs ? (
+                      <span className="inline-flex items-center gap-1 text-[11px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200 px-2.5 py-0.5 rounded-full">
+                        <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                        招集履歴あり
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 text-[11px] font-bold bg-slate-100 text-slate-500 px-2.5 py-0.5 rounded-full">
+                        未招集
+                      </span>
+                    )}
+
+                    <span className="text-xs font-mono text-slate-500 ml-auto lg:ml-2 flex items-center gap-1">
+                      <Users className="w-3.5 h-3.5 text-slate-400" />
+                      出場対象: <strong>{groupPlayers.length}</strong> 名 /
+                      通知先端末: <strong>{groupTokens.length}</strong> 件
+                    </span>
+                  </div>
+
+                  {/* 組内の選手名・所属プレビュー */}
+                  {groupPlayers.length === 0 ? (
+                    <p className="text-xs text-slate-400 font-medium pl-1">
+                      この組に割り当てられた有効な出場選手はいません。
+                    </p>
+                  ) : (
+                    <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                      {groupPlayers.map((p) => (
+                        <span
+                          key={p.id}
+                          className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-md border ${
+                            isThisGroupCalled
+                              ? 'bg-white border-amber-300 text-slate-900 font-bold'
+                              : 'bg-slate-50 border-slate-200 text-slate-700 font-medium'
+                          }`}
+                        >
+                          <span className="font-mono text-[10px] text-slate-500">
+                            No.{p.bibNumber}
+                          </span>
+                          <span>{p.name}</span>
+                          <span className="text-[10px] text-slate-400">
+                            ({p.organization || '無所属'})
+                          </span>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* 右側：単一排他制御の「招集ボタン」または「招集解除ボタン」 */}
+                <div className="flex items-center justify-end gap-2 shrink-0 pt-2 lg:pt-0 border-t lg:border-t-0 border-slate-100">
+                  {isThisGroupCalled ? (
+                    <Button
+                      type="button"
+                      disabled={isProcessing}
+                      onClick={() =>
+                        handleReleaseCallGroup(groupNumber, groupPlayers)
+                      }
+                      className="w-full sm:w-auto h-10 px-4 bg-slate-900 hover:bg-slate-800 text-white font-black text-xs rounded-xl shadow-xs flex items-center justify-center gap-1.5"
+                    >
+                      {isProcessing ? (
+                        <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
+                      ) : (
+                        <>
+                          <Unlock className="w-4 h-4 text-amber-400" />
+                          招集中を解除（完了）
+                        </>
+                      )}
+                    </Button>
+                  ) : (
+                    <Button
+                      type="button"
+                      disabled={
+                        isProcessing ||
+                        isLockedByOtherGroup ||
+                        groupPlayers.length === 0
+                      }
+                      onClick={() =>
+                        handleCallGroup(groupNumber, groupPlayers, groupTokens)
+                      }
+                      className={`w-full sm:w-auto h-10 px-5 font-black text-xs rounded-xl shadow-xs flex items-center justify-center gap-1.5 ${
+                        isLockedByOtherGroup
+                          ? 'bg-slate-200 text-slate-500 cursor-not-allowed'
+                          : 'bg-amber-500 hover:bg-amber-600 text-slate-950'
+                      }`}
+                      title={
+                        isLockedByOtherGroup
+                          ? `第${matchState.activeCallGroup}組が招集中のためロックされています`
+                          : `第${groupNumber}組を招集しFCM通知を送信します`
+                      }
+                    >
+                      {isProcessing ? (
+                        <Loader2 className="w-4 h-4 animate-spin text-slate-950" />
+                      ) : isLockedByOtherGroup ? (
+                        <>
+                          <Lock className="w-3.5 h-3.5" />
+                          他組招集中につきロック
+                        </>
+                      ) : (
+                        <>
+                          <Send className="w-3.5 h-3.5" />第 {groupNumber}{' '}
+                          組を招集する
+                        </>
+                      )}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
-      <div className="space-y-2 pt-2">
+      {/* FCM呼出通知 配信ログテーブル */}
+      <div className="space-y-2 pt-3 border-t border-slate-100">
         <div className="flex items-center justify-between">
           <h4 className="text-xs font-bold text-slate-800 flex items-center gap-1.5 uppercase tracking-wider">
             <History className="w-3.5 h-3.5 text-slate-600" />
@@ -971,11 +1105,11 @@ export function MatchControlPanel({
             </div>
           ) : (
             <div className="w-full overflow-x-auto">
-              <table className="w-full text-left text-xs min-w-162.5">
+              <table className="w-full text-left text-xs min-w-[650px]">
                 <thead className="bg-slate-100/80 text-slate-600 border-b border-slate-200 text-[11px]">
                   <tr>
                     <th className="py-2.5 px-3 font-bold">送信時刻</th>
-                    <th className="py-2.5 px-3 font-bold">対象立・組</th>
+                    <th className="py-2.5 px-3 font-bold">対象ステージ・組</th>
                     <th className="py-2.5 px-3 font-bold">状態</th>
                     <th className="py-2.5 px-3 font-bold">
                       配信実績 (成功/対象)
@@ -999,7 +1133,7 @@ export function MatchControlPanel({
                       </td>
                       <td className="py-2.5 px-3 whitespace-nowrap">
                         <span className="font-bold text-slate-900">
-                          {STAND_CONFIGS[log.round]?.name || `第${log.round}立`}
+                          {getStageLabel(log.round)}
                         </span>
                         <span className="ml-1.5 px-2 py-0.5 rounded bg-slate-200 text-slate-800 text-[10px] font-mono font-black">
                           第 {log.standGroup} 組
@@ -1008,17 +1142,17 @@ export function MatchControlPanel({
                       <td className="py-2.5 px-3 whitespace-nowrap">
                         {log.status === 'SUCCESS' ? (
                           <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-800 bg-emerald-50 border border-emerald-300 px-2 py-0.5 rounded-full">
-                            <CheckCircle2 className="w-3 h-3 text-emerald-600" />{' '}
+                            <CheckCircle2 className="w-3 h-3 text-emerald-600" />
                             成功
                           </span>
                         ) : log.status === 'PARTIAL' ? (
                           <span className="inline-flex items-center gap-1 text-[10px] font-bold text-amber-800 bg-amber-50 border border-amber-300 px-2 py-0.5 rounded-full">
-                            <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />{' '}
-                            一部未達
+                            <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
+                            ログ記録済
                           </span>
                         ) : (
                           <span className="inline-flex items-center gap-1 text-[10px] font-bold text-red-800 bg-red-50 border border-red-300 px-2 py-0.5 rounded-full">
-                            <AlertCircle className="w-3.5 h-3.5 text-red-600" />{' '}
+                            <AlertCircle className="w-3.5 h-3.5 text-red-600" />
                             失敗
                           </span>
                         )}
