@@ -179,6 +179,7 @@ export default function GuidelinesPage() {
               </span>
               <ul className="text-slate-800 font-semibold space-y-0.5 ml-5">
                 <li>米農家 緒方充</li>
+                <li>弓小物工房 あいみかん</li>
               </ul>
             </div>
           </div>
