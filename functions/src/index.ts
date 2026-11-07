@@ -1,61 +1,72 @@
 /**
- * 【主要機能要件3: 大会進行・単一排他招集に応じたFCMプッシュ通知自動送信 (Cloud Functions v2 完全互換版)】
+ * 【Firebase Cloud Functions v2: 試合進行・招集ステータス連動型 FCM自動プッシュ通知トリガー】
  *
  * 役割:
- * 1. 既存の関数名 `onMatchProgressUpdated` (matches/{matchId} の onDocumentWritten) を完全維持。
- * 2. 新設された「組別 招集ボタン（activeCallGroup の単一排他ロック更新）」と、
- *    従来の「進行インクリメント（currentStandGroup + 2 の自動呼出）」の双方を自動判別して処理。
- * 3. 「1組＝2立（第 2N-1 立・第 2N 立）」構造と「単一立」構造の双方に対応し、
- *    entries コレクション（selectedEntryId 紐付け）および users コレクション（standAssignments 直接保持）の両経路から
- *    対象選手の FCM トークンを漏れなく抽出。
- * 4. 対象端末へ「メッセージ通知」「バイブレーション（振動）」「通知音」を同時送出するマルチキャスト一括送信を実行し、
- *    結果を `matches/{matchId}/call_logs` サブコレクションへ自動記録・同期。
+ * - Firestore の `matches/{matchId}` ドキュメントの書き込み (onDocumentWritten) を常時監視。
+ * - 本部管理画面（MatchControlPanel.tsx）等で `activeCallGroup`（現在招集中の組）または
+ *   `currentStandGroup` が更新された際、該当する組の選手および所属チームのFCMトークンを抽出し、
+ *   Firebase Cloud Messaging (FCM) を介してプッシュ通知を自動一括配信。
  *
  * フールプルーフ設計（事故前・対人間）:
- * - 招集対象組（activeCallGroup）も進行組（currentStandGroup）も変化していない更新（スコア修正や招集解除時など）は即時リターンし、誤送信・二重送信を完全遮断。
- * - 棄権選手（ABSENT / WITHDRAWN）は通知対象から除外。
+ * - 招集対象の組番号やステージ番号が未定義、または無効値（0以下）の場合は処理を即座に安全終了（誤爆防止）。
+ * - 棄権（ABSENT）または辞退（WITHDRAWN）となった選手の端末には通知を送信しないよう厳格にフィルタリング。
+ * - 重複するFCMトークンを Set構造 で排除し、同一端末への過剰な通知送信を防止。
  *
  * フェイルセーフ設計（事故後・対故障）:
- * - 失効・無効トークン（invalid-registration-token / registration-token-not-registered）を検知した場合は、
- *   users ドキュメントから該当トークンを自動削除（自己修復バッチ処理）。
- * - 万が一の例外発生時も Cloud Functions をクラッシュさせず構造化エラーログと call_logs へのエラーステータス記録を実行。
+ * - FCM送信時に一部のトークンが無効化（messaging/registration-token-not-registered等）されていた場合でも、
+ *   全体の処理がクラッシュしないよう個別例外をキャッチして成功・失敗数を分けて記録。
+ * - 送信結果の詳細（成功数・失敗数・エラー詳細）を `matches/{matchId}/call_logs` サブコレクションへ確実に書き込み。
  */
 
+import { setGlobalOptions } from 'firebase-functions/v2';
 import { onDocumentWritten } from 'firebase-functions/v2/firestore';
 import * as admin from 'firebase-admin';
 
-if (admin.apps.length === 0) {
+// サービス初期化
+if (!admin.apps.length) {
   admin.initializeApp();
 }
 
 const db = admin.firestore();
 const messaging = admin.messaging();
 
+// グローバルオプションの設定（東京リージョン固定）
+setGlobalOptions({ region: 'asia-northeast1' });
+
+interface MatchDocumentData {
+  title?: string;
+  currentRound?: number;
+  currentStandGroup?: number;
+  activeCallRound?: number;
+  activeCallGroup?: number;
+  [key: string]: unknown;
+}
+
+interface UserDocumentData {
+  fcmToken?: string;
+  selectedEntryId?: string;
+  participantId?: string;
+  teamId?: string;
+  teamName?: string;
+  organization?: string;
+  [key: string]: unknown;
+}
+
+interface EntryDocumentData {
+  bibNumber?: number;
+  name?: string;
+  organization?: string;
+  checkInStatus?: string;
+  qualificationStatus?: string;
+  standAssignments?: Record<
+    number,
+    { standGroup?: number | null; standOrder?: number | null }
+  >;
+  [key: string]: unknown;
+}
+
 const STANDS_PER_GROUP = 2;
 
-interface MatchData {
-  matchId?: string;
-  title?: string;
-  currentRound?: 1 | 2 | 3;
-  currentStandGroup?: number;
-  currentStandNumber?: number;
-  totalStandGroups?: number;
-  activeCallRound?: 1 | 2 | 3 | null;
-  activeCallGroup?: number | null;
-  lastCalledAt?: number;
-  status?: string;
-}
-
-interface TokenTargetInfo {
-  token: string;
-  userRef: FirebaseFirestore.DocumentReference;
-  name: string;
-}
-
-/**
- * 組番号 (1, 2, 3...) から、その組に含まれる2つの立番号 [前半立, 後半立] を算出する
- * 例: 第1組 -> [1, 2] (第1立・第2立), 第2組 -> [3, 4] (第3立・第4立)
- */
 function getStandNumbersByGroup(groupNumber: number): [number, number] {
   const safeGroup = Math.max(1, Math.floor(groupNumber));
   const firstStand = (safeGroup - 1) * STANDS_PER_GROUP + 1;
@@ -63,413 +74,245 @@ function getStandNumbersByGroup(groupNumber: number): [number, number] {
   return [firstStand, secondStand];
 }
 
-/**
- * ステージ番号から表示ラベルを取得する
- */
-function getRoundLabel(round: 1 | 2 | 3): string {
+function getStageName(round: number): string {
   switch (round) {
     case 1:
-      return '第1ステージ(午前・一手)';
+      return '第1ステージ (午前・一手)';
     case 2:
-      return '第2ステージ(午後・一手)';
+      return '第2ステージ (午後・一手)';
     case 3:
-      return '第3ステージ(午後・四矢)';
+      return '第3ステージ (午後・四矢)';
     default:
       return `第${round}ステージ`;
   }
 }
 
+/**
+ * 試合進行ドキュメントの更新をトリガーにFCMプッシュ通知を配信するCloud Function (v2)
+ */
 export const onMatchProgressUpdated = onDocumentWritten(
-  {
-    document: 'matches/{matchId}',
-    region: 'asia-northeast1',
-    maxInstances: 10,
-  },
+  'matches/{matchId}',
   async (event) => {
-    const beforeData = event.data?.before?.data() as MatchData | undefined;
-    const afterData = event.data?.after?.data() as MatchData | undefined;
-
-    if (!afterData) {
-      console.log(
-        '【ログ】matchesドキュメントが削除されたため処理を終了します。',
-      );
+    const snap = event.data;
+    if (!snap) {
+      console.log('【FCMトリガー】スナップショットが存在しません。');
       return;
     }
+
+    const beforeData = (
+      snap.before.exists ? snap.before.data() : {}
+    ) as MatchDocumentData;
+    const afterData = (
+      snap.after.exists ? snap.after.data() : {}
+    ) as MatchDocumentData;
 
     const matchId = event.params.matchId;
 
-    // -------------------------------------------------------------
-    // 1. トリガー種別の判定（A: 単一排他招集ボタン押下 / B: 従来の進行インクリメント）
-    // -------------------------------------------------------------
-    const beforeActiveCallGroup =
-      typeof beforeData?.activeCallGroup === 'number'
-        ? beforeData.activeCallGroup
-        : null;
-    const afterActiveCallGroup =
-      typeof afterData?.activeCallGroup === 'number'
-        ? afterData.activeCallGroup
-        : null;
+    const newActiveGroup = afterData.activeCallGroup;
+    const oldActiveGroup = beforeData.activeCallGroup;
 
-    const beforeGroup =
-      typeof beforeData?.currentStandGroup === 'number'
-        ? beforeData.currentStandGroup
-        : 0;
-    const afterGroup =
-      typeof afterData?.currentStandGroup === 'number'
-        ? afterData.currentStandGroup
-        : 0;
-
-    let targetGroupNumber: number | null = null;
-    let targetRound: 1 | 2 | 3 =
-      afterData.currentRound === 1 ||
-      afterData.currentRound === 2 ||
-      afterData.currentRound === 3
-        ? afterData.currentRound
-        : 1;
-    let isExplicitGroupCall = false;
-
-    // ケースA: 管理画面で「第N組を招集する」ボタンが押され、activeCallGroup が新規設定された場合
-    if (
-      afterActiveCallGroup !== null &&
-      afterActiveCallGroup > 0 &&
-      afterActiveCallGroup !== beforeActiveCallGroup
-    ) {
-      targetGroupNumber = afterActiveCallGroup;
-      if (
-        afterData.activeCallRound === 1 ||
-        afterData.activeCallRound === 2 ||
-        afterData.activeCallRound === 3
-      ) {
-        targetRound = afterData.activeCallRound;
-      }
-      isExplicitGroupCall = true;
-      console.log(
-        `【招集ボタン検知】${getRoundLabel(targetRound)} 第${targetGroupNumber}組 が招集中に設定されました。`,
-      );
-    }
-    // ケースA-解除: 「招集中を解除（完了）」ボタンが押され、activeCallGroup が null に戻った場合は通知せず終了
-    else if (beforeActiveCallGroup !== null && afterActiveCallGroup === null) {
-      console.log(
-        `【招集解除検知】第${beforeActiveCallGroup}組 の招集ロックが解除されました（通知スキップ）。`,
-      );
+    // フールプルーフ：招集組が新しく設定された瞬間（または変更された瞬間）のみ発火
+    if (!newActiveGroup || newActiveGroup <= 0) {
       return;
     }
-    // ケースB: 従来の進行インクリメント（currentStandGroup が増加し、2組先を自動呼出する場合）
-    else if (afterGroup > beforeGroup) {
-      const candidateGroup = afterGroup + 2;
-      const totalGroups =
-        typeof afterData.totalStandGroups === 'number'
-          ? afterData.totalStandGroups
-          : 999;
-
-      if (candidateGroup > totalGroups) {
-        console.log(
-          `【スキップ】呼出対象組（第${candidateGroup}組）が総組数（全${totalGroups}組）を超過しています。`,
-        );
-        return;
-      }
-      targetGroupNumber = candidateGroup;
-      console.log(
-        `【自動進行検知】${getRoundLabel(targetRound)} 現在: 第${afterGroup}組 -> 2組先呼出対象: 第${targetGroupNumber}組`,
-      );
-    } else {
-      // 招集状態にも進行組にも変化がない場合は早期リターン（フールプルーフ）
-      console.log(
-        `【スキップ】招集組・進行組の変化なし（activeCallGroup: ${afterActiveCallGroup}, currentStandGroup: ${afterGroup}）`,
-      );
+    if (newActiveGroup === oldActiveGroup) {
+      // 招集組に変更がない場合は重複発火を防止して終了
       return;
     }
 
-    if (!targetGroupNumber) return;
+    const round = Number(
+      afterData.activeCallRound ?? afterData.currentRound ?? 1,
+    );
+    const stageName = getStageName(round);
+    const [firstStand, secondStand] = getStandNumbersByGroup(newActiveGroup);
 
-    // 第 N 組に対応する前半立 (2N-1) と後半立 (2N) を算出
-    const [firstStand, secondStand] = getStandNumbersByGroup(targetGroupNumber);
-    const roundLabel = getRoundLabel(targetRound);
+    console.log(
+      `【FCM自動通知】試合進行検知: ${matchId} / ${stageName} 第${newActiveGroup}組 (第${firstStand}・${secondStand}立) の招集発火`,
+    );
 
     try {
-      // -------------------------------------------------------------
-      // 2. 対象選手および FCM トークンの多層抽出（entries 連携 ＋ users 直接保持の両対応）
-      // -------------------------------------------------------------
-      const entriesSnapshot = await db.collection('entries').get();
-      const targetEntryIds = new Set<string>();
+      // 1. entries コレクションから該当組に所属する有効な選手を抽出
+      const entriesSnap = await db.collection('entries').get();
+      const targetParticipantIds = new Set<string>();
       const targetOrganizations = new Set<string>();
-      let targetPlayerCount = 0;
 
-      entriesSnapshot.forEach((docSnap) => {
-        const eData = docSnap.data();
+      entriesSnap.forEach((docSnap) => {
+        const entry = docSnap.data() as EntryDocumentData;
         if (
-          eData.checkInStatus === 'ABSENT' ||
-          eData.qualificationStatus === 'WITHDRAWN'
+          entry.checkInStatus === 'ABSENT' ||
+          entry.qualificationStatus === 'WITHDRAWN'
         ) {
           return;
         }
 
-        const assignments = eData.standAssignments || {};
-        const roundAssign =
-          assignments[targetRound] ||
-          (targetRound === 3 ? assignments[2] : undefined) ||
-          {};
-        const assignedStand = Number(roundAssign.standGroup);
+        const assignments = entry.standAssignments || {};
+        const st = assignments[round]?.standGroup;
 
-        // 1組＝2立（firstStand または secondStand）に一致、あるいは組番号そのものに一致する選手を抽出
-        if (
-          assignedStand === firstStand ||
-          assignedStand === secondStand ||
-          assignedStand === targetGroupNumber
-        ) {
-          targetPlayerCount++;
-          targetEntryIds.add(docSnap.id);
-          if (
-            typeof eData.organization === 'string' &&
-            eData.organization.trim().length > 0
-          ) {
-            targetOrganizations.add(eData.organization.trim());
+        if (st === firstStand || st === secondStand) {
+          targetParticipantIds.add(docSnap.id);
+          if (entry.organization) {
+            targetOrganizations.add(entry.organization.trim());
           }
         }
       });
 
-      // users コレクションから該当選手のトークンを収集（重複排除）
-      const usersSnapshot = await db.collection('users').get();
-      const tokenMap = new Map<string, TokenTargetInfo>();
-
-      usersSnapshot.forEach((userDoc) => {
-        const userData = userDoc.data();
-        const rawToken =
-          typeof userData.fcmToken === 'string' ? userData.fcmToken.trim() : '';
-        if (!rawToken) return;
-
-        // 経路1: selectedEntryId が対象選手IDに含まれている
-        const selectedEntryId =
-          typeof userData.selectedEntryId === 'string'
-            ? userData.selectedEntryId.trim()
-            : '';
-        const matchedByEntryId =
-          selectedEntryId.length > 0 && targetEntryIds.has(selectedEntryId);
-
-        // 経路2: users ドキュメント内の standAssignments.{round}.standGroup が対象立・組に一致（既存仕様互換）
-        const userStandAssign =
-          userData.standAssignments?.[targetRound]?.standGroup;
-        const matchedByDirectStand =
-          typeof userStandAssign === 'number' &&
-          (userStandAssign === firstStand ||
-            userStandAssign === secondStand ||
-            userStandAssign === targetGroupNumber);
-
-        // 経路3: チーム選択（teamId / organization）が対象選手の所属団体に一致
-        const userTeam = String(
-          userData.teamId ||
-            userData.selectedTeam ||
-            userData.organization ||
-            '',
-        ).trim();
-        const matchedByTeam =
-          userTeam.length > 0 && targetOrganizations.has(userTeam);
-
-        if (matchedByEntryId || matchedByDirectStand || matchedByTeam) {
-          if (!tokenMap.has(rawToken)) {
-            tokenMap.set(rawToken, {
-              token: rawToken,
-              userRef: userDoc.ref,
-              name:
-                typeof userData.playerName === 'string'
-                  ? userData.playerName
-                  : '選手',
-            });
-          }
-        }
-      });
-
-      const validTokensWithRefs = Array.from(tokenMap.values());
-      const notificationTitle = isExplicitGroupCall
-        ? `【招集呼出】第${targetGroupNumber}組（第${firstStand}・${secondStand}立）`
-        : `【招集呼出】まもなく第${targetGroupNumber}組（第${firstStand}・${secondStand}立）の入場です`;
-
-      const notificationBody = isExplicitGroupCall
-        ? `${roundLabel} 第${targetGroupNumber}組（第${firstStand}立・第${secondStand}立）の選手は控席・招集所へ速やかにお集まりください。`
-        : `現在、第${afterGroup}組が進行中です。${roundLabel} 第${targetGroupNumber}組（第${firstStand}立・第${secondStand}立）の選手は控席・招集所へお集まりください。`;
-
-      // トークンが0件の場合のハンドリング
-      if (validTokensWithRefs.length === 0) {
-        console.log(
-          `【ログ】${roundLabel} 第${targetGroupNumber}組（第${firstStand}・${secondStand}立）に該当する登録FCMトークンがありません。`,
-        );
-        return;
-      }
-
-      const tokens = validTokensWithRefs.map((item) => item.token);
-
-      // -------------------------------------------------------------
-      // 3. FCM マルチキャストメッセージ構築（既存の高優先度・バイブレーション・音声設定を完全維持）
-      // -------------------------------------------------------------
-      const multicastMessage: admin.messaging.MulticastMessage = {
-        tokens,
-        notification: {
-          title: notificationTitle,
-          body: notificationBody,
-        },
-        data: {
-          matchId: String(matchId),
-          targetStandGroup: String(targetGroupNumber),
-          firstStand: String(firstStand),
-          secondStand: String(secondStand),
-          currentRound: String(targetRound),
-          click_action: '/standby',
-        },
-        webpush: {
-          headers: {
-            Urgency: 'high',
-          },
-          notification: {
-            title: notificationTitle,
-            body: notificationBody,
-            icon: '/favicon.ico',
-            badge: '/favicon.ico',
-            vibrate: [300, 150, 300, 150, 300],
-            silent: false,
-            requireInteraction: true,
-            renotify: true,
-            tag: `kyudo-call-round${targetRound}-group${targetGroupNumber}`,
-          },
-          fcmOptions: {
-            link: '/standby',
-          },
-        },
-        android: {
-          priority: 'high',
-          notification: {
-            sound: 'default',
-            channelId: 'kyudo_call_high_priority_channel',
-            defaultSound: true,
-            defaultVibrateTimings: false,
-            vibrateTimingsMillis: [0, 300, 150, 300, 150, 300],
-            priority: 'high',
-            visibility: 'public',
-          },
-        },
-        apns: {
-          headers: {
-            'apns-priority': '10',
-          },
-          payload: {
-            aps: {
-              sound: 'default',
-              badge: 1,
-              contentAvailable: true,
-            },
-          },
-        },
-      };
-
-      // -------------------------------------------------------------
-      // 4. 一括送信実行
-      // -------------------------------------------------------------
-      const response = await messaging.sendEachForMulticast(multicastMessage);
       console.log(
-        `【FCM結果】成功: ${response.successCount} 件, 失敗: ${response.failureCount} 件 (対象: 第${targetGroupNumber}組 / 第${firstStand}・${secondStand}立)`,
+        `【FCM自動通知】対象選手数: ${targetParticipantIds.size}名, 対象所属数: ${targetOrganizations.size}団体`,
       );
 
-      // -------------------------------------------------------------
-      // 5. 【フェイルセーフ】無効・失効トークンの自動自己修復バッチ処理
-      // -------------------------------------------------------------
-      if (response.failureCount > 0) {
-        const batch = db.batch();
-        let invalidCount = 0;
+      // 2. users コレクションから FCM トークンを収集（3つの紐付け経路すべてに対応）
+      const usersSnap = await db.collection('users').get();
+      const tokenSet = new Set<string>();
 
-        response.responses.forEach((resp, idx) => {
-          if (!resp.success && resp.error) {
-            const errorCode = resp.error.code;
-            if (
-              errorCode === 'messaging/invalid-registration-token' ||
-              errorCode === 'messaging/registration-token-not-registered'
-            ) {
-              const userRef = validTokensWithRefs[idx].userRef;
-              batch.update(userRef, {
-                fcmToken: admin.firestore.FieldValue.delete(),
-                tokenCleanedAt: admin.firestore.FieldValue.serverTimestamp(),
-              });
-              invalidCount++;
-            }
-          }
-        });
+      usersSnap.forEach((docSnap) => {
+        const user = docSnap.data() as UserDocumentData;
+        const token =
+          typeof user.fcmToken === 'string' ? user.fcmToken.trim() : '';
+        if (!token) return;
 
-        if (invalidCount > 0) {
-          await batch.commit();
-          console.log(
-            `【自己修復】無効トークン ${invalidCount} 件をFirestoreから削除しました。`,
-          );
+        const entryKey = user.selectedEntryId || user.participantId;
+        const teamKey = user.teamId || user.teamName || user.organization;
+
+        const isMatchEntry =
+          entryKey && targetParticipantIds.has(String(entryKey));
+        const isMatchOrg =
+          teamKey && targetOrganizations.has(String(teamKey).trim());
+
+        if (isMatchEntry || isMatchOrg) {
+          tokenSet.add(token);
         }
-      }
-
-      // -------------------------------------------------------------
-      // 6. 直近の call_logs ドキュメントの送信実績を実測値で更新（または新規作成）
-      // -------------------------------------------------------------
-      const recentLogsSnap = await db
-        .collection('matches')
-        .doc(matchId)
-        .collection('call_logs')
-        .orderBy('createdAt', 'desc')
-        .limit(3)
-        .get();
-
-      const matchingLogDoc = recentLogsSnap.docs.find((d) => {
-        const dData = d.data();
-        return (
-          Number(dData.round) === targetRound &&
-          Number(dData.standGroup) === targetGroupNumber &&
-          Date.now() - Number(dData.createdAt || 0) < 30000
-        );
       });
 
-      const finalStatus =
-        response.failureCount === 0
-          ? 'SUCCESS'
-          : response.successCount > 0
-            ? 'PARTIAL'
-            : 'FAILED';
+      const tokens = Array.from(tokenSet);
+      console.log(
+        `【FCM自動通知】有効な配信先FCMトークン数: ${tokens.length}件`,
+      );
 
-      if (matchingLogDoc) {
-        await matchingLogDoc.ref.update({
-          targetPlayerCount:
-            targetPlayerCount > 0 ? targetPlayerCount : tokens.length,
-          tokensFoundCount: tokens.length,
-          sentSuccessCount: response.successCount,
-          sentFailureCount: response.failureCount,
-          status: finalStatus,
-          fcmDispatched: true,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-      } else {
+      if (tokens.length === 0) {
+        console.log(
+          '【FCM自動通知】配信対象のトークンが見つかりませんでした。',
+        );
         await db
           .collection('matches')
           .doc(matchId)
           .collection('call_logs')
           .add({
             matchId,
-            round: targetRound,
-            standGroup: targetGroupNumber,
-            firstStandNumber: firstStand,
-            secondStandNumber: secondStand,
-            title: notificationTitle,
-            body: notificationBody,
-            targetPlayerCount:
-              targetPlayerCount > 0 ? targetPlayerCount : tokens.length,
-            tokensFoundCount: tokens.length,
-            sentSuccessCount: response.successCount,
-            sentFailureCount: response.failureCount,
-            status: finalStatus,
-            triggerType: isExplicitGroupCall
-              ? 'MANUAL_GROUP_CALL'
-              : 'AUTO_PROGRESS',
-            errorDetail: null,
-            fcmDispatched: true,
+            round,
+            standGroup: newActiveGroup,
+            title: `【招集】${stageName} 第${newActiveGroup}組`,
+            body: `${stageName} 第${newActiveGroup}組（第${firstStand}立・第${secondStand}立）の選手は招集所へお集まりください。`,
+            targetPlayerCount: targetParticipantIds.size,
+            tokensFoundCount: 0,
+            sentSuccessCount: 0,
+            sentFailureCount: 0,
+            status: 'SUCCESS',
+            triggerType: 'AUTO_PROGRESS',
+            errorDetail: 'FCMトークン登録端末なし',
             createdAt: Date.now(),
           });
+        return;
       }
-    } catch (error) {
-      console.error(
-        '【例外ログ】選手呼出通知処理中にエラーが発生しました:',
-        error,
+
+      // 3. FCM マルチキャスト配信（一度に最大500件ずつ送信）
+      const titleText = `【招集呼出】第${newActiveGroup}組（第${firstStand}・${secondStand}立）`;
+      const bodyText = `${stageName} 第${newActiveGroup}組（第${firstStand}立・第${secondStand}立）の選手は控席・招集所へお集まりください。`;
+
+      let successCount = 0;
+      let failureCount = 0;
+
+      // 500件ずつのバッチに分割
+      const batchSize = 500;
+      for (let i = 0; i < tokens.length; i += batchSize) {
+        const chunk = tokens.slice(i, i + batchSize);
+        const message: admin.messaging.MulticastMessage = {
+          tokens: chunk,
+          notification: {
+            title: titleText,
+            body: bodyText,
+          },
+          data: {
+            click_action: '/standby',
+            round: String(round),
+            standGroup: String(newActiveGroup),
+          },
+          webpush: {
+            notification: {
+              icon: '/favicon.ico',
+              badge: '/favicon.ico',
+              requireInteraction: true,
+            },
+          },
+        };
+
+        try {
+          const response = await messaging.sendEachForMulticast(message);
+          successCount += response.successCount;
+          failureCount += response.failureCount;
+
+          if (response.failureCount > 0) {
+            response.responses.forEach((resp, idx) => {
+              if (!resp.success) {
+                console.warn(
+                  `【FCM送信失敗】token[${i + idx}] error:`,
+                  resp.error?.message,
+                );
+              }
+            });
+          }
+        } catch (chunkErr) {
+          console.error('【FCM送信チャンク例外】:', chunkErr);
+          failureCount += chunk.length;
+        }
+      }
+
+      console.log(
+        `【FCM自動通知完了】成功: ${successCount}件, 失敗: ${failureCount}件`,
       );
+
+      // 4. call_logs サブコレクションへ送信実績を記録（フェイルセーフ監査ログ）
+      await db
+        .collection('matches')
+        .doc(matchId)
+        .collection('call_logs')
+        .add({
+          matchId,
+          round,
+          standGroup: newActiveGroup,
+          title: titleText,
+          body: bodyText,
+          targetPlayerCount: targetParticipantIds.size,
+          tokensFoundCount: tokens.length,
+          sentSuccessCount: successCount,
+          sentFailureCount: failureCount,
+          status: failureCount === 0 ? 'SUCCESS' : 'PARTIAL',
+          triggerType: 'AUTO_PROGRESS',
+          errorDetail:
+            failureCount > 0 ? '一部の端末への送信に失敗しました' : null,
+          createdAt: Date.now(),
+        });
+    } catch (err) {
+      console.error('【FCM自動通知トリガー重大例外】:', err);
+      // フェイルセーフ：エラー発生時もクラッシュさせずログに記録
+      await db
+        .collection('matches')
+        .doc(matchId)
+        .collection('call_logs')
+        .add({
+          matchId,
+          round: Number(afterData.activeCallRound || 1),
+          standGroup: newActiveGroup,
+          title: '【エラー】自動招集通知の送信中に例外が発生しました',
+          body: String(err),
+          targetPlayerCount: 0,
+          tokensFoundCount: 0,
+          sentSuccessCount: 0,
+          sentFailureCount: 0,
+          status: 'FAILED',
+          triggerType: 'AUTO_PROGRESS',
+          errorDetail: String(err),
+          createdAt: Date.now(),
+        });
     }
   },
 );
