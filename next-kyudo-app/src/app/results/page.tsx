@@ -1,20 +1,19 @@
 /**
- * 【参加者・観客向け リアルタイム成績速報＆立順閲覧ページ（選手カード内 進行状況バッジ連動版）】
+ * 【参加者・観客向け リアルタイム成績速報＆立順閲覧ページ（選手カード枠線色連動版）】
  * /results パスに対応するページコンポーネント。
  *
  * 役割:
  * 1. スマートフォン縦画面での閲覧に特化し、ステージ別表示・総合成績表示ともに横スクロール不要のカードレイアウトを採用。
- * 2. 本部進行管理（MatchControlPanel）とリアルタイム連動し、各選手のカード内に以下の進行状況バッジを表示:
- *    - 「招集中」     (第 N 組 / CALLED)       : アンバー色・パルスアニメーションバッジ
- *    - 「控え待機中」 (第 N-1, N-2 組 / IN_STAND): ブルー色バッジ
- *    - 「行射中」     (第 N-3 組 / SHOOTING)   : エメラルドグリーン色バッジ
+ * 2. 本部進行管理（MatchControlPanel）とリアルタイム連動し、各選手のカード内にバッジを表示し、カード全体の枠線色も連動して強調:
+ *    - 「招集中」     (第 N 組 / CALLED)      : アンバー色バッジ ＆ アンバー色枠線（パルス）
+ *    - 「控え待機中」 (第 N-1, N-2 組 / IN_STAND): ブルー色バッジ ＆ ブルー色枠線
+ *    - 「行射中」     (第 N-3 組 / SHOOTING)   : エメラルド色バッジ ＆ エメラルド色枠線
  * 3. StandScoreContainer.tsx と同一の組・立構造ロジックを採用:
  *    - STANDS_PER_GROUP = 2, PLAYERS_PER_STAND = 5 (1組 = 2立 = 10名)
- *    - 第1組 = 第1立・第2立、第2組 = 第3立・第4立... として全組を第1立から昇順で一覧表示。
  *
  * フールプルーフ設計（事故前・対人間）:
- * - ステージ別タブ（第1〜第3ステージ）では、現在本部が招集操作を行っているステージ（activeCallRound）と表示中タブが一致する場合に組連動ステータスを適用し、別ステージ閲覧時の誤認を防止。
- * - 既にそのステージのスコアが確定入力済みの選手、または棄権選手には進行バッジを重複表示しない制御。
+ * - ステージ別タブでは、現在本部が招集操作を行っているステージと表示中タブが一致する場合に組連動ステータスを適用し、別ステージ閲覧時の誤認を防止。
+ * - 既にそのステージのスコアが確定入力済みの選手、または棄権選手には進行バッジと連動枠線を適用しない制御。
  *
  * フェイルセーフ設計（事故後・対故障）:
  * - matches ドキュメントの購読と entries コレクションの progressStatus の双方を参照し、片方の更新遅延時でも安全に表示を維持。
@@ -95,10 +94,6 @@ interface MatchCallState {
 // 2. ドメインヘルパー関数
 // ==========================================
 
-/**
- * 組番号 (1, 2, 3...) から、その組に含まれる2つの立番号 [前半立, 後半立] を算出する
- * 例: 第1組 -> [1, 2] (第1立・第2立), 第2組 -> [3, 4] (第3立・第4立)
- */
 function getStandNumbersByGroup(groupNumber: number): [number, number] {
   const safeGroup = Math.max(1, Math.floor(groupNumber));
   const firstStand = (safeGroup - 1) * STANDS_PER_GROUP + 1;
@@ -106,9 +101,6 @@ function getStandNumbersByGroup(groupNumber: number): [number, number] {
   return [firstStand, secondStand];
 }
 
-/**
- * ステージ名称を取得する
- */
 function getStageName(round: StandRoundIndex): string {
   switch (round) {
     case 1:
@@ -122,9 +114,6 @@ function getStageName(round: StandRoundIndex): string {
   }
 }
 
-/**
- * 射位（1〜5番）のラベルを取得する
- */
 function getStandOrderLabel(order: StandOrderIndex | null | undefined): string {
   if (!order) return '未定';
   const labels: Record<number, string> = {
@@ -137,26 +126,16 @@ function getStandOrderLabel(order: StandOrderIndex | null | undefined): string {
   return labels[order] || `${order}番`;
 }
 
-/**
- * 矢の配列から的中数をカウントする
- */
 function countHits(arrows: (ArrowHit | null | undefined)[]): number {
   if (!Array.isArray(arrows)) return 0;
   return arrows.filter((hit) => hit === true).length;
 }
 
-/**
- * ステージの矢配列に1本でも確定入力（true または false）が存在するか判定する
- */
 function isStageConfirmed(arrows: (ArrowHit | null | undefined)[]): boolean {
   if (!Array.isArray(arrows) || arrows.length === 0) return false;
   return arrows.some((hit) => hit === true || hit === false);
 }
 
-/**
- * 招集中の組番号 (activeCallGroup = N) と対象組番号 (groupNumber) から
- * 「招集中 (N)」「控え待機中 (N-1, N-2)」「行射中 (N-3)」を判定する
- */
 function evaluateGroupLiveStatus(
   groupNumber: number,
   activeCallGroup: number | null,
@@ -169,9 +148,6 @@ function evaluateGroupLiveStatus(
   return null;
 }
 
-/**
- * 選手の progressStatus から表示対象の3状態（招集中・控え待機中・行射中）を抽出する
- */
 function extractParticipantLiveStatus(
   status: ProgressStatus | undefined,
 ): ActiveLiveStatus {
@@ -259,7 +235,6 @@ const StageScoreDisplay: React.FC<StageScoreDisplayProps> = ({
     },
   );
 
-  // 未確定時の進行状況テキスト・配色を連動ステータスに合わせて強調
   const unconfirmedBoxStyle =
     liveStatus === 'SHOOTING'
       ? 'bg-emerald-50 border-emerald-300 text-emerald-900'
@@ -375,7 +350,6 @@ export default function ResultsPage() {
 
   // タブ状態: 1(第1ステージ), 2(第2ステージ), 3(第3ステージ), 'OVERALL'(総合成績)
   const [selectedTab, setSelectedTab] = useState<ResultTabKey>(1);
-  // 検索キーワード
   const [searchTerm, setSearchTerm] = useState<string>('');
 
   // 本部進行・招集状態ステート
@@ -401,7 +375,7 @@ export default function ResultsPage() {
     });
   }, [isDbReady]);
 
-  // 1. Firestore `matches/match_2026_mentaiko` のリアルタイム監視（招集中・待機中・行射中の組特定用）
+  // 1. Firestore `matches` ドキュメントのリアルタイム監視
   useEffect(() => {
     if (!isDbReady) return;
 
@@ -569,7 +543,6 @@ export default function ResultsPage() {
     return () => unsubscribe();
   }, [isDbReady]);
 
-  // 表示対象の選手リスト（立順が割り当てられている、または受付済・QR送信済の選手）
   const activeParticipants = useMemo(() => {
     return participants.filter((p) => {
       const hasStand =
@@ -584,7 +557,6 @@ export default function ResultsPage() {
     });
   }, [participants]);
 
-  // 全ての組番号（第1組, 第2組...）を昇順で算出
   const groupOptions = useMemo(() => {
     let maxAssignedStand = 1;
     activeParticipants.forEach((p) => {
@@ -603,7 +575,6 @@ export default function ResultsPage() {
     return Array.from({ length: totalGroups }, (_, i) => i + 1);
   }, [activeParticipants]);
 
-  // 検索フィルタ適用後の選手一覧
   const searchedParticipants = useMemo(() => {
     if (searchTerm.trim() === '') return activeParticipants;
     const term = searchTerm.trim().toLowerCase();
@@ -616,13 +587,9 @@ export default function ResultsPage() {
     });
   }, [activeParticipants, searchTerm]);
 
-  // 現在選択されているステージ番号 (1 | 2 | 3)
   const currentRound: StandRoundIndex =
     selectedTab === 'OVERALL' ? 1 : selectedTab;
 
-  /**
-   * 特定の選手および組の現在のライブ進行ステータス ('SHOOTING' | 'IN_STAND' | 'CALLED' | null) を解決する
-   */
   const resolvePlayerLiveStatus = (
     participant: Participant,
     round: StandRoundIndex,
@@ -633,7 +600,6 @@ export default function ResultsPage() {
       participant.qualificationStatus === 'WITHDRAWN';
     if (isAbsent) return null;
 
-    // 1. matches ドキュメントの activeCallGroup が有効であり、かつ対象ステージと一致している場合は組単位の相対位置から確定
     if (
       matchCallState.activeCallGroup !== null &&
       matchCallState.activeCallRound === round
@@ -650,7 +616,6 @@ export default function ResultsPage() {
       }
     }
 
-    // 2. フォールバック：現在進行中のラウンドと一致している場合は選手個別の progressStatus を参照
     if (matchCallState.currentRound === round) {
       return extractParticipantLiveStatus(participant.progressStatus);
     }
@@ -658,7 +623,6 @@ export default function ResultsPage() {
     return null;
   };
 
-  // 総合成績タブ用のランキングデータ（全8射・同中タイ順位・特別賞対応）
   const overallRankedParticipants = useMemo(() => {
     const list = searchedParticipants.map((p) => {
       const s1Hits = countHits(p.stand1_arrows);
@@ -717,7 +681,7 @@ export default function ResultsPage() {
     });
   }, [searchedParticipants]);
 
-  // ステージ別：1選手分のカード描画関数（立ちG、立ち、射位、選手名、進行状況バッジ、所属チーム、確定成績）
+  // ステージ別：1選手分のカード描画関数
   const renderParticipantRow = (
     participant: Participant,
     groupNumber: number,
@@ -737,22 +701,21 @@ export default function ResultsPage() {
     const standOrder = participant.standAssignments[currentRound]?.standOrder;
     const confirmed = isStageConfirmed(arrows);
 
-    // 確定スコア入力前の場合、または進行中の組に該当する場合にライブ進行ステータスを取得
     const liveStatus = !confirmed
       ? resolvePlayerLiveStatus(participant, currentRound, groupNumber)
       : null;
 
-    // 進行状況に応じたカード枠線のハイライト
+    // 【フールプルーフ】進行状況に応じたカード枠線の色連動ハイライト
     const cardBorderClass = isAbsent
       ? 'bg-rose-50/30 border-rose-200 opacity-65'
       : confirmed
         ? 'bg-white border-emerald-200/90 shadow-2xs'
         : liveStatus === 'CALLED'
-          ? 'bg-amber-50/40 border-2 border-amber-400 shadow-xs'
+          ? 'bg-amber-50/40 border-2 border-amber-400 shadow-sm animate-[pulse_3s_ease-in-out_infinite]'
           : liveStatus === 'IN_STAND'
-            ? 'bg-blue-50/30 border-2 border-blue-300 shadow-2xs'
+            ? 'bg-blue-50/30 border-2 border-blue-400 shadow-xs'
             : liveStatus === 'SHOOTING'
-              ? 'bg-emerald-50/30 border-2 border-emerald-400 shadow-2xs'
+              ? 'bg-emerald-50/30 border-2 border-emerald-500 shadow-xs'
               : 'bg-white border-slate-200/90 shadow-2xs hover:border-slate-300';
 
     return (
@@ -760,9 +723,7 @@ export default function ResultsPage() {
         key={participant.id}
         className={`p-3.5 rounded-2xl border transition-all flex flex-col lg:flex-row lg:items-center justify-between gap-3 ${cardBorderClass}`}
       >
-        {/* 左側：立ちG・立ち・射位バッジ ＋ 選手名・進行状況バッジ・所属チーム・特別賞 */}
         <div className="flex items-start sm:items-center gap-3">
-          {/* 立ちG・立ち・射位ボックス */}
           <div className="min-w-[88px] px-2.5 py-1.5 rounded-xl bg-slate-100 border border-slate-200 text-slate-900 flex flex-col items-center justify-center shrink-0">
             <div className="flex items-center gap-1 text-[10px] font-mono font-bold text-slate-600">
               <span>第{groupNumber}組</span>
@@ -776,7 +737,6 @@ export default function ResultsPage() {
             </span>
           </div>
 
-          {/* 選手名・ゼッケン・進行状況バッジ・所属チーム */}
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-mono text-xs font-black text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
@@ -786,7 +746,6 @@ export default function ResultsPage() {
                 {participant.name}
               </h4>
 
-              {/* 進行状況バッジ（行射中 / 控え待機中 / 招集中） */}
               <LiveProgressBadge status={liveStatus} />
 
               {isAbsent && (
@@ -825,7 +784,6 @@ export default function ResultsPage() {
           </div>
         </div>
 
-        {/* 右側：ステージ成績（〇✕＆確定的中数） */}
         <div className="flex items-center justify-end self-end lg:self-auto pt-2 lg:pt-0 border-t lg:border-t-0 border-slate-100 w-full lg:w-auto">
           <StageScoreDisplay
             round={currentRound}
@@ -851,7 +809,6 @@ export default function ResultsPage() {
 
   return (
     <main className="min-h-screen bg-[#F8FAFC] text-slate-900 p-4 sm:p-6 lg:p-8 space-y-6 w-full">
-      {/* エラーバナー（フェイルセーフ） */}
       {errorMessage && (
         <div className="w-full p-4 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs font-bold flex items-center justify-between gap-2 shadow-2xs">
           <div className="flex items-center gap-2">
@@ -870,7 +827,6 @@ export default function ResultsPage() {
         </div>
       )}
 
-      {/* メインカードコンテナ */}
       <Card className="w-full shadow-sm border border-slate-200/80 rounded-2xl bg-white overflow-hidden">
         <CardHeader className="bg-white border-b border-slate-100 p-5 space-y-3">
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
@@ -900,7 +856,6 @@ export default function ResultsPage() {
               </CardTitle>
             </div>
 
-            {/* 選手名・チーム名検索ボックス */}
             <div className="relative w-full md:w-80">
               <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input
@@ -922,7 +877,6 @@ export default function ResultsPage() {
             </div>
           </div>
 
-          {/* 4つのメインステージタブ */}
           <div className="flex flex-wrap items-center gap-2 pt-2">
             <button
               type="button"
@@ -980,9 +934,6 @@ export default function ResultsPage() {
 
         <CardContent className="p-4 sm:p-5 space-y-6">
           {selectedTab !== 'OVERALL' ? (
-            /* ==========================================
-               第1・第2・第3ステージ：すべての組・立を第1立から昇順表示
-               ========================================== */
             <>
               {groupOptions.map((groupNumber) => {
                 const [firstStandNumber, secondStandNumber] =
@@ -1019,7 +970,6 @@ export default function ResultsPage() {
                   return null;
                 }
 
-                // 組全体の進行ステータスバッジ判定
                 const groupLiveStatus =
                   matchCallState.activeCallRound === currentRound
                     ? evaluateGroupLiveStatus(
@@ -1033,7 +983,6 @@ export default function ResultsPage() {
                     key={groupNumber}
                     className="space-y-4 border border-slate-200/90 rounded-2xl p-4 bg-white shadow-2xs"
                   >
-                    {/* 組（立ちG）ヘッダーバー */}
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 border border-slate-200/80 rounded-xl text-xs font-medium gap-2">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-bold text-slate-900 font-sans flex items-center gap-1">
@@ -1043,7 +992,6 @@ export default function ResultsPage() {
                         <span className="text-slate-950 font-mono font-black bg-amber-100 border border-amber-300 px-2.5 py-0.5 rounded">
                           立ちG: 第 {groupNumber} 組
                         </span>
-                        {/* 組ヘッダーにも進行状況バッジを表示 */}
                         <LiveProgressBadge status={groupLiveStatus} />
                       </div>
                       <span className="text-[11px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md self-start sm:self-auto">
@@ -1055,7 +1003,6 @@ export default function ResultsPage() {
                       </span>
                     </div>
 
-                    {/* 前半立（第 2N-1 立）セクション */}
                     <div className="space-y-2.5 bg-slate-50/70 p-4 rounded-2xl border border-slate-200/90">
                       <div className="flex items-center justify-between border-b border-slate-200 pb-2">
                         <span className="px-2.5 py-0.5 rounded-md bg-slate-900 text-white font-mono text-xs font-black">
@@ -1080,7 +1027,6 @@ export default function ResultsPage() {
                       )}
                     </div>
 
-                    {/* 後半立（第 2N 立）セクション */}
                     <div className="space-y-2.5 bg-slate-50/70 p-4 rounded-2xl border border-slate-200/90">
                       <div className="flex items-center justify-between border-b border-slate-200 pb-2">
                         <span className="px-2.5 py-0.5 rounded-md bg-slate-800 text-amber-400 font-mono text-xs font-black">
@@ -1109,11 +1055,7 @@ export default function ResultsPage() {
               })}
             </>
           ) : (
-            /* ==========================================
-               総合成績タブ：スマートフォン縦画面向け カードリスト表示（各選手カードにも進行状況バッジを表示）
-               ========================================== */
             <div className="space-y-3">
-              {/* 総合成績ヘッダーバー */}
               <div className="bg-slate-900 text-white px-4 py-3 rounded-2xl flex flex-wrap items-center justify-between gap-2 shadow-2xs">
                 <div className="flex items-center gap-2">
                   <Trophy className="w-4 h-4 text-amber-400 shrink-0" />
@@ -1148,7 +1090,6 @@ export default function ResultsPage() {
                           ) + 1
                         : idx + 1);
 
-                    // 総合成績タブでも現在のアクティブステージにおける進行状況バッジを取得
                     const activeStageForOverall =
                       matchCallState.activeCallRound ??
                       matchCallState.currentRound;
@@ -1157,20 +1098,25 @@ export default function ResultsPage() {
                       activeStageForOverall,
                     );
 
+                    // 【フールプルーフ】総合成績タブでも進行枠線を強調表示
+                    const overallBorderClass = isAbsent
+                      ? 'bg-rose-50/30 border-rose-200 opacity-65'
+                      : overallLiveStatus === 'CALLED'
+                        ? 'bg-amber-50/40 border-2 border-amber-400 shadow-sm animate-[pulse_3s_ease-in-out_infinite]'
+                        : overallLiveStatus === 'IN_STAND'
+                          ? 'bg-blue-50/30 border-2 border-blue-400 shadow-xs'
+                          : overallLiveStatus === 'SHOOTING'
+                            ? 'bg-emerald-50/30 border-2 border-emerald-500 shadow-xs'
+                            : item.hasAnyRecord && rank <= 3
+                              ? 'bg-amber-50/30 border-amber-300/80 shadow-2xs'
+                              : 'bg-white border-slate-200/90 shadow-2xs hover:border-slate-300';
+
                     return (
                       <div
                         key={p.id}
-                        className={`p-3.5 sm:p-4 rounded-2xl border transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
-                          isAbsent
-                            ? 'bg-rose-50/30 border-rose-200 opacity-65'
-                            : item.hasAnyRecord && rank <= 3
-                              ? 'bg-amber-50/30 border-amber-300/80 shadow-2xs'
-                              : 'bg-white border-slate-200/90 shadow-2xs hover:border-slate-300'
-                        }`}
+                        className={`p-3.5 sm:p-4 rounded-2xl border transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${overallBorderClass}`}
                       >
-                        {/* 上段（スマホ）/ 左側（PC）：順位バッジ ＋ 選手名・進行状況バッジ・所属チーム・特別賞 */}
                         <div className="flex items-start sm:items-center gap-3 min-w-0">
-                          {/* 順位ボックス */}
                           <div
                             className={`w-12 h-12 rounded-xl flex flex-col items-center justify-center shrink-0 font-mono ${
                               isAbsent
@@ -1198,7 +1144,6 @@ export default function ResultsPage() {
                             </span>
                           </div>
 
-                          {/* 選手名・ゼッケン・進行状況バッジ・所属チーム・特別賞バッジ */}
                           <div className="min-w-0 flex-1">
                             <div className="flex flex-wrap items-center gap-1.5">
                               <span className="font-mono text-xs font-black text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
@@ -1208,7 +1153,6 @@ export default function ResultsPage() {
                                 {p.name}
                               </h4>
 
-                              {/* 進行状況バッジ（行射中 / 控え待機中 / 招集中） */}
                               <LiveProgressBadge status={overallLiveStatus} />
 
                               {isAbsent && (
@@ -1242,9 +1186,7 @@ export default function ResultsPage() {
                           </div>
                         </div>
 
-                        {/* 下段（スマホ）/ 右側（PC）：第1〜第3ステージ内訳 ＋ 通算的中ボックス（1行4グリッド構成） */}
                         <div className="grid grid-cols-4 gap-1.5 sm:flex sm:items-center sm:gap-2 pt-2.5 sm:pt-0 border-t sm:border-t-0 border-slate-100 w-full sm:w-auto">
-                          {/* 第1ステージ (午前2射) */}
                           <div className="px-2 py-1.5 sm:min-w-[68px] rounded-xl bg-slate-50 border border-slate-200/80 flex flex-col items-center justify-center">
                             <span className="text-[9px] font-bold text-slate-400">
                               第1(2射)
@@ -1263,7 +1205,6 @@ export default function ResultsPage() {
                             </span>
                           </div>
 
-                          {/* 第2ステージ (午後2射) */}
                           <div className="px-2 py-1.5 sm:min-w-[68px] rounded-xl bg-slate-50 border border-slate-200/80 flex flex-col items-center justify-center">
                             <span className="text-[9px] font-bold text-slate-400">
                               第2(2射)
@@ -1282,7 +1223,6 @@ export default function ResultsPage() {
                             </span>
                           </div>
 
-                          {/* 第3ステージ (午後4射) */}
                           <div className="px-2 py-1.5 sm:min-w-[68px] rounded-xl bg-slate-50 border border-slate-200/80 flex flex-col items-center justify-center">
                             <span className="text-[9px] font-bold text-slate-400">
                               第3(4射)
@@ -1301,7 +1241,6 @@ export default function ResultsPage() {
                             </span>
                           </div>
 
-                          {/* 通算的中 (全8射) */}
                           <div
                             className={`px-2.5 py-1.5 sm:min-w-[82px] rounded-xl border flex flex-col items-center justify-center ${
                               item.hasAnyRecord
