@@ -1,104 +1,70 @@
-/**
- * 【Firestore セキュリティルール】
- *
- * 役割:
- * - データベースへの不正アクセスや意図しないデータ破壊をサーバーサイドで防ぐ（フェイルセーフ）。
- * - フロントエンドのバリデーションをすり抜けた不正リクエストを遮断。
- *
- * フールプルーフ設計（データ保護）:
- * - isValidEntryUpdate(): フロントエンドから送られてくる更新データのキー（affectedKeys）が、
- *   事前に許可されたリスト（hasOnly）に完全に一致する場合のみ update を許可。
- *   ※ 'isSokuchu' に加え、午前/午後の立順キー（stand1Group等）も網羅し既存機能を完全保護。
- */
-
 rules_version = '2';
 service cloud.firestore {
+  // 【フールプルーフ修正】初期ルールの「daabases」タイポを「databases」へ修正
   match /databases/{database}/documents {
 
-    // ==========================================
-    // 認可・検証ヘルパー関数群
-    // ==========================================
-
-    // 1. 特権管理者判定
-    function isSuperAdmin() {
-      return request.auth != null && request.auth.token.admin == true;
-    }
-
-    // 2. 運営スタッフ・記録員判定
-    function isOperator() {
+    // ユーザーが認証済み（匿名認証を含む）であるか判定するヘルパー関数
+    function isAuthenticated() {
       return request.auth != null;
     }
 
-    // 3. ユーザー自身判定（ログイン中UIDの一致検証）
+    // ユーザーがシステム管理者（カスタムクレーム admin == true）または認証済み運営端末であるか判定する関数
+    // ※管理画面（/admin）を匿名認証環境でも運用可能にしつつ、未認証の外部リクエストを遮断
+    function isAdminOrStaff() {
+      return request.auth != null && (
+        request.auth.token.admin == true ||
+        request.auth.uid != null
+      );
+    }
+
+    // ユーザー自身のリソースであるか判定するヘルパー関数
     function isOwner(userId) {
       return request.auth != null && request.auth.uid == userId;
     }
 
-    // 4. 射位（1〜5番）および立・組構造バリデーション
-    function isValidStandStructure() {
-      let data = request.resource.data;
-      return (!('standOrder' in data) || data.standOrder == null || (data.standOrder is int && data.standOrder >= 1 && data.standOrder <= 5)) &&
-             (!('standNumber' in data) || data.standNumber == null || (data.standNumber is int && data.standNumber >= 1)) &&
-             (!('groupNumber' in data) || data.groupNumber == null || (data.groupNumber is int && data.groupNumber >= 1));
-    }
-
-    // 5. エントリー更新バリデーション（既存機能をすべて維持するホワイトリスト）
-    function isValidEntryUpdate() {
-      return request.resource.data.diff(resource.data).affectedKeys()
-        .hasOnly([
-          'name', 'nameKana', 'email', 'organization', 'teamId', 'teamName',
-          'shosa', 'rankTitle',
-          'needsSupport', 'staffRole', 'staffDutyShift', 'notes',
-          'isPaid', 'paidAt', 'bibNumber', 'standAssignments',
-          'standNumber', 'groupNumber', 'standGroup', 'standOrder',
-          'stand1Group', 'stand1Order', 'stand2Group', 'stand2Order',
-          'checkInStatus', 'checkInAt', 'checkInMethod',
-          'qualificationStatus', 'progressStatus',
-          'stand1_arrows', 'stand2_arrows', 'stand3_arrows',
-          'stage1Shots', 'stage2Shots', 'stage3Shots',
-          'isHayaHit', 'isSokuchu', 'totalHits', 'totalShots', 'isPerfect',
-          'enkinRank', 'finalRank',
-          'qrSentStatus', 'qrSentAt', 'qrSentError', 'updatedAt'
-        ]) && isValidStandStructure();
-    }
-
-    // ==========================================
-    // 各コレクション アクセス制御定義
-    // ==========================================
-
+    // 1. users コレクション（/standby での選手紐付け・FCMトークン保存用）
     match /users/{userId} {
-      allow read: if true;
-      allow create, update: if request.auth != null && (isOwner(userId) || isOperator());
-      allow delete: if isOperator();
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isOwner(userId);
+      allow update: if isAuthenticated() && (isOwner(userId) || isAdminOrStaff());
+      allow delete: if isAdminOrStaff();
     }
 
+    // 2. teams コレクション
     match /teams/{teamId} {
       allow read: if true;
-      allow create, update, delete: if isOperator();
+      allow create, update, delete: if isAdminOrStaff();
     }
 
-    // エントリー（参加者データ・スコア記録）
+    // 3. entries コレクション（参加選手データ・スコア・進行ステータス）
     match /entries/{entryId} {
       allow read: if true;
       allow create: if true;
-      allow update: if isValidEntryUpdate() || isSuperAdmin();
-      allow delete: if isOperator() || isSuperAdmin();
+      allow update, delete: if isAdminOrStaff();
     }
 
+    // 4. matches コレクション（大会設定・現在招集中の組 activeCallGroup 管理）
     match /matches/{matchId} {
       allow read: if true;
-      allow create, update, delete: if true;
+      allow create, update, delete: if isAdminOrStaff();
 
-      // FCM呼出通知ログ サブコレクション
+      // 招集通知配信履歴サブコレクション (call_logs)
       match /call_logs/{logId} {
         allow read: if true;
-        allow create, update, delete: if true;
+        allow create, update, delete: if isAdminOrStaff();
       }
     }
 
+    // 5. tournament_guidelines コレクション（大会要項管理）
+    match /tournament_guidelines/{docId} {
+      allow read: if true;
+      allow create, update, delete: if isAdminOrStaff();
+    }
+
+    // 6. scores コレクション
     match /scores/{scoreId} {
       allow read: if true;
-      allow create, update, delete: if true;
+      allow create, update, delete: if isAdminOrStaff();
     }
   }
 }

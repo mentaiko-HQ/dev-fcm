@@ -1,7 +1,17 @@
 /**
- * 【トップページ / 選手用ポータル】
+ * 【トップページ / 選手・応援ポータル（/standby 招集通知設定一本化導線 ＆ /results 成績速報導線統合版）】
  * / パスに対応するページコンポーネント。
  * 組番号・立順の未設定（null）データに対応。
+ *
+ * 【既存機能の完全維持】
+ * - 大会タイトル・開催ステータスヘッダー、本部運営管理（/admin）への遷移ボタン
+ * - 新規参加エントリー（/entry）カード、参加者一覧・入金確認（/admin/participants）カード
+ * - エントリー済み選手一覧テーブル（ゼッケン・氏名・所属・所作/段位・入金状態）
+ *
+ * 【新規追加導線（/standby 一本化）】
+ * - 参加選手が自身のスマートフォンでFCM招集プッシュ通知を設定・確認するための大型案内カード（/standby へ遷移）を最上段に配置。
+ * - 既に /standby で選手登録済みの端末では、localStorage ('kyudo_selected_entry_id_v5') を読み取り、登録中の選手名をトップページ上にもバッジ表示。
+ * - リアルタイム成績速報・立順確認（/results へ遷移）の案内カードを併設。
  *
  * 【フールプルーフ】
  * - TournamentConfig の必須プロパティ（date, venue）を完全網羅し型エラーを防止。
@@ -14,7 +24,7 @@
 
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   collection,
@@ -38,7 +48,19 @@ import {
   sanitizeStandGroup,
 } from '@/types';
 import { Button } from '@/components/ui/button';
-import { ShieldAlert, Users, Calendar, ArrowRight, Award } from 'lucide-react';
+import {
+  ShieldAlert,
+  Users,
+  Calendar,
+  ArrowRight,
+  Award,
+  BellRing,
+  Target,
+  CheckCircle2,
+  Smartphone,
+} from 'lucide-react';
+
+const STORAGE_KEY_ENTRY_ID = 'kyudo_selected_entry_id_v5';
 
 const DEFAULT_TOURNAMENT_CONFIG: TournamentConfig = {
   matchId: 'match_2026_mentaiko',
@@ -120,6 +142,16 @@ export default function PortalHomePage() {
     DEFAULT_TOURNAMENT_CONFIG,
   );
   const [participants, setParticipants] = useState<Participant[]>([]);
+  const [savedEntryId, setSavedEntryId] = useState<string | null>(null);
+
+  // 端末に保存済みの選手ID（/standby で設定したID）を読み込み
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const stored = window.localStorage.getItem(STORAGE_KEY_ENTRY_ID);
+    if (stored && stored.trim() !== '') {
+      setSavedEntryId(stored.trim());
+    }
+  }, []);
 
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
@@ -288,9 +320,16 @@ export default function PortalHomePage() {
     return () => unsubscribe();
   }, [tournamentConfig.matchId]);
 
+  // この端末で既に /standby にて選択・登録されている選手情報
+  const registeredPlayer = useMemo(() => {
+    if (!savedEntryId) return null;
+    return participants.find((p) => p.id === savedEntryId) || null;
+  }, [participants, savedEntryId]);
+
   return (
     <main className="min-h-screen bg-[#F8FAFC] text-slate-900 p-4 md:p-8 flex flex-col items-center justify-start">
       <div className="w-full max-w-4xl space-y-6">
+        {/* 1. 大会タイトル・本部運営管理ヘッダー */}
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between bg-white border border-slate-200/80 rounded-2xl p-6 shadow-sm gap-4">
           <div className="space-y-1">
             <div className="flex items-center gap-2">
@@ -319,6 +358,65 @@ export default function PortalHomePage() {
           </Button>
         </div>
 
+        {/* ==========================================
+            2. 【最優先導線】招集通知の設定・待機状況確認（/standby へ一本化）＆ 成績速報（/results）
+            ========================================== */}
+        <div className="bg-amber-50/90 border-2 border-amber-400 rounded-2xl p-5 sm:p-6 shadow-sm space-y-4">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div className="space-y-1.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="inline-flex items-center gap-1 text-[11px] font-black bg-slate-900 text-amber-400 px-2.5 py-0.5 rounded-full">
+                  <BellRing className="w-3 h-3" />
+                  参加選手 必須設定
+                </span>
+                {registeredPlayer ? (
+                  <span className="inline-flex items-center gap-1 text-[11px] font-black bg-emerald-100 text-emerald-900 border border-emerald-300 px-2.5 py-0.5 rounded-full">
+                    <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                    現在 No.{registeredPlayer.bibNumber} {registeredPlayer.name}{' '}
+                    選手で設定中
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 text-[11px] font-bold bg-white text-amber-900 border border-amber-300 px-2.5 py-0.5 rounded-full">
+                    <Smartphone className="w-3 h-3 text-amber-600" />
+                    スマホへの招集プッシュ通知対応
+                  </span>
+                )}
+              </div>
+
+              <h2 className="text-lg sm:text-xl font-black text-slate-950">
+                招集通知の設定・リアルタイム待機状況確認
+              </h2>
+              <p className="text-xs text-slate-700 font-medium leading-relaxed">
+                あなたの選手名を選択しておくと、運営本部があなたの組の「招集ボタン」を押した際にお手元のスマートフォンへプッシュ通知が届きます。現在の「行射中」「控え待機中」「招集中」の組もリアルタイムで確認できます。
+              </p>
+            </div>
+
+            <div className="flex flex-col sm:flex-row md:flex-col gap-2.5 shrink-0">
+              <Button
+                type="button"
+                onClick={() => router.push('/standby')}
+                className="w-full md:w-64 h-12 bg-amber-500 hover:bg-amber-600 text-slate-950 font-black text-xs sm:text-sm px-5 rounded-xl shadow-xs flex items-center justify-center gap-2"
+              >
+                <BellRing className="w-4 h-4 shrink-0" />
+                <span>招集通知の設定・待機確認はこちら</span>
+                <ArrowRight className="w-4 h-4 shrink-0" />
+              </Button>
+
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => router.push('/results')}
+                className="w-full md:w-64 h-10 bg-white hover:bg-slate-50 border-slate-300 text-slate-900 font-bold text-xs px-4 rounded-xl flex items-center justify-center gap-1.5"
+              >
+                <Target className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                <span>立順・リアルタイム成績速報を見る</span>
+                <ArrowRight className="w-3.5 h-3.5 shrink-0" />
+              </Button>
+            </div>
+          </div>
+        </div>
+
+        {/* 3. 新規参加エントリー ＆ 参加者一覧・入金確認（既存カード完全維持） */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="bg-white border border-slate-200/80 rounded-2xl p-6 space-y-3 shadow-sm hover:shadow-md transition-shadow">
             <div className="w-10 h-10 rounded-xl bg-slate-100 text-slate-900 flex items-center justify-center font-bold">
@@ -361,6 +459,7 @@ export default function PortalHomePage() {
           </div>
         </div>
 
+        {/* 4. エントリー済み選手一覧テーブル（既存テーブル完全維持） */}
         <div className="bg-white border border-slate-200/80 rounded-2xl p-6 space-y-4 shadow-sm">
           <div className="flex items-center justify-between border-b border-slate-100 pb-3">
             <h3 className="font-bold text-slate-900 text-sm flex items-center gap-2">
