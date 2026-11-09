@@ -1,14 +1,15 @@
 /**
- * 【選手用スマートフォン向け リアルタイム招集中ステータスバナー】
+ * 【選手用スマートフォン向け リアルタイム招集中ステータスバナー（招集解除時の進行表記完全消去版）】
  *
  * 役割:
  * - Firestore の `matches/{matchId}` ドキュメント (`activeCallRound`, `activeCallGroup`) を `onSnapshot` で常時監視。
  * - 本部（MatchControlPanel）でいずれかの組の「招集ボタン」が押されている間、
- *   選手のスマートフォン画面上に「現在 第N組（第2N-1立・第2N立）招集中」の警告バナーと対象選手名を即座に表示。
- * - 本部が「招集解除」を押すと自動的に待機表示へ切り替わる。
+ *   「行射中（3組前）」「控え待機中（1・2組前）」「招集中（押下組）」および招集対象選手名を即座に表示。
+ * - 本部が「招集解除」を押して activeCallGroup が null になった瞬間、
+ *   行射中・控え待機中・招集中の表記をすべて削除し、控えめな待機ステータスバーへ切り替える。
  *
  * フールプルーフ設計（事故前・対人間）:
- * - 組番号だけでなく「第〇立・第〇立」および該当する選手のゼッケン・氏名を一覧表示し、自分の出番かどうかを誤認させない。
+ * - activeCallGroup が null（招集解除状態）のときは、過去の進行状態を一切表示せず誤認を防止。
  *
  * フェイルセーフ設計（事故後・対故障）:
  * - Webプッシュ通知（FCM）がOS設定等でブロックされている端末でも、画面を開いていればこのバナーで確実に招集を認知可能。
@@ -32,7 +33,13 @@ import {
   sanitizeStandGroup,
   sanitizeStandOrder,
 } from '@/types';
-import { BellRing, CheckCircle2, Users } from 'lucide-react';
+import {
+  BellRing,
+  CheckCircle2,
+  Users,
+  Target,
+  ShieldAlert,
+} from 'lucide-react';
 
 interface LiveCallStatusBannerProps {
   matchId?: string;
@@ -106,7 +113,10 @@ export function LiveCallStatusBanner({
     const unsubscribe = onSnapshot(
       matchRef,
       (snap) => {
-        if (!snap.exists()) return;
+        if (!snap.exists()) {
+          setCallState({ activeCallRound: null, activeCallGroup: null });
+          return;
+        }
         const data = snap.data();
         const rawGroup = data.activeCallGroup;
         const safeGroup =
@@ -222,7 +232,7 @@ export function LiveCallStatusBanner({
       });
   }, [callState, players]);
 
-  // 招集中の組がない場合は控えめな待機ステータスバーを表示
+  // 【重要】招集解除時（activeCallGroup が null のとき）は、行射中・控え待機中・招集中の表記を一切出さず待機バーのみを表示
   if (!callState.activeCallGroup || !callState.activeCallRound) {
     return (
       <div className="w-full bg-white border border-slate-200/80 rounded-2xl px-4 py-3 shadow-2xs flex items-center justify-between gap-2">
@@ -239,9 +249,14 @@ export function LiveCallStatusBanner({
     );
   }
 
-  const [firstStand, secondStand] = getStandNumbersByGroup(
-    callState.activeCallGroup,
-  );
+  const g = callState.activeCallGroup;
+  const [firstStand, secondStand] = getStandNumbersByGroup(g);
+
+  // 招集中に連動する「控え待機中（1・2組前）」「行射中（3組前）」の組番号
+  const standbyGroups: number[] = [];
+  if (g - 2 >= 1) standbyGroups.push(g - 2);
+  if (g - 1 >= 1) standbyGroups.push(g - 1);
+  const shootingGroup = g - 3 >= 1 ? g - 3 : null;
 
   return (
     <div className="w-full bg-amber-50 border-2 border-amber-500 rounded-2xl p-4 shadow-md space-y-3 animate-in fade-in">
@@ -260,10 +275,42 @@ export function LiveCallStatusBanner({
               </span>
             </div>
             <h2 className="text-base sm:text-lg font-black text-slate-950 mt-0.5">
-              第 {callState.activeCallGroup} 組（第{firstStand}立・第
-              {secondStand}立）の選手は招集所へお集まりください
+              第 {g} 組（第{firstStand}立・第{secondStand}
+              立）の選手は招集所へお集まりください
             </h2>
           </div>
+        </div>
+      </div>
+
+      {/* 連動ステータスミニサマリ（招集中のみ表示され、招集解除時はバナーごと消去される） */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        <div className="bg-emerald-50/90 border border-emerald-300 rounded-xl px-3 py-2 flex items-center justify-between">
+          <span className="text-[11px] font-black text-emerald-900 flex items-center gap-1">
+            <Target className="w-3.5 h-3.5 text-emerald-600" /> 行射中
+          </span>
+          <span className="font-mono text-xs font-black text-emerald-950">
+            {shootingGroup ? `第 ${shootingGroup} 組` : '該当なし'}
+          </span>
+        </div>
+
+        <div className="bg-blue-50/90 border border-blue-300 rounded-xl px-3 py-2 flex items-center justify-between">
+          <span className="text-[11px] font-black text-blue-900 flex items-center gap-1">
+            <ShieldAlert className="w-3.5 h-3.5 text-blue-600" /> 控え待機中
+          </span>
+          <span className="font-mono text-xs font-black text-blue-950">
+            {standbyGroups.length > 0
+              ? standbyGroups.map((sg) => `第 ${sg} 組`).join('・')
+              : '該当なし'}
+          </span>
+        </div>
+
+        <div className="bg-amber-100/90 border border-amber-400 rounded-xl px-3 py-2 flex items-center justify-between">
+          <span className="text-[11px] font-black text-amber-950 flex items-center gap-1">
+            <BellRing className="w-3.5 h-3.5 text-amber-700" /> 招集中
+          </span>
+          <span className="font-mono text-xs font-black text-slate-950">
+            第 {g} 組
+          </span>
         </div>
       </div>
 

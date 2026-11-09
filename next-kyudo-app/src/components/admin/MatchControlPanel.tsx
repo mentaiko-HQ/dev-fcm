@@ -9,7 +9,8 @@
  *    - 1つ前・2つ前の組 (N-1, N-2 組) : 「控え待機中」 (progressStatus = 'IN_STAND')
  *    - 3つ前の組 (第 N-3 組)          : 「行射中」     (progressStatus = 'SHOOTING')
  *    - 4つ前以前の組 (第 N-4 組以下)  : 「行射終了」   (progressStatus = 'FINISHED')
- * 4. 既存の matches ドキュメント更新仕様（currentStandGroup = targetGroupNumber）および call_logs 履歴表示を完全維持。
+ * 4. 「招集解除」ボタンを押下した際は、matches の activeCallGroup / shootingStandGroup / standbyStandGroups をすべてクリアし、
+ *    entries 内の 'CALLED' / 'IN_STAND' / 'SHOOTING' ステータスを一括リセットすることで、/standby や /results 上の進行表記を完全に消去する。
  *
  * フールプルーフ設計（事故前・対人間）:
  * - いずれか1つの組が「招集中」の間は、他のすべての組の招集ボタンを非活性化（disabled）し、二重招集・誤タップを完全遮断。
@@ -44,6 +45,7 @@ import {
   Participant,
   ProgressStatus,
   CallNotificationLog,
+  ArrowHit,
   sanitizeStandGroup,
   sanitizeStandOrder,
   sanitizeProgressStatus,
@@ -149,12 +151,29 @@ function getStageLabel(round: StandRoundIndex): string {
 }
 
 /**
+ * 指定ステージの矢配列に1本でも確定入力（true または false）が存在するか判定する
+ */
+function hasConfirmedStageScore(
+  p: Participant,
+  round: StandRoundIndex,
+): boolean {
+  const arrows: (ArrowHit | null | undefined)[] =
+    round === 1
+      ? p.stand1_arrows
+      : round === 2
+        ? p.stand2_arrows
+        : p.stand3_arrows;
+  if (!Array.isArray(arrows) || arrows.length === 0) return false;
+  return arrows.some((hit) => hit === true || hit === false);
+}
+
+/**
  * 現在招集中の組番号 (calledGroup) を基準として、対象組 (groupNumber) の状態を算出する純粋関数
- * - groupNumber === calledGroup                 -> 'CALLED'   (現在招集中)
+ * - groupNumber === calledGroup                -> 'CALLED'   (現在招集中)
  * - groupNumber === calledGroup - 1 または - 2  -> 'STANDBY'  (控え待機中)
- * - groupNumber === calledGroup - 3             -> 'SHOOTING' (行射中)
- * - groupNumber <= calledGroup - 4              -> 'FINISHED' (行射終了)
- * - groupNumber > calledGroup                   -> 'WAITING'  (未招集)
+ * - groupNumber === calledGroup - 3            -> 'SHOOTING' (行射中)
+ * - groupNumber <= calledGroup - 4             -> 'FINISHED' (行射終了)
+ * - groupNumber > calledGroup                  -> 'WAITING'  (未招集)
  */
 function evaluateGroupRoleByActiveCall(
   groupNumber: number,
@@ -541,7 +560,6 @@ export function MatchControlPanel({
       return;
     }
 
-    // フールプルーフ: 他のステージで招集中の組がある場合は警告を表示して確認
     if (isAnyGroupCurrentlyCalled && matchState.activeCallRound !== newRound) {
       const proceed = window.confirm(
         `現在「${getStageLabel(matchState.activeCallRound!)} 第${matchState.activeCallGroup}組」が招集中です。\n表示ステージを「${getStageLabel(newRound)}」へ切り替えますか？（招集中の状態を解除してから別ステージを招集することを推奨します）`,
@@ -572,12 +590,7 @@ export function MatchControlPanel({
   };
 
   /**
-   * 【重要】指定した組の「招集ボタン」押下ハンドラー（単一排他ロック＋連鎖ステータス更新＋FCMプッシュ通知発報）
-   * - 押下した組 (第 N 組)          -> 'CALLED'   (現在招集中)
-   * - 1つ前・2つ前の組 (N-1, N-2組) -> 'IN_STAND' (控え待機中)
-   * - 3つ前の組 (第 N-3 組)         -> 'SHOOTING' (行射中)
-   * - 4つ前以前の組 (第 N-4 組以下) -> 'FINISHED' (行射終了)
-   * - N+1 組以降                    -> 'WAITING'  (未招集)
+   * 指定した組の「招集ボタン」押下ハンドラー（単一排他ロック＋連鎖ステータス更新＋FCMプッシュ通知発報）
    */
   const handleCallGroup = async (
     targetGroupNumber: number,
@@ -586,7 +599,6 @@ export function MatchControlPanel({
   ) => {
     if (!isDbReady || isProcessing) return;
 
-    // フールプルーフ：既に別の組が招集中の場合は入口で遮断
     if (isAnyGroupCurrentlyCalled) {
       setErrorMessage(
         `現在「${getStageLabel(matchState.activeCallRound!)} 第${matchState.activeCallGroup}組」が招集中です。同時に複数の組を招集することはできません。先に現在の招集を解除してください。`,
@@ -596,7 +608,6 @@ export function MatchControlPanel({
 
     const [firstStand, secondStand] = getStandNumbersByGroup(targetGroupNumber);
 
-    // 連動する1つ前・2つ前（控え待機中）、3つ前（行射中）の組番号を算出
     const standbyGroups: number[] = [];
     if (targetGroupNumber - 2 >= 1) standbyGroups.push(targetGroupNumber - 2);
     if (targetGroupNumber - 1 >= 1) standbyGroups.push(targetGroupNumber - 1);
@@ -633,8 +644,6 @@ export function MatchControlPanel({
     try {
       const batch = writeBatch(db);
 
-      // 1. matches ドキュメントに「現在招集中の組（activeCallGroup / activeCallRound）」を記録
-      // ※既存互換性のため currentStandGroup には従来通り targetGroupNumber を書き込み、shootingStandGroup に3組前を併記
       const matchDocRef = doc(db, 'matches', matchId);
       batch.update(matchDocRef, {
         currentRound: matchState.currentRound,
@@ -648,7 +657,6 @@ export function MatchControlPanel({
         updatedAt: serverTimestamp(),
       });
 
-      // 2. 現ステージの全組の選手に対し、相対位置に応じた progressStatus（CALLED / IN_STAND / SHOOTING / FINISHED / WAITING）を一括反映
       participants.forEach((p) => {
         if (
           p.checkInStatus === 'ABSENT' ||
@@ -678,7 +686,6 @@ export function MatchControlPanel({
 
       await batch.commit();
 
-      // 3. call_logs サブコレクションに招集リクエストを記録（既存フィールド完全互換）
       const logsCollectionRef = collection(db, 'matches', matchId, 'call_logs');
       await addDoc(logsCollectionRef, {
         matchId,
@@ -715,19 +722,21 @@ export function MatchControlPanel({
   };
 
   /**
-   * 現在招集中の組の「招集解除（完了）」ハンドラー
-   * ロックを解放し、他の組の招集ボタンを押せる状態に戻す（既存の引数シグネチャ完全互換）
+   * 【重要修正】現在招集中の組の「招集解除（完了）」ハンドラー
+   * 招集を解除した際、/standby および /results ページから「行射中」「控え待機中」「招集中」の表記を完全に消去するため、
+   * matches ドキュメントの連動フィールドをすべて null / 空配列にクリアし、
+   * entries 内の CALLED / IN_STAND / SHOOTING ステータスを一括で WAITING（スコア確定済なら FINISHED）へリセットする。
    */
   const handleReleaseCallGroup = async (
     targetGroupNumber: number,
-    groupPlayers: Participant[],
+    _groupPlayers: Participant[],
   ) => {
     if (!isDbReady || isProcessing) return;
 
     const [firstStand, secondStand] = getStandNumbersByGroup(targetGroupNumber);
 
     const confirmed = window.confirm(
-      `現在招集中の「第 ${targetGroupNumber} 組（第${firstStand}立・第${secondStand}立）」の招集状態を解除（完了）しますか？\n※解除すると、次の組の招集ボタンが押せるようになります。`,
+      `現在招集中の「第 ${targetGroupNumber} 組（第${firstStand}立・第${secondStand}立）」の招集状態を解除しますか？\n※解除すると、各ページの「行射中」「控え待機中」「招集中」の表記がすべてクリアされ、次の組の招集ボタンが押せるようになります。`,
     );
     if (!confirmed) return;
 
@@ -736,27 +745,42 @@ export function MatchControlPanel({
     setStatusMessage('');
 
     try {
+      const batch = writeBatch(db);
+      const targetRound = matchState.activeCallRound ?? matchState.currentRound;
+
+      // 1. matches ドキュメントの招集中・行射中・控え待機中フィールドをすべてクリア
       const matchDocRef = doc(db, 'matches', matchId);
-      await updateDoc(matchDocRef, {
+      batch.update(matchDocRef, {
         activeCallRound: null,
         activeCallGroup: null,
+        shootingStandGroup: null,
+        standbyStandGroups: [],
         updatedAt: serverTimestamp(),
       });
 
-      // 招集完了した選手のステータスを IN_STAND（控え待機中）へ進める
-      if (groupPlayers.length > 0) {
-        await Promise.all(
-          groupPlayers.map((p) =>
-            updateDoc(doc(db, 'entries', p.id), {
-              progressStatus: 'IN_STAND',
-              updatedAt: serverTimestamp(),
-            }),
-          ),
-        );
-      }
+      // 2. entries コレクション内で CALLED / IN_STAND / SHOOTING になっている全選手を WAITING（またはスコア確定済みなら FINISHED）へ一括リセット
+      participants.forEach((p) => {
+        if (
+          p.progressStatus === 'CALLED' ||
+          p.progressStatus === 'IN_STAND' ||
+          p.progressStatus === 'SHOOTING'
+        ) {
+          const isConfirmed = hasConfirmedStageScore(p, targetRound);
+          const resetStatus: ProgressStatus = isConfirmed
+            ? 'FINISHED'
+            : 'WAITING';
+
+          batch.update(doc(db, 'entries', p.id), {
+            progressStatus: resetStatus,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      });
+
+      await batch.commit();
 
       setStatusMessage(
-        `第 ${targetGroupNumber} 組の招集ロックを解除しました。次の組を招集できます。`,
+        `第 ${targetGroupNumber} 組の招集を解除し、「行射中・控え待機中・招集中」の表記をすべてクリアしました。`,
       );
       setTimeout(() => setStatusMessage(''), 4000);
     } catch (err) {
@@ -1099,7 +1123,6 @@ export function MatchControlPanel({
             const [firstStand, secondStand] =
               getStandNumbersByGroup(groupNumber);
 
-            // この組（前半立 firstStand または 後半立 secondStand）に属する有効な出場選手を抽出
             const groupPlayers = participants
               .filter((p) => {
                 const st =
@@ -1123,7 +1146,6 @@ export function MatchControlPanel({
                 return ordA - ordB;
               });
 
-            // 対象選手または所属チームに紐づくFCMトークンを重複なしで収集
             const tokenSet = new Set<string>();
             groupPlayers.forEach((p) => {
               if (userTokensMap[p.id]) {
@@ -1135,7 +1157,6 @@ export function MatchControlPanel({
             });
             const groupTokens = Array.from(tokenSet);
 
-            // 押下された招集中組との相対位置からロールを判定
             const isSameRoundAsActive =
               matchState.activeCallRound === matchState.currentRound;
             const groupRole = evaluateGroupRoleByActiveCall(
@@ -1149,11 +1170,9 @@ export function MatchControlPanel({
             const isThisGroupShooting = groupRole === 'SHOOTING';
             const isThisGroupFinished = groupRole === 'FINISHED';
 
-            // 他の組が招集中であるため、この組の招集ボタンをロックすべきか判定
             const isLockedByOtherGroup =
               isAnyGroupCurrentlyCalled && !isThisGroupCalled;
 
-            // 過去にこのステージ・この組を招集した履歴があるか判定（既存機能を保持）
             const hasBeenCalledInLogs = callLogs.some(
               (log) =>
                 log.round === matchState.currentRound &&
@@ -1198,7 +1217,7 @@ export function MatchControlPanel({
                       第 {firstStand} 立 ・ 第 {secondStand} 立
                     </span>
 
-                    {/* 状態バッジ（現在招集中 / 控え待機中 / 行射中 / 行射終了 / 招集履歴あり / 未招集） */}
+                    {/* 状態バッジ（招集解除時はすべて非表示となり、履歴または未招集に戻る） */}
                     {isThisGroupCalled ? (
                       <span className="inline-flex items-center gap-1.5 text-xs font-black bg-amber-400 text-slate-950 px-3 py-0.5 rounded-full animate-pulse shadow-2xs">
                         <BellRing className="w-3.5 h-3.5" />

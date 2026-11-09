@@ -1,5 +1,5 @@
 /**
- * 【選手用 招集通知登録・待機状況リアルタイム確認ページ】
+ * 【選手用 招集通知登録・待機状況リアルタイム確認ページ（招集解除時の進行表記完全消去対応版）】
  * /standby パスに対応するページコンポーネント。
  *
  * 主要機能要件1 ＆ 要件3 の完全実装:
@@ -11,11 +11,14 @@
  *    バックグラウンドで FCM トークン文字列のみを自動上書き更新。
  * 4. 本部の「招集ボタン」押下と連動し、選択した選手が現在「招集中」「控え待機中」「行射中」「未招集」の
  *    どれに該当するかを専用ステータスカードと全体バナーでリアルタイム表示。
+ * 5. 本部で「招集解除」が実行された際（activeCallGroup === null）は、
+ *    「行射中」「控え待機中」「招集中」の表記と色枠線を即座に消去し、待機表示へ戻す。
  *
  * フールプルーフ設計（事故前・対人間）:
  * - 選手登録完了後は選択フォームをロックし、ポケット内での誤タップによる選手変更事故を防止。
  * - 「選手を変更する」押下時は確認ダイアログ（window.confirm）を表示し、意図しない紐付けリセットを遮断。
  * - ensureAnonymousAuth の戻り値が string (UID直接返却) でも オブジェクト ({ uid: string }) でも安全に解決する型ガードを実装。
+ * - activeCallGroup が null（招集解除中）のときは、古い progressStatus による進行表記の残留を防止。
  *
  * フェイルセーフ設計（事故後・対故障）:
  * - iOSのブラウザ制限や通知拒否設定により FCM トークンが取得できない端末でも、選手登録自体は正常に完了させ、
@@ -215,6 +218,11 @@ export default function StandbyPage() {
             : safeActiveGroup !== null
               ? safeCurrentRound
               : null;
+
+        // 招集解除された場合はフォアグラウンド通知アラートもクリア
+        if (safeActiveGroup === null) {
+          setForegroundAlert(null);
+        }
 
         setMatchProgress({
           currentRound: safeCurrentRound,
@@ -556,7 +564,10 @@ export default function StandbyPage() {
   };
 
   /**
-   * 登録されている選手が、現在のステージにおいてどの状態（招集中 / 控え待機中 / 行射中 / 行射終了 / 未招集）にあるかを判定
+   * 【招集解除時の進行表記完全消去ロジック】
+   * 登録されている選手が、現在のステージにおいてどの状態にあるかを判定。
+   * 本部で「招集解除」が押され activeCallGroup === null になった場合は、
+   * entries 側の古い progressStatus を参照せず、CALLED / STANDBY / SHOOTING の表記を即座に消去する。
    */
   const myLiveStatusInfo = useMemo(() => {
     if (!registeredPlayer) return null;
@@ -581,8 +592,10 @@ export default function StandbyPage() {
     let role: 'CALLED' | 'STANDBY' | 'SHOOTING' | 'FINISHED' | 'WAITING' =
       'WAITING';
 
+    // 招集ボタンが有効（activeCallGroup !== null）な場合のみ、招集中・控え待機中・行射中を判定
     if (
       matchProgress.activeCallGroup !== null &&
+      matchProgress.activeCallGroup > 0 &&
       myGroup !== null &&
       matchProgress.activeCallRound === activeRound
     ) {
@@ -592,17 +605,14 @@ export default function StandbyPage() {
       else if (diff === 3) role = 'SHOOTING';
       else if (diff >= 4) role = 'FINISHED';
       else role = 'WAITING';
-    } else if (registeredPlayer.progressStatus === 'CALLED') {
-      role = 'CALLED';
-    } else if (registeredPlayer.progressStatus === 'IN_STAND') {
-      role = 'STANDBY';
-    } else if (registeredPlayer.progressStatus === 'SHOOTING') {
-      role = 'SHOOTING';
     } else if (
       registeredPlayer.progressStatus === 'FINISHED' ||
       registeredPlayer.progressStatus === 'COMPLETED'
     ) {
       role = 'FINISHED';
+    } else {
+      // 招集解除時（activeCallGroup === null）は必ず WAITING に戻し、行射中・控え待機中・招集中の表記を消去
+      role = 'WAITING';
     }
 
     return {
@@ -766,7 +776,7 @@ export default function StandbyPage() {
                 </p>
               </div>
 
-              {/* 現在のあなたの進行状態ビッグバッジ */}
+              {/* 現在のあなたの進行状態ビッグバッジ（招集解除時は CALLED / STANDBY / SHOOTING が消去される） */}
               <div className="shrink-0">
                 {myLiveStatusInfo.role === 'CALLED' && (
                   <span className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-amber-400 text-slate-950 font-black text-xs sm:text-sm animate-pulse shadow-xs">

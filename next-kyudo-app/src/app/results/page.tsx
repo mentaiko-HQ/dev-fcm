@@ -1,5 +1,5 @@
 /**
- * 【参加者・観客向け リアルタイム成績速報＆立順閲覧ページ（選手カード枠線色連動版）】
+ * 【参加者・観客向け リアルタイム成績速報＆立順閲覧ページ（選手カード枠線色連動 ＋ 招集解除時表記完全消去版）】
  * /results パスに対応するページコンポーネント。
  *
  * 役割:
@@ -8,7 +8,8 @@
  *    - 「招集中」     (第 N 組 / CALLED)      : アンバー色バッジ ＆ アンバー色枠線（パルス）
  *    - 「控え待機中」 (第 N-1, N-2 組 / IN_STAND): ブルー色バッジ ＆ ブルー色枠線
  *    - 「行射中」     (第 N-3 組 / SHOOTING)   : エメラルド色バッジ ＆ エメラルド色枠線
- * 3. StandScoreContainer.tsx と同一の組・立構造ロジックを採用:
+ * 3. 本部で招集ボタンが解除された際（activeCallGroup === null）は、上記の進行状況バッジと色枠線を即座に消去し「行射前」の初期表示へ戻す。
+ * 4. StandScoreContainer.tsx と同一の組・立構造ロジックを採用:
  *    - STANDS_PER_GROUP = 2, PLAYERS_PER_STAND = 5 (1組 = 2立 = 10名)
  *
  * フールプルーフ設計（事故前・対人間）:
@@ -16,8 +17,7 @@
  * - 既にそのステージのスコアが確定入力済みの選手、または棄権選手には進行バッジと連動枠線を適用しない制御。
  *
  * フェイルセーフ設計（事故後・対故障）:
- * - matches ドキュメントの購読と entries コレクションの progressStatus の双方を参照し、片方の更新遅延時でも安全に表示を維持。
- * - Firebase未初期化や通信切断時にクラッシュせず、エラーログ出力と再読み込みボタンを提供。
+ * - matches ドキュメントの購読と entries コレクションの双方を安全に参照し、Firebase未初期化や通信切断時にクラッシュせず、エラーログ出力と再読み込みボタンを提供。
  */
 
 'use client';
@@ -41,7 +41,6 @@ import {
   Participant,
   CheckInStatus,
   QualificationStatus,
-  ProgressStatus,
   StandRoundIndex,
   StandOrderIndex,
   ArrowHit,
@@ -136,6 +135,11 @@ function isStageConfirmed(arrows: (ArrowHit | null | undefined)[]): boolean {
   return arrows.some((hit) => hit === true || hit === false);
 }
 
+/**
+ * 招集中の組番号 (activeCallGroup = N) と対象組番号 (groupNumber) から
+ * 「招集中 (N)」「控え待機中 (N-1, N-2)」「行射中 (N-3)」を判定する。
+ * 招集解除時（activeCallGroup === null）は必ず null を返す。
+ */
 function evaluateGroupLiveStatus(
   groupNumber: number,
   activeCallGroup: number | null,
@@ -145,15 +149,6 @@ function evaluateGroupLiveStatus(
   if (diff === 0) return 'CALLED';
   if (diff === 1 || diff === 2) return 'IN_STAND';
   if (diff === 3) return 'SHOOTING';
-  return null;
-}
-
-function extractParticipantLiveStatus(
-  status: ProgressStatus | undefined,
-): ActiveLiveStatus {
-  if (status === 'CALLED') return 'CALLED';
-  if (status === 'IN_STAND') return 'IN_STAND';
-  if (status === 'SHOOTING') return 'SHOOTING';
   return null;
 }
 
@@ -590,6 +585,12 @@ export default function ResultsPage() {
   const currentRound: StandRoundIndex =
     selectedTab === 'OVERALL' ? 1 : selectedTab;
 
+  /**
+   * 【招集解除時の進行表記完全消去ロジック】
+   * 招集ボタンが解除された際（activeCallGroup === null）は、
+   * entries 側の古い progressStatus を参照せず即座に null を返し、
+   * 「行射中」「控え待機中」「招集中」のバッジと枠線色をすべて消去する。
+   */
   const resolvePlayerLiveStatus = (
     participant: Participant,
     round: StandRoundIndex,
@@ -601,26 +602,24 @@ export default function ResultsPage() {
     if (isAbsent) return null;
 
     if (
-      matchCallState.activeCallGroup !== null &&
-      matchCallState.activeCallRound === round
+      matchCallState.activeCallGroup === null ||
+      matchCallState.activeCallGroup <= 0 ||
+      matchCallState.activeCallRound !== round
     ) {
-      const assignedStand = participant.standAssignments[round]?.standGroup;
-      const effectiveGroup =
-        groupNumber ??
-        (assignedStand ? Math.ceil(assignedStand / STANDS_PER_GROUP) : null);
-      if (effectiveGroup) {
-        return evaluateGroupLiveStatus(
-          effectiveGroup,
-          matchCallState.activeCallGroup,
-        );
-      }
+      return null;
     }
 
-    if (matchCallState.currentRound === round) {
-      return extractParticipantLiveStatus(participant.progressStatus);
-    }
+    const assignedStand = participant.standAssignments[round]?.standGroup;
+    const effectiveGroup =
+      groupNumber ??
+      (assignedStand ? Math.ceil(assignedStand / STANDS_PER_GROUP) : null);
 
-    return null;
+    if (!effectiveGroup) return null;
+
+    return evaluateGroupLiveStatus(
+      effectiveGroup,
+      matchCallState.activeCallGroup,
+    );
   };
 
   const overallRankedParticipants = useMemo(() => {
@@ -971,6 +970,7 @@ export default function ResultsPage() {
                 }
 
                 const groupLiveStatus =
+                  matchCallState.activeCallGroup !== null &&
                   matchCallState.activeCallRound === currentRound
                     ? evaluateGroupLiveStatus(
                         groupNumber,
@@ -1090,15 +1090,16 @@ export default function ResultsPage() {
                           ) + 1
                         : idx + 1);
 
-                    const activeStageForOverall =
-                      matchCallState.activeCallRound ??
-                      matchCallState.currentRound;
-                    const overallLiveStatus = resolvePlayerLiveStatus(
-                      p,
-                      activeStageForOverall,
-                    );
+                    // 総合成績タブでも招集解除中（activeCallGroup === null）は進行表記を一切出さない
+                    const overallLiveStatus: ActiveLiveStatus =
+                      matchCallState.activeCallGroup !== null &&
+                      matchCallState.activeCallRound !== null
+                        ? resolvePlayerLiveStatus(
+                            p,
+                            matchCallState.activeCallRound,
+                          )
+                        : null;
 
-                    // 【フールプルーフ】総合成績タブでも進行枠線を強調表示
                     const overallBorderClass = isAbsent
                       ? 'bg-rose-50/30 border-rose-200 opacity-65'
                       : overallLiveStatus === 'CALLED'
