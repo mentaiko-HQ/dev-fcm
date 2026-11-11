@@ -1,21 +1,23 @@
 /**
- * 【大会進行管理 / 組別縦リスト招集制御・連鎖ステータス表示・FCM送信ログリアルタイム可視化コンソール】
+ * 【大会進行管理 / 順送り組別招集制御（第1組→第2組→第3組）・誤押下キャンセル（Undo）・FCM送信ログリアルタイム可視化コンソール】
  *
  * 役割:
  * 1. 各ステージ（第1〜第3ステージ）において、第1組（第1・2立）、第2組（第3・4立）…を昇順で縦リスト表示。
- * 2. 各組の行に「招集ボタン」を配置し、全体で「1つの組のみ」招集中（activeCallGroup）にできる単一排他制御を実装。
+ * 2. 招集ボタンの順送り制御（第1組 → 第2組 → 第3組…）:
+ *    - 未招集時（初期状態）は「第1組」の招集ボタンのみ押下可能。
+ *    - 第 N 組を招集した後は、解除操作を挟まずにそのまま次の「第 N+1 組を招集する」ボタンを押下可能。
  * 3. 第 N 組の「招集ボタン」を押下した際、以下の連鎖ステータスを自動計算・表示し、Firestoreの選手データへ一括反映:
  *    - 押下した組 (第 N 組)           : 「現在招集中」 (progressStatus = 'CALLED')
  *    - 1つ前・2つ前の組 (N-1, N-2 組) : 「控え待機中」 (progressStatus = 'IN_STAND')
  *    - 3つ前の組 (第 N-3 組)          : 「行射中」     (progressStatus = 'SHOOTING')
  *    - 4つ前以前の組 (第 N-4 組以下)  : 「行射終了」   (progressStatus = 'FINISHED')
- * 4. 「招集解除」ボタンを押下した際は、matches の activeCallGroup / shootingStandGroup / standbyStandGroups をすべてクリアし、
- *    entries 内の 'CALLED' / 'IN_STAND' / 'SHOOTING' ステータスを一括リセットすることで、/standby や /results 上の進行表記を完全に消去する。
+ * 4. 誤押下時のキャンセル（Undo）機能と全招集解除機能:
+ *    - 間違えて第 N 組を押した際、「誤押下キャンセル」ボタンで1つ前の組（第 N-1 組招集中、N=1 の場合は未招集状態）へ即座にロールバック。
+ *    - 「全招集状態を解除」ボタンを押した際は、matches と entries の進行ステータスをすべてクリアし、/standby や /results の表記を完全消去。
  *
  * フールプルーフ設計（事故前・対人間）:
- * - いずれか1つの組が「招集中」の間は、他のすべての組の招集ボタンを非活性化（disabled）し、二重招集・誤タップを完全遮断。
+ * - 次の順番の組（第 N+1 組）以外の招集ボタンは非活性化（disabled）し、順番飛ばし（第1組の次に第3組を押す等）を入口で完全遮断。
  * - シードデータ投入処理に「既にデータが存在する場合はブロックする」ガードを維持し、本番データの破壊を防止。
- * - 招集実行・招集解除時に確認ダイアログ（window.confirm）と非同期ロック（isProcessing）を適用。
  *
  * フェイルセーフ設計（事故後・対故障）:
  * - 参加選手データが0件、またはFirestoreドキュメントが未生成の状態でもクラッシュせず安全側デフォルトで稼働。
@@ -70,6 +72,8 @@ import {
   Layers,
   Target,
   ShieldAlert,
+  RotateCcw,
+  ArrowRight,
 } from 'lucide-react';
 
 interface MatchControlPanelProps {
@@ -77,7 +81,7 @@ interface MatchControlPanelProps {
 }
 
 /**
- * 試合進行および単一招集ロック状態を表すインターフェース
+ * 試合進行および招集状態を表すインターフェース
  */
 interface MatchState {
   matchId: string;
@@ -229,7 +233,7 @@ export function MatchControlPanel({
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string>('');
 
-  // 1. matches ドキュメントのリアルタイム購読（進行ステージ・単一招集中の組ロック状態を取得）
+  // 1. matches ドキュメントのリアルタイム購読
   useEffect(() => {
     if (!isDbReady) return;
 
@@ -534,6 +538,31 @@ export function MatchControlPanel({
     );
   }, [matchState.activeCallGroup, matchState.activeCallRound]);
 
+  /**
+   * 【順送り招集ロジック】
+   * 現ステージにおいて「次に押下可能な組番号（nextCallableGroup）」を算出する。
+   * - まだどの組も招集されていない場合: 第 1 組
+   * - 現在 第 N 組が招集中の場合      : 第 N + 1 組
+   * - 別ステージが招集中の場合        : null（別ステージの招集を完了・解除するまでロック）
+   */
+  const nextCallableGroup = useMemo((): number | null => {
+    if (!isAnyGroupCurrentlyCalled) {
+      return 1;
+    }
+    if (
+      matchState.activeCallRound === matchState.currentRound &&
+      matchState.activeCallGroup !== null
+    ) {
+      return matchState.activeCallGroup + 1;
+    }
+    return null;
+  }, [
+    isAnyGroupCurrentlyCalled,
+    matchState.activeCallRound,
+    matchState.currentRound,
+    matchState.activeCallGroup,
+  ]);
+
   // 現在招集中の組 (N) から連動算出される「控え待機中 (N-1, N-2)」「行射中 (N-3)」の組番号サマリ
   const activePipelineSummary = useMemo(() => {
     const g = matchState.activeCallGroup;
@@ -562,7 +591,7 @@ export function MatchControlPanel({
 
     if (isAnyGroupCurrentlyCalled && matchState.activeCallRound !== newRound) {
       const proceed = window.confirm(
-        `現在「${getStageLabel(matchState.activeCallRound!)} 第${matchState.activeCallGroup}組」が招集中です。\n表示ステージを「${getStageLabel(newRound)}」へ切り替えますか？（招集中の状態を解除してから別ステージを招集することを推奨します）`,
+        `現在「${getStageLabel(matchState.activeCallRound!)} 第${matchState.activeCallGroup}組」が招集中です。\n表示ステージを「${getStageLabel(newRound)}」へ切り替えますか？（別ステージの招集を開始する場合は、現在の招集状態を解除してください）`,
       );
       if (!proceed) return;
     }
@@ -590,7 +619,9 @@ export function MatchControlPanel({
   };
 
   /**
-   * 指定した組の「招集ボタン」押下ハンドラー（単一排他ロック＋連鎖ステータス更新＋FCMプッシュ通知発報）
+   * 【順送り招集ハンドラー（第1組 → 第2組 → 第3組…）】
+   * 現在 第 N-1 組が招集中であっても解除操作不要でそのまま第 N 組を招集でき、
+   * 連鎖ステータス（第N組＝招集中、第N-1/N-2組＝控え待機中、第N-3組＝行射中）を自動更新してFCMプッシュ通知を発報する。
    */
   const handleCallGroup = async (
     targetGroupNumber: number,
@@ -599,9 +630,21 @@ export function MatchControlPanel({
   ) => {
     if (!isDbReady || isProcessing) return;
 
-    if (isAnyGroupCurrentlyCalled) {
+    // フールプルーフ1: 別ステージで招集中の組がある場合は遮断
+    if (
+      isAnyGroupCurrentlyCalled &&
+      matchState.activeCallRound !== matchState.currentRound
+    ) {
       setErrorMessage(
-        `現在「${getStageLabel(matchState.activeCallRound!)} 第${matchState.activeCallGroup}組」が招集中です。同時に複数の組を招集することはできません。先に現在の招集を解除してください。`,
+        `現在「${getStageLabel(matchState.activeCallRound!)} 第${matchState.activeCallGroup}組」が招集中です。別ステージを招集する前に「全招集状態を解除」ボタンを押してください。`,
+      );
+      return;
+    }
+
+    // フールプルーフ2: 順番飛ばし（第1組→第3組など）や逆行押下を防止
+    if (nextCallableGroup !== null && targetGroupNumber !== nextCallableGroup) {
+      setErrorMessage(
+        `招集ボタンは順番に押下してください。次に招集できるのは「第 ${nextCallableGroup} 組」です。`,
       );
       return;
     }
@@ -623,13 +666,13 @@ export function MatchControlPanel({
     const stageName = getStageLabel(matchState.currentRound);
 
     const confirmed = window.confirm(
-      `【招集呼出の確認】\n` +
+      `【招集呼出の確認（順送り進行）】\n` +
         `対象ステージ: ${stageName}\n` +
         `● 招集中 (今回呼出)   : 第 ${targetGroupNumber} 組（第${firstStand}立・第${secondStand}立 / ${groupPlayers.length}名）\n` +
         `● 控え待機中 (1・2組前): ${standbyText}\n` +
         `● 行射中 (3組前)       : ${shootingText}\n` +
         `通知配信先トークン: ${targetTokens.length} 件\n\n` +
-        `この内容で設定し、プッシュ通知を発報しますか？\n※招集中は他の組の招集ボタンはロックされます。`,
+        `この内容で進行し、プッシュ通知を発報しますか？`,
     );
     if (!confirmed) return;
 
@@ -709,7 +752,7 @@ export function MatchControlPanel({
       });
 
       setStatusMessage(
-        `【招集中】第 ${targetGroupNumber} 組を「招集中」、${standbyText}を「控え待機中」、${shootingText}を「行射中」に設定しました。`,
+        `【招集中】第 ${targetGroupNumber} 組を「招集中」、${standbyText}を「控え待機中」、${shootingText}を「行射中」に設定しました。次は「第 ${targetGroupNumber + 1} 組」を招集できます。`,
       );
     } catch (err) {
       console.error('【招集実行エラー】:', err);
@@ -722,8 +765,134 @@ export function MatchControlPanel({
   };
 
   /**
-   * 【重要修正】現在招集中の組の「招集解除（完了）」ハンドラー
-   * 招集を解除した際、/standby および /results ページから「行射中」「控え待機中」「招集中」の表記を完全に消去するため、
+   * 【新規実装：誤押下キャンセル（Undo / 1つ前の組へ戻す）ハンドラー】
+   * 間違えて第 N 組の招集ボタンを押してしまった際、1つ前の状態へ正確に戻す。
+   * - 第 2 組以降（N >= 2）をキャンセルした場合:
+   *   activeCallGroup を N - 1 に戻し、全選手のステータスも第 N - 1 組招集時点の連鎖状態へ再計算して戻す。
+   *   （この際、Cloud Functions 側では activeCallGroup が減少するため不要な重複FCM通知が飛ばない安全設計）
+   * - 第 1 組（N === 1）をキャンセルした場合:
+   *   招集前の初期状態（activeCallGroup = null）へ戻し、すべての進行表記を消去する。
+   */
+  const handleCancelCurrentGroupCall = async (currentCalledGroup: number) => {
+    if (!isDbReady || isProcessing) return;
+
+    const targetRound = matchState.activeCallRound ?? matchState.currentRound;
+    const previousGroup =
+      currentCalledGroup > 1 ? currentCalledGroup - 1 : null;
+
+    const confirmMessage =
+      previousGroup !== null
+        ? `【誤押下キャンセル（1つ前へ戻す）】\n現在招集中の「第 ${currentCalledGroup} 組」の押下をキャンセルし、1つ前の「第 ${previousGroup} 組が招集中」の状態へ戻しますか？`
+        : `【誤押下キャンセル（初期状態へ戻す）】\n現在招集中の「第 1 組」の押下をキャンセルし、招集前の初期状態へ戻しますか？\n※各ページの「招集中」表記も消去されます。`;
+
+    if (!window.confirm(confirmMessage)) return;
+
+    setIsProcessing(true);
+    setErrorMessage('');
+    setStatusMessage('');
+
+    try {
+      const batch = writeBatch(db);
+      const matchDocRef = doc(db, 'matches', matchId);
+
+      if (previousGroup !== null) {
+        // 第 N-1 組が招集中だった状態へロールバック
+        const [prevFirstStand] = getStandNumbersByGroup(previousGroup);
+        const prevStandbyGroups: number[] = [];
+        if (previousGroup - 2 >= 1) prevStandbyGroups.push(previousGroup - 2);
+        if (previousGroup - 1 >= 1) prevStandbyGroups.push(previousGroup - 1);
+        const prevShootingGroup =
+          previousGroup - 3 >= 1 ? previousGroup - 3 : null;
+
+        batch.update(matchDocRef, {
+          currentRound: targetRound,
+          currentStandGroup: previousGroup,
+          currentStandNumber: prevFirstStand,
+          shootingStandGroup: prevShootingGroup,
+          standbyStandGroups: prevStandbyGroups,
+          activeCallRound: targetRound,
+          activeCallGroup: previousGroup,
+          updatedAt: serverTimestamp(),
+        });
+
+        participants.forEach((p) => {
+          if (
+            p.checkInStatus === 'ABSENT' ||
+            p.qualificationStatus === 'WITHDRAWN'
+          ) {
+            return;
+          }
+          const assignedStand = p.standAssignments[targetRound]?.standGroup;
+          if (!assignedStand || assignedStand <= 0) return;
+
+          const playerGroup = Math.ceil(assignedStand / STANDS_PER_GROUP);
+          const role = evaluateGroupRoleByActiveCall(
+            playerGroup,
+            previousGroup,
+            true,
+          );
+          const nextStatus = mapRoleToProgressStatus(role);
+
+          if (p.progressStatus !== nextStatus) {
+            batch.update(doc(db, 'entries', p.id), {
+              progressStatus: nextStatus,
+              updatedAt: serverTimestamp(),
+            });
+          }
+        });
+
+        await batch.commit();
+        setStatusMessage(
+          `第 ${currentCalledGroup} 組の招集押下をキャンセルし、1つ前の「第 ${previousGroup} 組 招集中」の状態へ戻しました。`,
+        );
+      } else {
+        // 第1組の押下をキャンセルした場合は未招集（初期状態）へ完全リセット
+        batch.update(matchDocRef, {
+          currentStandGroup: 1,
+          currentStandNumber: 1,
+          activeCallRound: null,
+          activeCallGroup: null,
+          shootingStandGroup: null,
+          standbyStandGroups: [],
+          updatedAt: serverTimestamp(),
+        });
+
+        participants.forEach((p) => {
+          if (
+            p.progressStatus === 'CALLED' ||
+            p.progressStatus === 'IN_STAND' ||
+            p.progressStatus === 'SHOOTING'
+          ) {
+            const isConfirmed = hasConfirmedStageScore(p, targetRound);
+            const resetStatus: ProgressStatus = isConfirmed
+              ? 'FINISHED'
+              : 'WAITING';
+
+            batch.update(doc(db, 'entries', p.id), {
+              progressStatus: resetStatus,
+              updatedAt: serverTimestamp(),
+            });
+          }
+        });
+
+        await batch.commit();
+        setStatusMessage(
+          '第 1 組の招集押下をキャンセルし、招集前の初期状態へ戻しました。',
+        );
+      }
+
+      setTimeout(() => setStatusMessage(''), 4000);
+    } catch (err) {
+      console.error('【招集キャンセル（Undo）エラー】:', err);
+      setErrorMessage('招集のキャンセル処理に失敗しました。');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  /**
+   * 【全招集状態の解除（完了）ハンドラー】
+   * ステージの招集がすべて終わった際や、進行表記をすべて消去したい際に実行。
    * matches ドキュメントの連動フィールドをすべて null / 空配列にクリアし、
    * entries 内の CALLED / IN_STAND / SHOOTING ステータスを一括で WAITING（スコア確定済なら FINISHED）へリセットする。
    */
@@ -733,10 +902,8 @@ export function MatchControlPanel({
   ) => {
     if (!isDbReady || isProcessing) return;
 
-    const [firstStand, secondStand] = getStandNumbersByGroup(targetGroupNumber);
-
     const confirmed = window.confirm(
-      `現在招集中の「第 ${targetGroupNumber} 組（第${firstStand}立・第${secondStand}立）」の招集状態を解除しますか？\n※解除すると、各ページの「行射中」「控え待機中」「招集中」の表記がすべてクリアされ、次の組の招集ボタンが押せるようになります。`,
+      `現在の招集進行状態（第 ${targetGroupNumber} 組 招集中）をすべて解除（クリア）しますか？\n※解除すると、/standby および /results ページの「行射中」「控え待機中」「招集中」の表記がすべて削除されます。`,
     );
     if (!confirmed) return;
 
@@ -780,7 +947,7 @@ export function MatchControlPanel({
       await batch.commit();
 
       setStatusMessage(
-        `第 ${targetGroupNumber} 組の招集を解除し、「行射中・控え待機中・招集中」の表記をすべてクリアしました。`,
+        `招集状態をすべて解除し、「行射中・控え待機中・招集中」の表記をクリアしました。`,
       );
       setTimeout(() => setStatusMessage(''), 4000);
     } catch (err) {
@@ -853,10 +1020,10 @@ export function MatchControlPanel({
             </span>
           </div>
           <h3 className="font-black text-slate-900 text-lg">
-            ステージ別 組一覧・単一排他招集コンソール
+            ステージ別 組一覧・順送り招集コンソール（第1組 → 第2組 → 第3組）
           </h3>
           <p className="text-xs text-slate-500 font-medium">
-            招集ボタンを押した組を「現在招集中」、1つ前・2つ前の組を「控え待機中」、3つ前の組を「行射中」として自動連動表示します。
+            第1組から順番に招集ボタンを押すだけで次の組へ進行します。誤って押した場合は「誤押下キャンセル」で1つ前の組へ戻せます。
           </p>
         </div>
 
@@ -876,7 +1043,7 @@ export function MatchControlPanel({
         </div>
       </div>
 
-      {/* 現在どの組が「行射中」「控え待機中」「招集中」かを一目で判別できる3連モニター＆グローバルバナー */}
+      {/* 現在どの組が「行射中」「控え待機中」「招集中」かを一目で判別できる3連モニター */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {/* 3つ前の組：行射中 */}
         <div
@@ -953,7 +1120,7 @@ export function MatchControlPanel({
           </div>
         </div>
 
-        {/* 押下した組：現在招集中 */}
+        {/* 押下した組：現在招集中 ＋ 誤押下キャンセル / 全解除コントロール */}
         <div
           className={`p-4 rounded-2xl border-2 transition-all flex flex-col justify-between ${
             isAnyGroupCurrentlyCalled
@@ -967,13 +1134,13 @@ export function MatchControlPanel({
                 <BellRing className="w-4 h-4 text-amber-600 animate-pulse" />
                 現在招集中（押下した組）
               </span>
-              {isAnyGroupCurrentlyCalled ? (
+              {isAnyGroupCurrentlyCalled && nextCallableGroup ? (
                 <span className="inline-flex items-center gap-1 text-[10px] font-black bg-amber-500 text-slate-950 px-2 py-0.5 rounded-full">
-                  <Lock className="w-3 h-3" /> 他組ロック中
+                  次は 第{nextCallableGroup}組 を招集可能
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full">
-                  <Unlock className="w-3 h-3" /> 選択可能
+                  <Unlock className="w-3 h-3" /> 第1組から開始可能
                 </span>
               )}
             </div>
@@ -989,14 +1156,33 @@ export function MatchControlPanel({
                 </>
               ) : (
                 <span className="text-sm font-bold text-slate-400">
-                  未選択（リストから招集）
+                  未選択（第1組から順に招集）
                 </span>
               )}
             </div>
           </div>
 
           {isAnyGroupCurrentlyCalled && (
-            <div className="pt-2 mt-2 border-t border-amber-200/80 flex justify-end">
+            <div className="pt-2.5 mt-2 border-t border-amber-200/80 flex flex-wrap items-center justify-end gap-1.5">
+              {/* 誤押下時の1つ前へ戻すキャンセルボタン */}
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={isProcessing}
+                onClick={() =>
+                  handleCancelCurrentGroupCall(matchState.activeCallGroup!)
+                }
+                className="h-8 px-2.5 bg-white hover:bg-amber-100 border-amber-400 text-slate-900 text-[11px] font-bold rounded-lg"
+                title="間違えて押した場合、1つ前の組が招集中の状態に戻します"
+              >
+                <RotateCcw className="w-3 h-3 mr-1 text-amber-700" />
+                {matchState.activeCallGroup! > 1
+                  ? `誤押下キャンセル (第${matchState.activeCallGroup! - 1}組へ戻す)`
+                  : '誤押下キャンセル (未招集へ戻す)'}
+              </Button>
+
+              {/* 全招集状態を完全解除して表記をすべて消すボタン */}
               <Button
                 type="button"
                 size="sm"
@@ -1016,10 +1202,11 @@ export function MatchControlPanel({
                     calledPlayers,
                   );
                 }}
-                className="h-8 px-3 bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-bold rounded-lg"
+                className="h-8 px-2.5 bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-bold rounded-lg"
+                title="招集状態を完全に終了し、各ページの行射中・控え待機中・招集中の表記をすべて消去します"
               >
-                <Unlock className="w-3 h-3 mr-1 text-amber-400" />第{' '}
-                {matchState.activeCallGroup} 組の招集を解除する
+                <Unlock className="w-3 h-3 mr-1 text-amber-400" />
+                全招集状態を解除（クリア）
               </Button>
             </div>
           )}
@@ -1104,7 +1291,7 @@ export function MatchControlPanel({
       )}
 
       {/* ==========================================
-          組別 昇順縦リスト（各組に招集ボタンを配置・単一排他制御＋連鎖ステータス表示）
+          組別 昇順縦リスト（第1組 → 第2組 → 第3組 の順送り押下＆誤押下キャンセル対応）
           ========================================== */}
       <div className="space-y-2.5">
         <div className="flex flex-wrap items-center justify-between px-1 gap-2">
@@ -1113,7 +1300,7 @@ export function MatchControlPanel({
             {getStageLabel(matchState.currentRound)}】組別 招集リスト（昇順）
           </span>
           <span className="text-[11px] text-slate-500 font-medium">
-            ※招集ボタンは1つの組のみ有効になります（1・2組前＝控え待機中 /
+            ※第1組 → 第2組 → 第3組の順に押下できます（1・2組前＝控え待機中 /
             3組前＝行射中）
           </span>
         </div>
@@ -1170,8 +1357,14 @@ export function MatchControlPanel({
             const isThisGroupShooting = groupRole === 'SHOOTING';
             const isThisGroupFinished = groupRole === 'FINISHED';
 
-            const isLockedByOtherGroup =
-              isAnyGroupCurrentlyCalled && !isThisGroupCalled;
+            // 次に招集すべき順番の組（第1組、または現在招集中組の次の組）であるか判定
+            const isNextCallable = nextCallableGroup === groupNumber;
+
+            // すでに招集を通過した組（現在招集中の組より前の組）かどうか
+            const isAlreadyPassed =
+              isSameRoundAsActive &&
+              matchState.activeCallGroup !== null &&
+              groupNumber < matchState.activeCallGroup;
 
             const hasBeenCalledInLogs = callLogs.some(
               (log) =>
@@ -1181,15 +1374,15 @@ export function MatchControlPanel({
 
             const cardStyleClass = isThisGroupCalled
               ? 'bg-amber-50/95 border-2 border-amber-500 shadow-md ring-2 ring-amber-200/70'
-              : isThisGroupStandby
-                ? 'bg-blue-50/85 border-2 border-blue-400 shadow-xs'
-                : isThisGroupShooting
-                  ? 'bg-emerald-50/85 border-2 border-emerald-500 shadow-xs'
-                  : isThisGroupFinished
-                    ? 'bg-slate-100/70 border border-slate-200 opacity-65'
-                    : isLockedByOtherGroup
-                      ? 'bg-slate-50/70 border border-slate-200 opacity-70'
-                      : 'bg-white border border-slate-200/90 hover:border-slate-300 shadow-2xs';
+              : isNextCallable
+                ? 'bg-white border-2 border-amber-400 shadow-sm'
+                : isThisGroupStandby
+                  ? 'bg-blue-50/85 border-2 border-blue-400 shadow-xs'
+                  : isThisGroupShooting
+                    ? 'bg-emerald-50/85 border-2 border-emerald-500 shadow-xs'
+                    : isThisGroupFinished
+                      ? 'bg-slate-100/70 border border-slate-200 opacity-65'
+                      : 'bg-slate-50/70 border border-slate-200/80 opacity-80';
 
             return (
               <div
@@ -1217,7 +1410,7 @@ export function MatchControlPanel({
                       第 {firstStand} 立 ・ 第 {secondStand} 立
                     </span>
 
-                    {/* 状態バッジ（招集解除時はすべて非表示となり、履歴または未招集に戻る） */}
+                    {/* 状態バッジ */}
                     {isThisGroupCalled ? (
                       <span className="inline-flex items-center gap-1.5 text-xs font-black bg-amber-400 text-slate-950 px-3 py-0.5 rounded-full animate-pulse shadow-2xs">
                         <BellRing className="w-3.5 h-3.5" />
@@ -1238,6 +1431,11 @@ export function MatchControlPanel({
                       <span className="inline-flex items-center gap-1 text-[11px] font-bold bg-slate-200 text-slate-700 px-2.5 py-0.5 rounded-full">
                         <CheckCircle2 className="w-3 h-3 text-slate-600" />
                         行射終了
+                      </span>
+                    ) : isNextCallable ? (
+                      <span className="inline-flex items-center gap-1 text-[11px] font-black bg-amber-100 text-amber-950 border border-amber-400 px-2.5 py-0.5 rounded-full">
+                        <ArrowRight className="w-3 h-3 text-amber-700" />
+                        次に招集可能
                       </span>
                     ) : hasBeenCalledInLogs ? (
                       <span className="inline-flex items-center gap-1 text-[11px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200 px-2.5 py-0.5 rounded-full">
@@ -1290,61 +1488,98 @@ export function MatchControlPanel({
                   )}
                 </div>
 
-                {/* 右側：単一排他制御の「招集ボタン」または「招集解除ボタン」 */}
-                <div className="flex items-center justify-end gap-2 shrink-0 pt-2 lg:pt-0 border-t lg:border-t-0 border-slate-100">
+                {/* 右側：順送り招集ボタン ＆ 誤押下キャンセル（Undo）ボタン */}
+                <div className="flex flex-wrap items-center justify-end gap-2 shrink-0 pt-2 lg:pt-0 border-t lg:border-t-0 border-slate-100">
                   {isThisGroupCalled ? (
+                    <>
+                      {/* 間違えてこの組を押してしまった場合のキャンセル（1つ前へ戻す）ボタン */}
+                      <Button
+                        type="button"
+                        variant="outline"
+                        disabled={isProcessing}
+                        onClick={() =>
+                          handleCancelCurrentGroupCall(groupNumber)
+                        }
+                        className="w-full sm:w-auto h-10 px-3.5 bg-white hover:bg-amber-100 border-amber-500 text-slate-900 font-black text-xs rounded-xl shadow-2xs flex items-center justify-center gap-1.5"
+                      >
+                        {isProcessing ? (
+                          <Loader2 className="w-4 h-4 animate-spin text-slate-900" />
+                        ) : (
+                          <>
+                            <RotateCcw className="w-3.5 h-3.5 text-amber-700" />
+                            {groupNumber > 1
+                              ? `誤押下キャンセル（第${groupNumber - 1}組へ戻す）`
+                              : '誤押下キャンセル（未招集へ戻す）'}
+                          </>
+                        )}
+                      </Button>
+
+                      {/* 招集全体を終了・クリアするボタン */}
+                      <Button
+                        type="button"
+                        disabled={isProcessing}
+                        onClick={() =>
+                          handleReleaseCallGroup(groupNumber, groupPlayers)
+                        }
+                        className="w-full sm:w-auto h-10 px-3.5 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-xl shadow-2xs flex items-center justify-center gap-1.5"
+                      >
+                        <Unlock className="w-3.5 h-3.5 text-amber-400" />
+                        全招集解除
+                      </Button>
+                    </>
+                  ) : isNextCallable ? (
+                    /* 次に押下すべき順番の組（第1組、または現在招集中組の次の組） */
                     <Button
                       type="button"
-                      disabled={isProcessing}
-                      onClick={() =>
-                        handleReleaseCallGroup(groupNumber, groupPlayers)
-                      }
-                      className="w-full sm:w-auto h-10 px-4 bg-slate-900 hover:bg-slate-800 text-white font-black text-xs rounded-xl shadow-xs flex items-center justify-center gap-1.5"
-                    >
-                      {isProcessing ? (
-                        <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
-                      ) : (
-                        <>
-                          <Unlock className="w-4 h-4 text-amber-400" />
-                          招集中を解除（完了）
-                        </>
-                      )}
-                    </Button>
-                  ) : (
-                    <Button
-                      type="button"
-                      disabled={
-                        isProcessing ||
-                        isLockedByOtherGroup ||
-                        groupPlayers.length === 0
-                      }
+                      disabled={isProcessing || groupPlayers.length === 0}
                       onClick={() =>
                         handleCallGroup(groupNumber, groupPlayers, groupTokens)
                       }
-                      className={`w-full sm:w-auto h-10 px-5 font-black text-xs rounded-xl shadow-xs flex items-center justify-center gap-1.5 ${
-                        isLockedByOtherGroup
-                          ? 'bg-slate-200 text-slate-500 cursor-not-allowed'
-                          : 'bg-amber-500 hover:bg-amber-600 text-slate-950'
-                      }`}
-                      title={
-                        isLockedByOtherGroup
-                          ? `第${matchState.activeCallGroup}組が招集中のためロックされています`
-                          : `第${groupNumber}組を招集しFCM通知を送信します`
-                      }
+                      className="w-full sm:w-auto h-10 px-5 bg-amber-500 hover:bg-amber-600 text-slate-950 font-black text-xs rounded-xl shadow-xs flex items-center justify-center gap-1.5"
                     >
                       {isProcessing ? (
                         <Loader2 className="w-4 h-4 animate-spin text-slate-950" />
-                      ) : isLockedByOtherGroup ? (
-                        <>
-                          <Lock className="w-3.5 h-3.5" />
-                          他組招集中につきロック
-                        </>
                       ) : (
                         <>
-                          <Send className="w-3.5 h-3.5" />第 {groupNumber}{' '}
-                          組を招集する
+                          <Send className="w-3.5 h-3.5" />
+                          {groupNumber === 1
+                            ? '第 1 組を招集する（開始）'
+                            : `次の 第 ${groupNumber} 組を招集する`}
                         </>
                       )}
+                    </Button>
+                  ) : isAlreadyPassed ? (
+                    /* すでに通過した組（控え待機中・行射中・行射終了） */
+                    <Button
+                      type="button"
+                      disabled={true}
+                      className="w-full sm:w-auto h-10 px-4 bg-slate-100 text-slate-500 font-bold text-xs rounded-xl cursor-not-allowed flex items-center justify-center gap-1.5"
+                    >
+                      <CheckCircle2 className="w-3.5 h-3.5 text-slate-400" />
+                      招集通過済（
+                      {isThisGroupStandby
+                        ? '控え待機中'
+                        : isThisGroupShooting
+                          ? '行射中'
+                          : '行射終了'}
+                      ）
+                    </Button>
+                  ) : (
+                    /* まだ順番が来ていない組（第 N+2 組以降） */
+                    <Button
+                      type="button"
+                      disabled={true}
+                      className="w-full sm:w-auto h-10 px-4 bg-slate-200 text-slate-500 font-bold text-xs rounded-xl cursor-not-allowed flex items-center justify-center gap-1.5"
+                      title={
+                        nextCallableGroup
+                          ? `先に第 ${nextCallableGroup} 組を招集してください`
+                          : '別ステージが招集中です'
+                      }
+                    >
+                      <Lock className="w-3.5 h-3.5" />
+                      {nextCallableGroup
+                        ? `順番待機（次は第${nextCallableGroup}組）`
+                        : '他ステージ招集中'}
                     </Button>
                   )}
                 </div>
