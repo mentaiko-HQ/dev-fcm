@@ -6,7 +6,8 @@
  * - 従来 /admin 内の「5. 競技記録員用 スコア入力コンソール (ステージ別成績入力)」にあった StandScoreContainer を
  *   記録スタッフ専用ページ (/admin/input) として独立表示。
  * - Firestore の `matches/match_2026_mentaiko` ドキュメントをリアルタイム購読し、
- *   最新の大会設定（title, totalStandGroups 等）を StandScoreContainer へ安全に注入。
+ *   最新の組数設定（totalStandGroups 等）を StandScoreContainer へ安全に注入。
+ * - ヘッダータイトルは不要な大会名プレフィックスを省き「競技記録員用 スコア入力コンソール」のみを端的に表示。
  *
  * フールプルーフ設計（事故前・対人間）:
  * - 競技記録員がスコア入力中に誤って「大会設定変更」「招集ボタン」「データリセット」等を操作してしまう事故を物理的に遮断。
@@ -69,7 +70,7 @@ export default function AdminScoreInputPage() {
     });
   }, []);
 
-  // matches ドキュメントのリアルタイム購読
+  // matches ドキュメントのリアルタイム購読（組数 totalStandGroups 等の同期用）
   useEffect(() => {
     if (!isFirebaseConfigured || !isFirestoreAvailable(db)) return;
 
@@ -106,7 +107,7 @@ export default function AdminScoreInputPage() {
 
   return (
     <div className="w-full min-h-screen bg-[#F8FAFC] text-slate-900 p-4 sm:p-6 lg:p-8 space-y-6">
-      {/* 記録員用コンソール 専用ヘッダー */}
+      {/* 記録員用コンソール 専用ヘッダー（大会名プレフィックスを排除しシンプルに表示） */}
       <header className="w-full bg-white border border-slate-200/80 rounded-2xl p-5 sm:p-6 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <div className="space-y-1">
           <div className="flex flex-wrap items-center gap-2">
@@ -115,12 +116,12 @@ export default function AdminScoreInputPage() {
               競技記録員専用コンソール
             </span>
             <span className="text-xs font-semibold text-slate-600 bg-slate-100 px-2.5 py-0.5 rounded-md">
-              ステージ別成績入力 (/admin/input)
+              ステージ別成績入力
             </span>
             <AdminAuthStatusBadge />
           </div>
           <h1 className="text-xl md:text-2xl font-black text-slate-900 pt-1">
-            {tournamentConfig.title} — 競技記録員用 スコア入力コンソール
+            競技記録員用 スコア入力コンソール
           </h1>
           <p className="text-xs text-slate-500 font-medium">
             第1ステージ(午前・一手2射) / 第2ステージ(午後・一手2射) /
@@ -136,7 +137,7 @@ export default function AdminScoreInputPage() {
             className="text-xs h-9 bg-white border-slate-200 text-slate-700 hover:bg-slate-50 font-bold rounded-xl"
           >
             <ArrowLeft className="w-3.5 h-3.5 mr-1" />
-            本部運営管理 (/admin) へ戻る
+            本部運営管理へ戻る
           </Button>
 
           <Button
@@ -146,7 +147,7 @@ export default function AdminScoreInputPage() {
             className="text-xs h-9 bg-white border-slate-200 text-slate-800 hover:bg-slate-50 font-bold rounded-xl"
           >
             <Trophy className="w-3.5 h-3.5 mr-1 text-amber-500" />
-            リアルタイム成績速報 (/results)
+            成績速報
             <ArrowRight className="w-3 h-3 ml-1" />
           </Button>
         </div>
