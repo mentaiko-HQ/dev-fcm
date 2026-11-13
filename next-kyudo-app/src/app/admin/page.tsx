@@ -1,5 +1,5 @@
 /**
- * 【管理者向け本部運営統合ダッシュボード】
+ * 【管理者向け本部運営統合ダッシュボード（5. 競技記録員用スコア入力コンソール /admin/input 独立対応版）】
  * /admin パスに対応するページコンポーネント。
  *
  * 競技回次（ラウンド）呼称設計:
@@ -14,13 +14,14 @@
  * 2. 名簿取り込み / 立ちグループ編成 (CSVImportScheduleWizard)
  * 3. 表彰・成績サマリー (AwardSummaryCard)
  * 4. 本部進行管理 / 呼出通知トリガー (MatchControlPanel)
- * 5. 競技記録員用 スコア入力コンソール (StandScoreContainer)
+ * 5. 競技記録員用 スコア入力コンソール (/admin/input 独立ページへの専用遷移セクション)
  * 6. 競射判定 / 順位確定 (TieBreakerRankPanel)
  * 7. 参加者一覧 / 進行状況管理テーブル (ParticipantDataTable)
  *    - 参加選手全データCSVエクスポート機能（UTF-8 BOM付き・Excel文字化け防止）
  * 8. データベース初期化・データリセット管理 (DataResetPanel)
  *
  * フールプルーフ設計（事故前・対人間）:
+ * - 競技記録員用スコア入力コンソールを /admin/input に分離し、記録スタッフが本部設定やデータリセットに誤って触れる事故を防止。
  * - 参加者データが0件（空配列）の場合はCSVエクスポートボタンを非活性化（disabled）し、空ファイルの出力を遮断。
  * - CSV出力時にダブルクォート、カンマ、改行を含む文字列をRFC 4180準拠でエスケープ。
  * - Excelでの直接オープン時に文字化けしないよう、UTF-8 BOM（\uFEFF）を自動付加。
@@ -59,7 +60,6 @@ import {
   sanitizeStandGroup,
 } from '@/types';
 import { ParticipantDataTable } from '@/components/admin/ParticipantDataTable';
-import { StandScoreContainer } from '@/components/admin/StandScoreContainer';
 import { MatchControlPanel } from '@/components/admin/MatchControlPanel';
 import { CSVImportScheduleWizard } from '@/components/admin/CSVImportScheduleWizard';
 import { EntryPeriodConfigPanel } from '@/components/admin/EntryPeriodConfigPanel';
@@ -77,6 +77,7 @@ import {
   Download,
   AlertCircle,
   Target,
+  ExternalLink,
 } from 'lucide-react';
 import { AdminAuthStatusBadge } from '@/components/admin/AdminAuthStatusBadge';
 
@@ -272,7 +273,7 @@ export default function AdminConsolePage() {
                 ? raw.stand3_arrows
                 : [],
               isHayaHit: Boolean(raw.isHayaHit),
-              isSokuchu: Boolean(raw.isSokuchu), // 欠落していた isSokuchu を追加
+              isSokuchu: Boolean(raw.isSokuchu),
               totalHits:
                 typeof raw.totalHits === 'number'
                   ? raw.totalHits
@@ -463,6 +464,10 @@ export default function AdminConsolePage() {
     }
   }, [participants, tournamentConfig.matchId]);
 
+  const checkedInCount = participants.filter(
+    (p) => p.checkInStatus === 'CHECKED_IN',
+  ).length;
+
   return (
     <div className="w-full min-h-screen bg-[#F8FAFC] text-slate-900 p-4 sm:p-6 lg:p-8 space-y-6">
       <header className="w-full bg-white border border-slate-200/80 rounded-2xl p-6 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
@@ -495,6 +500,16 @@ export default function AdminConsolePage() {
           >
             <ArrowLeft className="w-3.5 h-3.5 mr-1" />
             選手用ポータル
+          </Button>
+
+          <Button
+            type="button"
+            onClick={() => router.push('/admin/input')}
+            className="bg-amber-500 hover:bg-amber-600 text-slate-950 font-black text-xs h-9 px-3.5 rounded-xl shadow-xs"
+          >
+            <Target className="w-3.5 h-3.5 mr-1 text-slate-950" />
+            スコア入力 (/admin/input)
+            <ArrowRight className="w-3 h-3 ml-1" />
           </Button>
 
           <Button
@@ -555,21 +570,56 @@ export default function AdminConsolePage() {
         <MatchControlPanel matchId={tournamentConfig.matchId} />
       </section>
 
-      {/* 5. 競技記録員用 スコア入力コンソール（ステージ別成績入力） */}
-      <section className="w-full flex flex-col gap-2 bg-white p-6 border border-slate-200/80 rounded-2xl shadow-sm">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 pb-1">
-          <div className="flex items-center gap-2">
-            <Target className="w-4 h-4 text-amber-500" />
-            <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-              5. 競技記録員用 スコア入力コンソール (ステージ別成績入力)
-            </h2>
+      {/* 5. 競技記録員用 スコア入力コンソール（/admin/input 独立ページへの専用誘導セクション） */}
+      <section className="w-full flex flex-col gap-3 bg-white p-6 border-2 border-amber-400/90 rounded-2xl shadow-sm">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="space-y-1.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <Target className="w-4 h-4 text-amber-500" />
+              <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                5. 競技記録員用 スコア入力コンソール (ステージ別成績入力)
+              </h2>
+              <span className="text-[10px] font-black bg-slate-900 text-amber-400 px-2.5 py-0.5 rounded-full">
+                専用URL: /admin/input
+              </span>
+              <span className="text-[11px] font-mono font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md">
+                現在受付済: {checkedInCount} 名
+              </span>
+            </div>
+            <p className="text-xs text-slate-600 font-medium leading-relaxed">
+              記録スタッフの誤操作防止とタブレット操作性向上のため、スコア入力コンソールは専用ページ（
+              <code className="font-mono font-bold text-slate-900 bg-slate-100 px-1.5 py-0.5 rounded">
+                /admin/input
+              </code>
+              ）として独立しています。第1ステージ(午前・一手) /
+              第2ステージ(午後・一手) /
+              第3ステージ(午後・四矢)の成績入力は以下のボタンから開いてください。
+            </p>
           </div>
-          <span className="text-[11px] text-slate-500 font-medium">
-            第1ステージ(午前・一手) / 第2ステージ(午後・一手) /
-            第3ステージ(午後・四矢)
-          </span>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <Button
+              type="button"
+              onClick={() => router.push('/admin/input')}
+              className="w-full sm:w-auto h-11 px-5 bg-amber-500 hover:bg-amber-600 text-slate-950 font-black text-xs sm:text-sm rounded-xl shadow-xs flex items-center justify-center gap-2"
+            >
+              <Target className="w-4 h-4 shrink-0" />
+              <span>競技記録員用 スコア入力コンソールを開く</span>
+              <ArrowRight className="w-4 h-4 shrink-0" />
+            </Button>
+
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => window.open('/admin/input', '_blank')}
+              className="w-full sm:w-auto h-11 px-4 bg-white hover:bg-slate-50 border-slate-300 text-slate-800 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5"
+              title="別タブ（競技記録員用 スコア入力コンソール | ５め杯）で開きます"
+            >
+              <ExternalLink className="w-3.5 h-3.5 text-slate-600" />
+              <span>別タブで開く</span>
+            </Button>
+          </div>
         </div>
-        <StandScoreContainer tournamentConfig={tournamentConfig} />
       </section>
 
       <section className="w-full flex flex-col gap-2 bg-white p-6 border border-slate-200/80 rounded-2xl shadow-sm">

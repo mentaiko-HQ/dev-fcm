@@ -1,22 +1,26 @@
 /**
- * 【ルートレイアウト】
+ * 【ルートレイアウト（Vercel Web Analytics 統合・TS2307型解決対応版）】
  *
  * 役割:
  * - 全画面共通のWebフォント、言語属性、メタデータを提供。
  * - 管理画面（/admin配下）のデスクトップ・タブレット向けフルブリード（全幅）表示を阻害しないよう、
  *   最外殻での幅固定（max-w-7xlなど）を廃止し、幅100%（w-full）のコンテナとして子ページへ委譲。
+ * - `@vercel/analytics/react` の <Analytics /> を組み込み、/guidelines を含む全ページのアクセス状況を計測。
  *
  * フールプルーフ設計:
- * - 【修正】グローバルなメタデータ（タブタイトル等）を一元管理し、子ページでタイトルが指定されていない場合のデフォルト値（５め杯【選手ポータル】）や、
+ * - グローバルなメタデータ（タブタイトル等）を一元管理し、子ページでタイトルが指定されていない場合のデフォルト値（５め杯【選手ポータル】）や、
  *   共通のサフィックス（「 | ５め杯」）のテンプレートを定義。
+ * - tsconfig.json の moduleResolution 設定に左右されず確実に型解決される `@vercel/analytics/react` エントリポイントを使用。
  *
  * フェイルセーフ設計:
  * - 日本語フォント最適化読み込み（システムフォントへの安全なフォールバック）。
  * - フレックスボックス構成により、コンテンツ量に関わらず最低画面高（min-h-screen）を維持し、レイアウト崩壊を防止。
  */
 
+import React from 'react';
 import type { Metadata, Viewport } from 'next';
 import { Noto_Sans_JP } from 'next/font/google';
+import { Analytics } from '@vercel/analytics/react';
 import './globals.css';
 
 // 日本語フォント最適化読み込み（フェイルセーフ: システムフォントへの安全なフォールバック）
@@ -69,6 +73,8 @@ export default function RootLayout({ children }: RootLayoutProps) {
             </p>
           </footer>
         </div>
+        {/* Vercel Web Analytics: /guidelines 等を含む全ページのアクセス解析 */}
+        <Analytics />
       </body>
     </html>
   );
