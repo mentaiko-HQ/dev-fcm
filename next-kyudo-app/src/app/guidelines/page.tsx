@@ -5,10 +5,12 @@
  * - 参加者が大会の趣旨、ルール、免責事項、個人情報の取り扱い等を確認し、同意した上でエントリー画面へ進むためのゲートウェイ。
  * - Firebase Firestoreから最新のエントリー期間設定（entryStartDate, entryEndDate, isEntryEnabled）をリアルタイムで取得し、
  *   受付期間外の場合はエントリー画面への遷移を自動的にブロック。
+ * - 協賛企業および個人協賛の名称横に公式Webサイト・SNSへの外部リンク（別タブ遷移）を設置。
  *
  * フールプルーフ設計:
  * - 同意チェックボックスにチェックを入れないと「エントリー画面へ進む」ボタンが活性化しない。
  * - 現在時刻がエントリー期間外、または受付停止フラグが立っている場合は、ボタンが非活性化されメッセージが変わる。
+ * - 協賛リンクはすべて target="_blank" rel="noopener noreferrer" とし、要項ページからの離脱や同意状態のリセットを防止。
  *
  * フェイルセーフ設計:
  * - Firestoreが未接続、またはドキュメントが見つからない場合でも、DEFAULT_CONFIGの値を用いて安全にフォールバック表示。
@@ -167,19 +169,61 @@ export default function GuidelinesPage() {
               <span className="font-bold text-slate-500 flex items-center gap-1">
                 <Building2 className="w-4 h-4 text-slate-400" /> 協賛企業
               </span>
-              <ul className="text-slate-800 font-semibold space-y-0.5 ml-5">
-                <li>本家相良弓矢製作所</li>
-                <li>有限会社しらみず弓道具店</li>
-                <li>有限会社征矢弓具製作所</li>
+              <ul className="text-slate-800 font-semibold space-y-1 ml-5">
+                <li className="flex items-center flex-wrap gap-2">
+                  <span>本家相良弓矢製作所</span>
+                  <a
+                    href="https://www.sagara-yumiya.jp/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[11px] font-normal text-blue-600 hover:underline inline-flex items-center gap-0.5"
+                  >
+                    Webサイト <ExternalLink className="w-3 h-3" />
+                  </a>
+                </li>
+                <li className="flex items-center flex-wrap gap-2">
+                  <span>有限会社しらみず弓道具店</span>
+                  <a
+                    href="https://siramizu.com/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[11px] font-normal text-blue-600 hover:underline inline-flex items-center gap-0.5"
+                  >
+                    Webサイト <ExternalLink className="w-3 h-3" />
+                  </a>
+                </li>
+                <li className="flex items-center flex-wrap gap-2">
+                  <span>有限会社征矢弓具製作所</span>
+                  <a
+                    href="https://www.soyakyugu.com/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[11px] font-normal text-blue-600 hover:underline inline-flex items-center gap-0.5"
+                  >
+                    Webサイト <ExternalLink className="w-3 h-3" />
+                  </a>
+                </li>
               </ul>
             </div>
             <div className="flex-1 space-y-1.5 sm:border-l sm:border-slate-200 sm:pl-4 pt-4 sm:pt-0 border-t border-slate-200 sm:border-t-0">
               <span className="font-bold text-slate-500 flex items-center gap-1">
                 <User className="w-4 h-4 text-slate-400" /> 個人協賛
               </span>
-              <ul className="text-slate-800 font-semibold space-y-0.5 ml-5">
-                <li>米農家 緒方充</li>
-                <li>弓小物工房 あいみかん</li>
+              <ul className="text-slate-800 font-semibold space-y-1 ml-5">
+                <li className="flex items-center flex-wrap gap-2">
+                  <span>米農家 緒方充</span>
+                </li>
+                <li className="flex items-center flex-wrap gap-2">
+                  <span>弓小物工房 あいみかん</span>
+                  <a
+                    href="https://www.instagram.com/aimikan1/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[11px] font-normal text-blue-600 hover:underline inline-flex items-center gap-0.5"
+                  >
+                    Webサイト <ExternalLink className="w-3 h-3" />
+                  </a>
+                </li>
               </ul>
             </div>
           </div>
